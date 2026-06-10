@@ -1,0 +1,16 @@
+# Firmware build artifacts
+firmware/build/
+
+# ModelSim simulation artifacts
+sim/work/
+sim/transcript
+sim/vsim.wlf
+sim/*.wlf
+sim/modelsim.ini
+sim/library.info
+sim/axi_sys_tb.vcd
+
+# OS files
+.DS_Store
+Thumbs.db
+.tmp/
