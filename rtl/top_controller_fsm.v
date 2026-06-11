@@ -61,6 +61,7 @@ module top_controller_fsm #(
     output wire [3:0]               o_im2col_offset_sel,
     output wire [DATA_W-1:0]        o_im2col_pixel_data,
     output wire                     o_im2col_pixel_vld,
+    output wire [3:0]               o_im2col_load_tile,   // IC tile being streamed during LOAD_ROW
     input  wire                     i_im2col_win_vld,
     input  wire [15:0]              i_im2col_win_x,
     input  wire [15:0]              i_im2col_win_y,
@@ -133,6 +134,7 @@ module top_controller_fsm #(
     reg [15:0] load_col_cnt;  // Column load counter
     reg [15:0] pf_wait_cnt;   // Pre-fetch wait counter
     reg [15:0] row_base_in_row; // Starting cur_in_row for current output row
+    reg [3:0]  load_tile;     // Current IC tile being streamed within a column (0..ic_groups-1)
 
     // Derived
     wire [15:0] ic_groups;
@@ -156,7 +158,7 @@ module top_controller_fsm #(
     assign act_rd_addr = act_base_addr
                        + cur_in_row * act_row_stride
                        + cur_in_col * ic_groups
-                       + ic_tile[SRAM_ADDR_W-1:0];
+                       + load_tile;   // stream each IC tile of the column
 
     assign o_act_sram_addr = act_rd_addr;
     assign o_act_sram_en   = (state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && (load_col_cnt > 16'd0);
@@ -168,7 +170,9 @@ module top_controller_fsm #(
     // Weight reader control
     assign o_wgt_start_prefetch  = (state == S_PREFETCH_WGT) && (pf_wait_cnt == 16'd0);
     assign o_wgt_oc_base         = oc_tile[9:0];
-    assign o_wgt_ic_group        = ic_tile[9:0];
+    // wgt_reader wants the IC *group* index (0,1,2..), but ic_tile counts
+    // channels (0,16,32..) → convert by >>4.
+    assign o_wgt_ic_group        = ic_tile[9:0] >> 4;
     assign o_wgt_ic_groups_total = ic_groups;
 
     // Array control
@@ -184,9 +188,17 @@ module top_controller_fsm #(
     assign o_im2col_row_start  = (state == S_LOAD_ROW) && (load_col_cnt == 16'd0) && (cur_in_col == 16'd0);
     assign o_im2col_win_freeze = (state == S_CALC_KERNEL) || (state == S_K_END)
                               || ((state == S_LOAD_ROW) && i_im2col_win_vld);
-    assign o_im2col_win_advance = ((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && !i_im2col_win_vld) && (load_col_cnt > 16'd0)
+    // Window advance: once per COLUMN during LOAD (on the last IC tile, when the
+    // whole column has been streamed into the line buffer), and once per spatial
+    // step during the sweep (NEXT_TILE).  The im2col keeps one shared timeline
+    // and shifts all IC tiles' windows together.  For ic_groups==1 the LOAD term
+    // fires every pixel cycle, identical to the original single-tile design.
+    assign o_im2col_win_advance = ((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w)
+                                     && !i_im2col_win_vld && (load_col_cnt > 16'd0)
+                                     && (load_tile == (ic_groups[3:0] - 4'd1)))
                              || ((state == S_NEXT_TILE) && (ko_cnt == 4'd0));
     assign o_im2col_offset_sel = ko_cnt;
+    assign o_im2col_load_tile  = load_tile;
 
     // Out SRAM write — include OC tile offset so tiles don't overwrite each other
     wire [SRAM_ADDR_W-1:0] out_wr_addr_calc;
@@ -228,6 +240,7 @@ module top_controller_fsm #(
             load_col_cnt <= 16'd0;
             pf_wait_cnt  <= 16'd0;
             row_base_in_row <= 16'd0;
+            load_tile    <= 4'd0;
             act_base_addr<= {SRAM_ADDR_W{1'b0}};
             wgt_base_addr<= {SRAM_ADDR_W{1'b0}};
             out_base_addr<= {SRAM_ADDR_W{1'b0}};
@@ -259,6 +272,7 @@ module top_controller_fsm #(
                         drain_cnt  <= 5'd0;
                         pf_wait_cnt<= 16'd0;
                         row_base_in_row <= 16'd0;
+                        load_tile  <= 4'd0;
                         state <= S_LOAD_ROW;
                     end
                 end
@@ -269,15 +283,23 @@ module top_controller_fsm #(
                 // -------------------------------------------------------
                 S_LOAD_ROW: begin
                     if (cur_in_col < i_dim_in_w) begin
-                        // Read one 128-bit pixel (16 channels at x=cur_in_col)
-                        load_col_cnt <= load_col_cnt + 16'd1;
-                        if (load_col_cnt > 16'd0) begin  // Skip first cycle (row_start collision)
+                        // Stream the IC tiles of the current column one per cycle.
+                        // Skip the very first cycle (row_start settle); then read
+                        // tile 0,1,..,ic_groups-1, advancing the column only after
+                        // the last tile.  (ic_groups==1 ⇒ one read per column.)
+                        if (load_col_cnt == 16'd0) begin
+                            load_col_cnt <= 16'd1;
+                        end else if (load_tile >= ic_groups[3:0] - 4'd1) begin
+                            load_tile  <= 4'd0;
                             cur_in_col <= cur_in_col + 16'd1;
+                        end else begin
+                            load_tile  <= load_tile + 4'd1;
                         end
                     end else begin
                         // Row complete
                         cur_in_col   <= 16'd0;
                         load_col_cnt <= 16'd0;
+                        load_tile    <= 4'd0;
                         // After loading enough rows (≥ kernel height),
                         // transition to window processing.
                         // IMPORTANT: do NOT increment cur_in_row here —

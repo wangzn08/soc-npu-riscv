@@ -231,7 +231,8 @@ static void pad_activation(
 static void npu_conv_pass(
     int in_w, int in_h, int ic, int oc,
     int kh, int kw, int sx, int sy,
-    const int8_t *W,   // weight ROM pointer (W[oc][ic*kh*kw + ko])
+    const int8_t *W,   // weight ROM pointer (W[oc][rom_ic*kh*kw + ko])
+    int rom_ic,        // input channels actually present in W (conv1: 1, else == ic)
     int bias_scale,  // scale_mul for this layer
     const int32_t *biases,
     int out_ddr_addr,
@@ -243,8 +244,9 @@ static void npu_conv_pass(
     for (int pass = 0; pass < oc_passes; pass++) {
         int oc_base = pass * 16;
 
-        // Load this pass's 16 OCs into Wgt SRAM base 0 (wgt_reader reads base 0)
-        load_conv_weights(W, oc_base, ic, kh, kw);
+        // Load this pass's 16 OCs into Wgt SRAM base 0 (wgt_reader reads base 0).
+        // rom_ic governs ROM indexing & lane fill; unused lanes are zeroed.
+        load_conv_weights(W, oc_base, rom_ic, kh, kw);
 
         // Configure NPU dimensions
         npu_wr(NPU_IN_W, in_w);
@@ -294,35 +296,33 @@ static void cpu_max_pool_2x2(
     uint32_t src_ddr, int in_w, int in_h, int ch,
     uint32_t dst_ddr)
 {
-    volatile int32_t *src = (volatile int32_t *)src_ddr;
-    volatile int32_t *dst = (volatile int32_t *)dst_ddr;
+    // Per-channel (per-byte) 2×2 max on 16-byte words (16 int8 channels).
+    // Layout is IC-tile-major: word = tile*spatial + position.
+    volatile int8_t *src = (volatile int8_t *)src_ddr;
+    volatile int8_t *dst = (volatile int8_t *)dst_ddr;
 
     int out_w = in_w / 2;
     int out_h = in_h / 2;
-    int passes = ch / 16;
+    int tiles = ch / 16;
 
-    for (int oy = 0; oy < out_h; oy++) {
-        for (int ox = 0; ox < out_w; ox++) {
-            int iy = oy * 2;
-            int ix = ox * 2;
+    for (int t = 0; t < tiles; t++) {
+        int sbase = t * in_w * in_h;        // source word base
+        int dbase = t * out_w * out_h;      // dest word base
+        for (int oy = 0; oy < out_h; oy++) {
+            for (int ox = 0; ox < out_w; ox++) {
+                int iy = oy * 2, ix = ox * 2;
+                int o00 = (sbase + (iy    ) * in_w + (ix    )) * 16;
+                int o01 = (sbase + (iy    ) * in_w + (ix + 1)) * 16;
+                int o10 = (sbase + (iy + 1) * in_w + (ix    )) * 16;
+                int o11 = (sbase + (iy + 1) * in_w + (ix + 1)) * 16;
+                int doff = (dbase + oy * out_w + ox) * 16;
 
-            for (int pass = 0; pass < passes; pass++) {
-                int src_base = pass * (in_w * in_h) * 4;
-                int dst_base = pass * (out_w * out_h) * 4;
-                int dst_off  = dst_base + (oy * out_w + ox) * 4;
-
-                for (int sub = 0; sub < 4; sub++) {
-                    int32_t v00 = src[src_base + ((iy    ) * in_w + (ix    )) * 4 + sub];
-                    int32_t v01 = src[src_base + ((iy    ) * in_w + (ix + 1)) * 4 + sub];
-                    int32_t v10 = src[src_base + ((iy + 1) * in_w + (ix    )) * 4 + sub];
-                    int32_t v11 = src[src_base + ((iy + 1) * in_w + (ix + 1)) * 4 + sub];
-
-                    int32_t mx = v00;
-                    if (v01 > mx) mx = v01;
-                    if (v10 > mx) mx = v10;
-                    if (v11 > mx) mx = v11;
-
-                    dst[dst_off + sub] = mx;
+                for (int c = 0; c < 16; c++) {
+                    int8_t mx = src[o00 + c];
+                    if (src[o01 + c] > mx) mx = src[o01 + c];
+                    if (src[o10 + c] > mx) mx = src[o10 + c];
+                    if (src[o11 + c] > mx) mx = src[o11 + c];
+                    dst[doff + c] = mx;
                 }
             }
         }
@@ -342,7 +342,7 @@ static void cpu_affine_layer(
         for (int ic = 0; ic < in_dim; ic++)
             acc += (int32_t)input[ic] * (int32_t)W[oc * in_dim + ic];
 
-        int32_t val = (acc * scale_mul) >> SCALE_SHIFT;
+        int32_t val = (int32_t)(((int64_t)acc * scale_mul) >> SCALE_SHIFT);
         if (do_relu && val < 0) val = 0;
         if (val > 127) val = 127;
         if (val < -128) val = -128;
@@ -404,23 +404,52 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     }
     dma_ddr_to_act(ACT_BUF_A, 0, CONV1_ACT_SRAM);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
-                  &conv1_W[0][0], SCALE_CONV1, conv1_b,
+                  &conv1_W[0][0], 1, SCALE_CONV1, conv1_b,
                   ACT_BUF_B, 784);
     dbg_layer("Conv1", ACT_BUF_B, 784 * 16);
-
-    // Debug: print Conv1 output (first 16 bytes = pos(0,0) ch0..15)
-    print_str("  Conv1 out[0]:");
-    for (int i = 0; i < 16; i++) {
-        print_chr(' ');
-        print_hex((uint32_t)(uint8_t)((volatile int8_t *)ACT_BUF_B)[i], 2);
+    // PROBE: read Wgt SRAM back (64-beat chunks), print lane0 of word oc*9
+    {
+        uint32_t scr = AFFINE_SCR;
+        npu_wr(NPU_DMA_PATH_CTL, 0x4);  // rd src = Wgt SRAM
+        int sent = 0, n = 144;
+        while (sent < n) {
+            int chunk = n - sent; if (chunk > 64) chunk = 64;
+            npu_wr(NPU_DMA_WR_DDR_ADDR, scr + sent * 16);
+            npu_wr(NPU_DMA_WR_LEN, chunk - 1);
+            npu_wr(NPU_DMA_WR_SRAM_BASE, sent);
+            npu_wr(NPU_DMA_WR_TRIG, 1);
+            int t = DMA_TIMEOUT; while (t-- > 0) if (npu_rd(NPU_DMA_STATUS) & 0x2) break;
+            sent += chunk;
+        }
+        volatile int8_t *wb = (volatile int8_t *)scr;
+        print_str("    wgtSRAM lane0[oc*9]:");
+        for (int oc = 0; oc < 16; oc++) { print_chr(' '); print_hex((uint32_t)(uint8_t)wb[(oc * 9) * 16], 2); }
+        print_chr('\n');
+        // CPU-direct read of WGT_BUF (DDR) to check formatting (no DMA)
+        volatile int8_t *fb = (volatile int8_t *)WGT_BUF;
+        print_str("    WgtBuf lane0[oc*9]:");
+        for (int oc = 0; oc < 16; oc++) { print_chr(' '); print_hex((uint32_t)(uint8_t)fb[(oc * 9) * 16], 2); }
+        print_chr('\n');
     }
-    print_chr('\n');
+
+    // Debug: dump Conv1 output at the same positions as golden.py
+    {
+        volatile int8_t *cb = (volatile int8_t *)ACT_BUF_B;
+        int pys[4] = {0, 14, 7, 14}, pxs[4] = {0, 14, 10, 0};
+        for (int p = 0; p < 4; p++) {
+            int base = (pys[p] * 28 + pxs[p]) * 16;
+            print_str("    conv1("); print_dec((uint32_t)pys[p]);
+            print_chr(','); print_dec((uint32_t)pxs[p]); print_str(") ch0-15:");
+            for (int i = 0; i < 16; i++) { print_chr(' '); print_hex((uint32_t)(uint8_t)cb[base + i], 2); }
+            print_chr('\n');
+        }
+    }
 
     // ---- Conv2: ActBuf_B(28×28×16) → padded(30×30×16) → Conv → 28×28×16 → ActBuf_A ----
     pad_activation(ACT_BUF_B, 28, 28, 16, 30, 30);
     dma_ddr_to_act(PAD_BUF, 0, CONV2_ACT_SRAM);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
-                  &conv2_W[0][0], SCALE_CONV2, conv2_b,
+                  &conv2_W[0][0], 16, SCALE_CONV2, conv2_b,
                   ACT_BUF_A, 784);
     dbg_layer("Conv2", ACT_BUF_A, 784 * 16);
 
@@ -432,17 +461,52 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     pad_activation(ACT_BUF_B, 14, 14, 16, 16, 16);
     dma_ddr_to_act(PAD_BUF, 0, CONV3_ACT_SRAM);
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
-                  &conv3_W[0][0], SCALE_CONV3, conv3_b,
+                  &conv3_W[0][0], 16, SCALE_CONV3, conv3_b,
                   ACT_BUF_A, 196);
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
+    {
+        volatile int8_t *b = (volatile int8_t *)ACT_BUF_A;
+        print_str("    conv3(7,7) ch0-15:");
+        for (int c = 0; c < 16; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)b[(0*196 + 7*14+7)*16 + c], 2); }
+        print_str("\n    conv3(7,7) ch16-31:");
+        for (int c = 0; c < 16; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)b[(1*196 + 7*14+7)*16 + c], 2); }
+        print_chr('\n');
+    }
 
     // ---- Conv4: ActBuf_A(14×14×32) → padded(18×18×32) → Conv → 16×16×32 → ActBuf_B ----
     pad_activation(ACT_BUF_A, 14, 14, 32, 18, 18);
+    {   // verify pad: conv3(7,7) → padded(9,9); word=(9*18+9)*2+tile
+        volatile int8_t *p = (volatile int8_t *)PAD_BUF;
+        print_str("    pad4(9,9) t0:");
+        for (int c = 0; c < 16; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)p[((9*18+9)*2+0)*16 + c], 2); }
+        print_str("\n    pad4(9,9) t1:");
+        for (int c = 0; c < 16; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)p[((9*18+9)*2+1)*16 + c], 2); }
+        print_chr('\n');
+        // 3x3 block rows 8..10 cols 8..10, lo32 (t0 ch0-3, t1 ch16-19)
+        for (int ry = 8; ry <= 10; ry++)
+            for (int rx = 8; rx <= 10; rx++) {
+                int w0 = ((ry*18+rx)*2+0)*16, w1 = ((ry*18+rx)*2+1)*16;
+                print_str("    pad4("); print_dec((uint32_t)ry); print_chr(',');
+                print_dec((uint32_t)rx); print_str(") t0lo:");
+                for (int c = 0; c < 4; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)p[w0+c], 2); }
+                print_str(" t1lo:");
+                for (int c = 0; c < 4; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)p[w1+c], 2); }
+                print_chr('\n');
+            }
+    }
     dma_ddr_to_act(PAD_BUF, 0, CONV4_ACT_SRAM);
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
-                  &conv4_W[0][0], SCALE_CONV4, conv4_b,
+                  &conv4_W[0][0], 32, SCALE_CONV4, conv4_b,
                   ACT_BUF_B, 256);
     dbg_layer("Conv4", ACT_BUF_B, 256 * 32);
+    {
+        volatile int8_t *b = (volatile int8_t *)ACT_BUF_B;
+        print_str("    conv4(8,8) ch0-15:");
+        for (int c = 0; c < 16; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)b[(0*256 + 8*16+8)*16 + c], 2); }
+        print_str("\n    conv4(8,8) ch16-31:");
+        for (int c = 0; c < 16; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)b[(1*256 + 8*16+8)*16 + c], 2); }
+        print_chr('\n');
+    }
 
     // ---- Pool2: ActBuf_B(16×16×32) → 8×8×32 → ActBuf_A ----
     cpu_max_pool_2x2(ACT_BUF_B, 16, 16, 32, ACT_BUF_A);
@@ -452,7 +516,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     pad_activation(ACT_BUF_A, 8, 8, 32, 10, 10);
     dma_ddr_to_act(PAD_BUF, 0, CONV5_ACT_SRAM);
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
-                  &conv5_W[0][0], SCALE_CONV5, conv5_b,
+                  &conv5_W[0][0], 32, SCALE_CONV5, conv5_b,
                   ACT_BUF_B, 64);
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 
@@ -460,7 +524,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     pad_activation(ACT_BUF_B, 8, 8, 64, 10, 10);
     dma_ddr_to_act(PAD_BUF, 0, CONV6_ACT_SRAM);
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
-                  &conv6_W[0][0], SCALE_CONV6, conv6_b,
+                  &conv6_W[0][0], 64, SCALE_CONV6, conv6_b,
                   ACT_BUF_A, 64);
     dbg_layer("Conv6", ACT_BUF_A, 64 * 64);
 
@@ -514,7 +578,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
             int32_t acc = affine2_b[oc];
             for (int ic = 0; ic < 50; ic++)
                 acc += (int32_t)act1[ic] * (int32_t)w2[oc * 50 + ic];
-            scores[oc] = (acc * SCALE_AFFINE2) >> SCALE_SHIFT;
+            scores[oc] = (int32_t)(((int64_t)acc * SCALE_AFFINE2) >> SCALE_SHIFT);
         }
         // Debug: print raw scores
         print_str("  Scores:");
@@ -536,7 +600,7 @@ void usercode7(void)
     volatile int32_t *scr = (volatile int32_t *)SCORES;
 
     int correct = 0;
-    for (int d = 0; d < 2; d++) {
+    for (int d = 0; d < 10; d++) {
         print_str("Digit "); print_dec(d); print_str(": ");
 
         deepnet_inference(mnist_images[d], (int32_t *)SCORES);
@@ -561,9 +625,9 @@ void usercode7(void)
     }
 
     print_str("\n=== Result: "); print_dec(correct);
-    print_str("/2 correct ===\n");
+    print_str("/10 correct ===\n");
 
-    if (correct >= 2)
+    if (correct >= 10)
         print_str("DEPLOY SUCCESS.\n");
     else
         print_str("DEPLOY FAILED.\n");

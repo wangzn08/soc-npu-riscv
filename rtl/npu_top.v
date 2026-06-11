@@ -387,6 +387,8 @@ module npu_top #(
     wire [3:0]                  fsm_im2col_offset_sel;
     wire [ACT_DATA_W-1:0]       fsm_im2col_pixel_data;
     wire                        fsm_im2col_pixel_vld;
+    wire [3:0]                  fsm_im2col_load_tile;
+    wire                        fsm_im2col_sweep_advance;
     wire                        fsm_im2col_win_vld;
     wire [15:0]                 fsm_im2col_win_x;
     wire [15:0]                 fsm_im2col_win_y;
@@ -453,6 +455,7 @@ module npu_top #(
         .o_im2col_offset_sel  (fsm_im2col_offset_sel),
         .o_im2col_pixel_data  (fsm_im2col_pixel_data),
         .o_im2col_pixel_vld   (fsm_im2col_pixel_vld),
+        .o_im2col_load_tile   (fsm_im2col_load_tile),
         .i_im2col_win_vld     (fsm_im2col_win_vld),
         .i_im2col_win_x       (fsm_im2col_win_x),
         .i_im2col_win_y       (fsm_im2col_win_y),
@@ -531,19 +534,45 @@ module npu_top #(
     wire                  im2col_at_top_edge;
     wire                  im2col_at_bottom_edge;
 
-    // SRAM Read Latency Compensation (declared before im2col instantiation)
+    // -----------------------------------------------------------------
+    // Multi IC-tile im2col (single timeline): one line buffer stores all IC
+    // tiles per column; the FSM streams a column's tiles one-per-cycle
+    // (load_tile) and pulses win_advance once per column.  The block keeps one
+    // shared cur_x/rd_ptr/win_valid so all tiles stay column-aligned (no skew).
+    // During CALC the systolic reads the window for the current IC tile.
+    // ic_groups==1 → identical to the original single-tile design.
+    // -----------------------------------------------------------------
+    localparam ICG_MAX = 4;
+    wire [3:0] cfg_ic_groups = (cfg_dim_in_c + 16'd15) >> 4;  // 1..ICG_MAX
+
+    // SRAM Read Latency Compensation
     reg fsm_im2col_pixel_vld_d;
     reg fsm_im2col_win_advance_d;
-    reg [ACT_DATA_W-1:0] fsm_im2col_pixel_data_d;
+    reg [3:0] fsm_im2col_load_tile_d;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            fsm_im2col_pixel_vld_d   <= 1'b0;
+            fsm_im2col_win_advance_d <= 1'b0;
+            fsm_im2col_load_tile_d   <= 4'd0;
+        end else begin
+            fsm_im2col_pixel_vld_d   <= fsm_im2col_pixel_vld;
+            fsm_im2col_win_advance_d <= fsm_im2col_win_advance;
+            fsm_im2col_load_tile_d   <= fsm_im2col_load_tile;
+        end
+    end
 
     im2col_line_buffer #(
         .MAX_WIDTH   (MAX_WIDTH),
-        .ARRAY_ROWS  (ARRAY_ROWS)
+        .ARRAY_ROWS  (ARRAY_ROWS),
+        .ICG_MAX     (ICG_MAX)
     ) u_im2col (
         .clk             (clk),
         .rst_n           (rst_n),
         .i_pixel_data    (fsm_im2col_pixel_data),
         .i_pixel_vld     (fsm_im2col_pixel_vld_d),
+        .i_pixel_tile    (fsm_im2col_load_tile_d),
+        .i_ic_groups     (cfg_ic_groups),
+        .i_win_tile      (fsm_cur_ic_tile[7:4]),
         .i_width         (cfg_dim_in_w),
         .i_height        (cfg_dim_in_h),
         .i_row_start     (fsm_im2col_row_start),
@@ -559,19 +588,6 @@ module npu_top #(
         .o_at_top_edge   (im2col_at_top_edge),
         .o_at_bottom_edge(im2col_at_bottom_edge)
     );
-
-    // SRAM Read Latency Compensation — always block for delay registers
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            fsm_im2col_pixel_vld_d   <= 1'b0;
-            fsm_im2col_win_advance_d <= 1'b0;
-            fsm_im2col_pixel_data_d  <= {ACT_DATA_W{1'b0}};
-        end else begin
-            fsm_im2col_pixel_vld_d   <= fsm_im2col_pixel_vld;
-            fsm_im2col_win_advance_d <= fsm_im2col_win_advance;
-            fsm_im2col_pixel_data_d  <= fsm_im2col_pixel_data;
-        end
-    end
 
     // Feedback to FSM
     assign fsm_im2col_win_vld = im2col_win_vld;
@@ -598,6 +614,14 @@ module npu_top #(
     );
 
     // synthesis translate_off
+    `ifdef C4DBG
+    always @(posedge clk) begin
+        if (fsm_array_vld && fsm_cur_ox == 16'd8 && fsm_cur_oy == 16'd8)
+            $display("C4DBG ic_tile=%0d ko=%0d act_lo32=%08h act_hi32=%08h",
+                     fsm_cur_ic_tile, fsm_im2col_offset_sel,
+                     im2col_act_window[31:0], im2col_act_window[127:96]);
+    end
+    `endif
     `ifdef DEBUG
     always @(posedge clk) begin
         if (fsm_array_vld) begin
