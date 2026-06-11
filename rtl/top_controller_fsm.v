@@ -52,6 +52,7 @@ module top_controller_fsm #(
     output wire [9:0]               o_wgt_oc_base,
     output wire [9:0]               o_wgt_ic_group,
     output wire [15:0]              o_wgt_ic_groups_total,
+    output wire [SRAM_ADDR_W-1:0]   o_wgt_base,
     input  wire                     i_wgt_prefetch_done,
 
     // === Im2Col control ===
@@ -174,6 +175,7 @@ module top_controller_fsm #(
     // channels (0,16,32..) → convert by >>4.
     assign o_wgt_ic_group        = ic_tile[9:0] >> 4;
     assign o_wgt_ic_groups_total = ic_groups;
+    assign o_wgt_base            = wgt_base_addr;
 
     // Array control
     assign o_array_vld     = (state == S_CALC_KERNEL);

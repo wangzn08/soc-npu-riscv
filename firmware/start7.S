@@ -230,6 +230,11 @@ start:
 	addi tp, gp, 0
 
 #ifdef ENABLE_USERCODE
+	/* Enable only the NPU-done interrupt (irq bit 3); keep every other irq
+	   masked so the closing ebreak still traps and no timer/ext irqs fire. */
+	li t0, ~(1 << 3)
+	picorv32_maskirq_insn(x0, t0)
+
 	/* call user C code */
 	jal ra,usercode7
 #endif

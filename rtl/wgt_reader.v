@@ -39,6 +39,7 @@ module wgt_reader #(
     input  wire [9:0]                   i_oc_base,         // Output channel base
     input  wire [9:0]                   i_ic_group,        // Input channel group index
     input  wire [15:0]                  i_ic_groups_total,  // IC/16 for the layer
+    input  wire [SRAM_ADDR_W-1:0]       i_wgt_base,         // Wgt SRAM base (resident weights)
     output wire                         o_prefetch_done,   // Pre-fetch complete
 
     // === Kernel offset selection (during CALC_MAC) ===
@@ -87,7 +88,8 @@ module wgt_reader #(
     assign addr_kw = pf_ko % KW;          // pf_ko % 3
 
     wire [SRAM_ADDR_W-1:0] sram_rd_addr;
-    assign sram_rd_addr = addr_oc_component + addr_ic_component + addr_kh + addr_kw
+    assign sram_rd_addr = i_wgt_base
+                        + addr_oc_component + addr_ic_component + addr_kh + addr_kw
                         + pf_oc * oc_stride;
 
     assign o_sram_addr = sram_rd_addr;

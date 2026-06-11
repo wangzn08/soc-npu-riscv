@@ -36,6 +36,7 @@ module post_process_top #(
     input  wire                             i_relu_en,
 
     // Pooling state control (from FSM)
+    input  wire                             i_start,      // op-start pulse: reset pool phase
     input  wire                             i_in_drain,
     input  wire                             i_in_post,
 
@@ -142,6 +143,7 @@ module post_process_top #(
     reg [DATA_W-1:0] pool_gated_data;
     reg              pool_gated_vld;
     reg              pool_data_latched;
+    reg              in_post_d;        // delayed i_in_post, for S_POST-entry edge
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -176,6 +178,7 @@ module post_process_top #(
     ) u_pool (
         .clk         (clk),
         .rst_n       (rst_n),
+        .i_start     (i_start),
         .i_feat      (pool_gated_data),
         .i_feat_vld  (pool_gated_vld),
         .i_width     (i_width),

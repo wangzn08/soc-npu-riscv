@@ -79,7 +79,7 @@ module axi_sys #(
         .mem_axi_rvalid     (cpu_axi_rvalid),
         .mem_axi_rready     (cpu_axi_rready),
         .mem_axi_rdata      (cpu_axi_rdata),
-        .irq                ({29'b0, npu_irq_latched, 2'b0}),  // bit 3 = NPU done
+        .irq                ({28'b0, npu_irq_latched, 3'b0}),  // bit 3 = NPU done (avoids PicoRV32 bus-error irq[2])
         .eoi                (),
         .trace_valid        (),
         .trace_data         ()

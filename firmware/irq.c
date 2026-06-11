@@ -18,6 +18,10 @@ uint32_t *irq(uint32_t *regs, uint32_t irqs)
 	// NPU done IRQ (bit 3)
 	if ((irqs & (1<<3)) != 0) {
 		npu_irq_flag = 1;
+		// Ack: clear the latched NPU-done so the (level-sensitive) irq line
+		// drops before retirq; otherwise the handler would re-fire forever.
+		// CLEAR_DONE carries no START bit, so the NPU is not restarted.
+		*(volatile uint32_t *)(uint32_t)NPU_CTRL = NPU_CTRL_CLEAR_DONE;
 	}
 
 	// checking compressed isa q0 reg handling

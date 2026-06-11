@@ -27,16 +27,15 @@ static inline uint32_t npu_rd(uint32_t addr) {
 // ---- DMA timeouts ----
 #define DMA_TIMEOUT  50000
 #define NPU_TIMEOUT  200000
+// IRQ-wait spins on a RAM flag (much faster than an MMIO poll), so it needs a
+// larger iteration budget to cover the same wall-clock as NPU_TIMEOUT. Normal
+// completion exits the moment the interrupt fires; this is only a fallback.
+#define NPU_IRQ_TIMEOUT  1000000
 
-// ---- Conv layer SRAM word counts ----
+// ---- Conv layer Act SRAM word counts ----
 // SRAM word = 128 bits = 16 bytes (one spatial position, 16 channels)
-#define CONV1_WGT_SRAM  9     // IC=1, 9 kernel offsets
-#define CONV2_WGT_SRAM  144   // IC=16, 144 kernel offsets
-#define CONV3_WGT_SRAM  288   // IC=32, 288 kernel offsets (per OC pass)
-#define CONV4_WGT_SRAM  288   // IC=32, 288 kernel offsets
-#define CONV5_WGT_SRAM  288   // IC=32, 288 kernel offsets
-#define CONV6_WGT_SRAM  576   // IC=64, 576 kernel offsets
-
+// (Packed Wgt SRAM sizes are computed at runtime as tile_words; per-layer
+//  resident bases are the CONV*_WGT_BASE values below.)
 #define CONV1_ACT_SRAM  900   // padded 30x30, 1 word/pos
 #define CONV2_ACT_SRAM  900   // padded 30x30, 1 word/pos
 #define CONV3_ACT_SRAM  256   // padded 16x16, 1 word/pos
@@ -137,21 +136,22 @@ static void dma_out_to_ddr(uint32_t ddr_addr, uint32_t sram_base, int nbeats)
 }
 
 // ================================================================
-// Load one 16-output-channel tile [oc_start, oc_start+16) of conv weights
-// into Wgt SRAM base 0, in the layout wgt_reader expects.
+// Pack one 16-output-channel tile [oc_start, oc_start+16) of conv weights
+// into the layout wgt_reader expects, then DMA it to Wgt SRAM word
+// `wgt_sram_base`.
 //
 // wgt_reader reads SRAM word at:
-//   addr = oc_local*ic_groups*KHKW + ic_group*KHKW + ko
+//   addr = NPU_WGT_ADDR_A + oc_local*ic_groups*KHKW + ic_group*KHKW + ko
 // and treats the 128-bit word as 16 INT8 weights for input channels
 // {ic_group*16 .. ic_group*16+15} of output channel (oc_start+oc_local),
-// kernel offset ko.  (NOTE: wgt_reader ignores NPU_WGT_ADDR_A, so every
-// pass must reload its 16 OCs to Wgt SRAM base 0.)
+// kernel offset ko.  wgt_reader now adds NPU_WGT_ADDR_A, so each tile can
+// stay resident at its own base across all images (see preload_conv_weights).
 //
 // ROM weight layout: W[oc][ic*KHKW + ko]  (row stride = ic*kh*kw).
 // For ic<16 the unused lanes of the single group are zero-filled.
 // ================================================================
 static void load_conv_weights(const int8_t *W, int oc_start,
-                              int ic, int kh, int kw)
+                              int ic, int kh, int kw, int wgt_sram_base)
 {
     volatile int8_t *wbuf8 = (volatile int8_t *)WGT_BUF;
     int khkw      = kh * kw;
@@ -179,9 +179,36 @@ static void load_conv_weights(const int8_t *W, int oc_start,
     while (sent < n_words) {
         int chunk = n_words - sent;
         if (chunk > 256) chunk = 256;
-        dma_ddr_to_wgt(WGT_BUF + sent * 16, sent, chunk);
+        dma_ddr_to_wgt(WGT_BUF + sent * 16, wgt_sram_base + sent, chunk);
         sent += chunk;
     }
+}
+
+// ================================================================
+// Preload ALL conv weights into Wgt SRAM once (resident for every image).
+// Each (layer,pass) 16-OC tile lands at a distinct Wgt SRAM word base so the
+// NPU selects it via NPU_WGT_ADDR_A instead of re-packing + re-DMA'ing the
+// same weights on every pass of every image.
+// Total resident = 4608 words <= 8192 (one Wgt ping bank).
+// ================================================================
+static void preload_one_conv(const int8_t *W, int rom_ic, int kh, int kw,
+                             int oc, int wgt_base)
+{
+    int passes     = oc / 16;
+    int tile_words = 16 * ((rom_ic + 15) / 16) * kh * kw;
+    for (int pass = 0; pass < passes; pass++)
+        load_conv_weights(W, pass * 16, rom_ic, kh, kw,
+                          wgt_base + pass * tile_words);
+}
+
+static void preload_conv_weights(void)
+{
+    preload_one_conv(&conv1_W[0][0],  1, 3, 3, 16, CONV1_WGT_BASE);
+    preload_one_conv(&conv2_W[0][0], 16, 3, 3, 16, CONV2_WGT_BASE);
+    preload_one_conv(&conv3_W[0][0], 16, 3, 3, 32, CONV3_WGT_BASE);
+    preload_one_conv(&conv4_W[0][0], 32, 3, 3, 32, CONV4_WGT_BASE);
+    preload_one_conv(&conv5_W[0][0], 32, 3, 3, 64, CONV5_WGT_BASE);
+    preload_one_conv(&conv6_W[0][0], 64, 3, 3, 64, CONV6_WGT_BASE);
 }
 
 // ================================================================
@@ -231,22 +258,19 @@ static void pad_activation(
 static void npu_conv_pass(
     int in_w, int in_h, int ic, int oc,
     int kh, int kw, int sx, int sy,
-    const int8_t *W,   // weight ROM pointer (W[oc][rom_ic*kh*kw + ko])
-    int rom_ic,        // input channels actually present in W (conv1: 1, else == ic)
+    int rom_ic,        // input channels present in ROM (conv1: 1, else == ic)
     int bias_scale,  // scale_mul for this layer
     const int32_t *biases,
     int out_ddr_addr,
-    int out_spatial)  // out_w * out_h
+    int out_spatial,   // out_w * out_h
+    int wgt_base)      // Wgt SRAM word base of this layer's resident weights
 {
-    int oc_passes = oc / 16;
+    int oc_passes  = oc / 16;
     int out_nbeats = out_spatial;  // SRAM words per pass
+    int tile_words = 16 * ((rom_ic + 15) / 16) * kh * kw;  // per-pass Wgt stride
 
     for (int pass = 0; pass < oc_passes; pass++) {
         int oc_base = pass * 16;
-
-        // Load this pass's 16 OCs into Wgt SRAM base 0 (wgt_reader reads base 0).
-        // rom_ic governs ROM indexing & lane fill; unused lanes are zeroed.
-        load_conv_weights(W, oc_base, rom_ic, kh, kw);
 
         // Configure NPU dimensions
         npu_wr(NPU_IN_W, in_w);
@@ -258,7 +282,9 @@ static void npu_conv_pass(
 
         // SRAM addresses
         npu_wr(NPU_ACT_ADDR_A, 0);   // padded data at SRAM base 0
-        npu_wr(NPU_WGT_ADDR_A, 0);
+        // Weights resident in Wgt SRAM (preloaded once); select this pass's
+        // 16-OC tile by base address instead of reloading every pass.
+        npu_wr(NPU_WGT_ADDR_A, wgt_base + pass * tile_words);
         npu_wr(NPU_OUT_ADDR_A, 0);
 
         // Per-channel bias, scale, shift
@@ -268,14 +294,16 @@ static void npu_conv_pass(
             npu_wr(NPU_SHIFT(ch), SCALE_SHIFT);
         }
 
-        // Start NPU: relu_en=1, pool_en=0
+        // Start NPU: relu_en=1, pool_en=0. Clear the done flag first; the CTRL
+        // write also clears any stale NPU-done latch from a previous pass.
+        npu_irq_flag = 0;
         npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_RELU_EN);
 
-        // Wait for done
-        int t = NPU_TIMEOUT;
+        // Wait for the NPU-done interrupt (irq.c sets npu_irq_flag on bit 3).
+        int t = NPU_IRQ_TIMEOUT;
         while (t-- > 0)
-            if (npu_rd(NPU_STATUS) & NPU_STATUS_DONE_IRQ) break;
-        if (t <= 0) print_str("  NPU timeout!\n");
+            if (npu_irq_flag) break;
+        if (t <= 0) print_str("  NPU IRQ timeout!\n");
         if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_RD_ERR) print_str("  NPU DMA rd err!\n");
         if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_WR_ERR) print_str("  NPU DMA wr err!\n");
 
@@ -404,8 +432,8 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     }
     dma_ddr_to_act(ACT_BUF_A, 0, CONV1_ACT_SRAM);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
-                  &conv1_W[0][0], 1, SCALE_CONV1, conv1_b,
-                  ACT_BUF_B, 784);
+                  1, SCALE_CONV1, conv1_b,
+                  ACT_BUF_B, 784, CONV1_WGT_BASE);
     dbg_layer("Conv1", ACT_BUF_B, 784 * 16);
     // PROBE: read Wgt SRAM back (64-beat chunks), print lane0 of word oc*9
     {
@@ -449,8 +477,8 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     pad_activation(ACT_BUF_B, 28, 28, 16, 30, 30);
     dma_ddr_to_act(PAD_BUF, 0, CONV2_ACT_SRAM);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
-                  &conv2_W[0][0], 16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_A, 784);
+                  16, SCALE_CONV2, conv2_b,
+                  ACT_BUF_A, 784, CONV2_WGT_BASE);
     dbg_layer("Conv2", ACT_BUF_A, 784 * 16);
 
     // ---- Pool1: ActBuf_A(28×28×16) → 14×14×16 → ActBuf_B ----
@@ -461,8 +489,8 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     pad_activation(ACT_BUF_B, 14, 14, 16, 16, 16);
     dma_ddr_to_act(PAD_BUF, 0, CONV3_ACT_SRAM);
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
-                  &conv3_W[0][0], 16, SCALE_CONV3, conv3_b,
-                  ACT_BUF_A, 196);
+                  16, SCALE_CONV3, conv3_b,
+                  ACT_BUF_A, 196, CONV3_WGT_BASE);
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
     {
         volatile int8_t *b = (volatile int8_t *)ACT_BUF_A;
@@ -496,8 +524,8 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     }
     dma_ddr_to_act(PAD_BUF, 0, CONV4_ACT_SRAM);
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
-                  &conv4_W[0][0], 32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_B, 256);
+                  32, SCALE_CONV4, conv4_b,
+                  ACT_BUF_B, 256, CONV4_WGT_BASE);
     dbg_layer("Conv4", ACT_BUF_B, 256 * 32);
     {
         volatile int8_t *b = (volatile int8_t *)ACT_BUF_B;
@@ -516,16 +544,16 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     pad_activation(ACT_BUF_A, 8, 8, 32, 10, 10);
     dma_ddr_to_act(PAD_BUF, 0, CONV5_ACT_SRAM);
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
-                  &conv5_W[0][0], 32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64);
+                  32, SCALE_CONV5, conv5_b,
+                  ACT_BUF_B, 64, CONV5_WGT_BASE);
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 
     // ---- Conv6: ActBuf_B(8×8×64) → padded(10×10×64) → Conv → 8×8×64 → ActBuf_A ----
     pad_activation(ACT_BUF_B, 8, 8, 64, 10, 10);
     dma_ddr_to_act(PAD_BUF, 0, CONV6_ACT_SRAM);
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
-                  &conv6_W[0][0], 64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_A, 64);
+                  64, SCALE_CONV6, conv6_b,
+                  ACT_BUF_A, 64, CONV6_WGT_BASE);
     dbg_layer("Conv6", ACT_BUF_A, 64 * 64);
 
     // ---- Pool3: ActBuf_A(8×8×64) → 4×4×64 → ActBuf_B ----
@@ -596,6 +624,10 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
 void usercode7(void)
 {
     print_str("=== MNIST DeepConvNet Deploy ===\n");
+
+    // Preload all conv weights into Wgt SRAM once; they stay resident for
+    // every image instead of being re-packed and re-DMA'd on every pass.
+    preload_conv_weights();
 
     volatile int32_t *scr = (volatile int32_t *)SCORES;
 
