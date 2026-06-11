@@ -262,11 +262,14 @@ static void npu_conv_pass(
     int bias_scale,  // scale_mul for this layer
     const int32_t *biases,
     int out_ddr_addr,
-    int out_spatial,   // out_w * out_h
-    int wgt_base)      // Wgt SRAM word base of this layer's resident weights
+    int out_spatial,   // out_w * out_h (conv output, before pooling)
+    int wgt_base,      // Wgt SRAM word base of this layer's resident weights
+    int pool_en)       // 1 = NPU does 2x2 maxpool on the conv output
 {
     int oc_passes  = oc / 16;
-    int out_nbeats = out_spatial;  // SRAM words per pass
+    // 2x2 pooling quarters the spatial size; only pooled points are written.
+    int out_words  = pool_en ? (out_spatial >> 2) : out_spatial;
+    int out_nbeats = out_words;    // SRAM words written per pass
     int tile_words = 16 * ((rom_ic + 15) / 16) * kh * kw;  // per-pass Wgt stride
 
     for (int pass = 0; pass < oc_passes; pass++) {
@@ -297,7 +300,8 @@ static void npu_conv_pass(
         // Start NPU: relu_en=1, pool_en=0. Clear the done flag first; the CTRL
         // write also clears any stale NPU-done latch from a previous pass.
         npu_irq_flag = 0;
-        npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_RELU_EN);
+        npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_RELU_EN |
+                         (pool_en ? NPU_CTRL_POOL_EN : 0));
 
         // Wait for the NPU-done interrupt (irq.c sets npu_irq_flag on bit 3).
         int t = NPU_IRQ_TIMEOUT;
@@ -310,7 +314,7 @@ static void npu_conv_pass(
         // DMA Out SRAM → DDR. Each output position = 16 bytes (16 ch),
         // so pass p (OCs 16p..16p+15) lands at byte offset p*out_spatial*16
         // → buffer is IC-tile-major: word = pass*out_spatial + pos.
-        int ddr_off = pass * out_spatial * 16;  // byte offset
+        int ddr_off = pass * out_words * 16;  // byte offset (pooled size if pool_en)
         dma_out_to_ddr(out_ddr_addr + ddr_off, 0, out_nbeats);
     }
 }
@@ -320,7 +324,7 @@ static void npu_conv_pass(
 // Input: spatial-first-per-tile layout in DDR
 // Output: spatial-first-per-tile layout in DDR
 // ================================================================
-static void cpu_max_pool_2x2(
+static void __attribute__((unused)) cpu_max_pool_2x2(
     uint32_t src_ddr, int in_w, int in_h, int ch,
     uint32_t dst_ddr)
 {
@@ -433,7 +437,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_A, 0, CONV1_ACT_SRAM);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   1, SCALE_CONV1, conv1_b,
-                  ACT_BUF_B, 784, CONV1_WGT_BASE);
+                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0);
     dbg_layer("Conv1", ACT_BUF_B, 784 * 16);
     // PROBE: read Wgt SRAM back (64-beat chunks), print lane0 of word oc*9
     {
@@ -476,13 +480,10 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // ---- Conv2: ActBuf_B(28×28×16) → padded(30×30×16) → Conv → 28×28×16 → ActBuf_A ----
     pad_activation(ACT_BUF_B, 28, 28, 16, 30, 30);
     dma_ddr_to_act(PAD_BUF, 0, CONV2_ACT_SRAM);
+    // NPU does Conv2 + Pool1 in one pass: 28x28 conv -> 2x2 maxpool -> 14x14.
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_A, 784, CONV2_WGT_BASE);
-    dbg_layer("Conv2", ACT_BUF_A, 784 * 16);
-
-    // ---- Pool1: ActBuf_A(28×28×16) → 14×14×16 → ActBuf_B ----
-    cpu_max_pool_2x2(ACT_BUF_A, 28, 28, 16, ACT_BUF_B);
+                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1);   // pool_en=1 -> 14x14 to ActBuf_B
     dbg_layer("Pool1", ACT_BUF_B, 196 * 16);
 
     // ---- Conv3: ActBuf_B(14×14×16) → padded(16×16×16) → Conv → 14×14×32 → ActBuf_A ----
@@ -490,7 +491,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(PAD_BUF, 0, CONV3_ACT_SRAM);
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
                   16, SCALE_CONV3, conv3_b,
-                  ACT_BUF_A, 196, CONV3_WGT_BASE);
+                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0);
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
     {
         volatile int8_t *b = (volatile int8_t *)ACT_BUF_A;
@@ -523,21 +524,10 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
             }
     }
     dma_ddr_to_act(PAD_BUF, 0, CONV4_ACT_SRAM);
+    // NPU does Conv4 + Pool2: 16x16 conv -> 2x2 maxpool -> 8x8.
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
                   32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_B, 256, CONV4_WGT_BASE);
-    dbg_layer("Conv4", ACT_BUF_B, 256 * 32);
-    {
-        volatile int8_t *b = (volatile int8_t *)ACT_BUF_B;
-        print_str("    conv4(8,8) ch0-15:");
-        for (int c = 0; c < 16; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)b[(0*256 + 8*16+8)*16 + c], 2); }
-        print_str("\n    conv4(8,8) ch16-31:");
-        for (int c = 0; c < 16; c++) { print_chr(' '); print_hex((uint32_t)(uint8_t)b[(1*256 + 8*16+8)*16 + c], 2); }
-        print_chr('\n');
-    }
-
-    // ---- Pool2: ActBuf_B(16×16×32) → 8×8×32 → ActBuf_A ----
-    cpu_max_pool_2x2(ACT_BUF_B, 16, 16, 32, ACT_BUF_A);
+                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1);   // pool_en=1 -> 8x8 to ActBuf_A
     dbg_layer("Pool2", ACT_BUF_A, 64 * 32);
 
     // ---- Conv5: ActBuf_A(8×8×32) → padded(10×10×32) → Conv → 8×8×64 → ActBuf_B ----
@@ -545,19 +535,16 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(PAD_BUF, 0, CONV5_ACT_SRAM);
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
                   32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64, CONV5_WGT_BASE);
+                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0);
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 
     // ---- Conv6: ActBuf_B(8×8×64) → padded(10×10×64) → Conv → 8×8×64 → ActBuf_A ----
     pad_activation(ACT_BUF_B, 8, 8, 64, 10, 10);
     dma_ddr_to_act(PAD_BUF, 0, CONV6_ACT_SRAM);
+    // NPU does Conv6 + Pool3: 8x8 conv -> 2x2 maxpool -> 4x4.
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
                   64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_A, 64, CONV6_WGT_BASE);
-    dbg_layer("Conv6", ACT_BUF_A, 64 * 64);
-
-    // ---- Pool3: ActBuf_A(8×8×64) → 4×4×64 → ActBuf_B ----
-    cpu_max_pool_2x2(ACT_BUF_A, 8, 8, 64, ACT_BUF_B);
+                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1);   // pool_en=1 -> 4x4 to ActBuf_B
 
     // Debug: print Pool3 output (first 16 bytes = pos(0,0) ch0..15)
     print_str("  Pool3 out[0]:");

@@ -147,20 +147,25 @@ module post_process_top #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            pool_gated_data  <= {DATA_W{1'b0}};
-            pool_gated_vld   <= 1'b0;
+            pool_gated_data   <= {DATA_W{1'b0}};
+            pool_gated_vld    <= 1'b0;
             pool_data_latched <= 1'b0;
+            in_post_d         <= 1'b0;
         end else begin
-            // Latch accumulated data on FIRST drain cycle only (PE row 15 = final result)
+            // Latch the conv result once, on the first post-processed value
+            // of the drain phase; hold it stable through S_POST.
             if (i_in_drain && s3_vld && !pool_data_latched) begin
-                pool_gated_data  <= s3_act;
+                pool_gated_data   <= s3_act;
                 pool_data_latched <= 1'b1;
             end
-            // Reset latch flag when drain ends
             if (!i_in_drain)
                 pool_data_latched <= 1'b0;
-            // Generate single valid pulse at POST entry
-            pool_gated_vld <= s3_vld && i_in_post;
+            // Feed the pooler EXACTLY ONCE per conv point: a single-cycle
+            // pulse on the rising edge of i_in_post (S_POST entry).  The old
+            // "s3_vld && i_in_post" stayed high for ~4 cycles and fed the
+            // pooler ~4x per point, corrupting the 2x2 windowing.
+            in_post_d      <= i_in_post;
+            pool_gated_vld <= i_in_post && !in_post_d;
         end
     end
 

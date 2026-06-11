@@ -747,8 +747,11 @@ module npu_top #(
             pool_out_addr_cnt <= pool_out_addr_cnt + {{SRAM_ADDR_W-1{1'b0}}, 1'b1};
     end
 
-    assign out_sram_ena   = fsm_out_wr_en;
-    assign out_sram_wea   = fsm_out_wr_en;
+    // In pool mode the Out-SRAM write is self-timed by the pooler's output
+    // valid (pool_vld = pp_feat_vld) with the contiguous pool_out_addr_cnt;
+    // in non-pool mode it is FSM-driven exactly as before.
+    assign out_sram_ena   = cfg_pool_en ? pp_feat_vld : fsm_out_wr_en;
+    assign out_sram_wea   = cfg_pool_en ? pp_feat_vld : fsm_out_wr_en;
     assign out_sram_addra = cfg_pool_en
                           ? pool_out_addr_cnt[OUT_SRAM_ADDR_W-1:0]
                           : fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
@@ -767,8 +770,11 @@ module npu_top #(
     `endif
     // synthesis translate_on
 
-    // Post-process done: feed back to FSM
-    assign fsm_pp_done = alu_vld;
+    // Post-process done: feed back to FSM.  In pool mode advance once per conv
+    // point (pp_start pulses at S_POST entry) so the FSM does not stall on the
+    // 3/4 of points where 2x2 pooling emits no output; the Out-SRAM write is
+    // decoupled and self-timed by pp_feat_vld above.  Non-pool keeps alu_vld.
+    assign fsm_pp_done = cfg_pool_en ? fsm_pp_start : alu_vld;
 
     // ===================================================================
     // DMA write port mux: Act SRAM or Wgt SRAM based on cfg_dma_sram_sel
