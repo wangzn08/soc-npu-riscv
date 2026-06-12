@@ -54,6 +54,7 @@ void usercode7(void);
 #define NPU_OC         (NPU_BASE + 0x02C)
 #define NPU_KERNEL     (NPU_BASE + 0x030)  // [15:8]KH [7:0]KW
 #define NPU_STRIDE     (NPU_BASE + 0x034)  // [15:8]SX [7:0]SY
+#define NPU_PAD        (NPU_BASE + 0x150)  // [15:8]pad_h [7:0]pad_w (hardware padding, CTRL[8])
 #define NPU_BIAS_ADDR  (NPU_BASE + 0x038)
 #define NPU_SCALE_ADDR (NPU_BASE + 0x03C)
 #define NPU_BIAS(ch)   (NPU_BASE + 0x040 + ((ch) * 4))
@@ -82,6 +83,7 @@ void usercode7(void);
 #define NPU_CTRL_RELU_EN    (1 << 5)
 #define NPU_CTRL_OUT_PING   (1 << 6)
 #define NPU_CTRL_GEMM_EN    (1 << 7)   // GEMM/FC mode: bypass im2col, vector x matrix
+#define NPU_CTRL_HW_PAD     (1 << 8)   // hardware padding: FSM injects border zeros, reads tile-major
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)

@@ -126,6 +126,9 @@ module npu_top #(
     wire                            cfg_relu_en;
     wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
+    wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
+    wire [7:0]                      cfg_pad_w;          // NPU_PAD[7:0]
+    wire [7:0]                      cfg_pad_h;          // NPU_PAD[15:8]
     wire                            status_done_irq;
     wire                            status_busy;
     wire                            dma_rd_err;
@@ -221,6 +224,9 @@ module npu_top #(
         .o_relu_en        (cfg_relu_en),
         .o_out_ping_sel   (cfg_out_ping_sel),
         .o_gemm_en        (cfg_gemm_en),
+        .o_hw_pad         (cfg_hw_pad),
+        .o_pad_w          (cfg_pad_w),
+        .o_pad_h          (cfg_pad_h),
         .i_done_irq       (status_done_irq),
         .i_busy           (status_busy),
         .i_dma_rd_err     (dma_rd_err),
@@ -398,6 +404,7 @@ module npu_top #(
     wire [3:0]                  fsm_im2col_offset_sel;
     wire [ACT_DATA_W-1:0]       fsm_im2col_pixel_data;
     wire                        fsm_im2col_pixel_vld;
+    wire                        fsm_border;
     wire [3:0]                  fsm_im2col_load_tile;
     wire                        fsm_im2col_sweep_advance;
     wire                        fsm_im2col_win_vld;
@@ -436,6 +443,9 @@ module npu_top #(
         .i_pool_en            (cfg_pool_en),
         .i_eltwise_en         (cfg_eltwise_en),
         .i_gemm_en            (cfg_gemm_en),
+        .i_hw_pad             (cfg_hw_pad),
+        .i_pad_w              (cfg_pad_w),
+        .i_pad_h              (cfg_pad_h),
         .i_act_base_ping      (cfg_act_addr_ping),
         .i_act_base_pong      (cfg_act_addr_pong),
         .i_wgt_base_ping      (cfg_wgt_addr_ping),
@@ -470,6 +480,7 @@ module npu_top #(
         .o_im2col_offset_sel  (fsm_im2col_offset_sel),
         .o_im2col_pixel_data  (fsm_im2col_pixel_data),
         .o_im2col_pixel_vld   (fsm_im2col_pixel_vld),
+        .o_border             (fsm_border),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
         .i_im2col_win_vld     (fsm_im2col_win_vld),
         .i_im2col_win_x       (fsm_im2col_win_x),
@@ -571,17 +582,24 @@ module npu_top #(
     reg fsm_im2col_pixel_vld_d;
     reg fsm_im2col_win_advance_d;
     reg [3:0] fsm_im2col_load_tile_d;
+    reg fsm_border_d;   // hw-pad border flag, delayed to match the 1-cycle SRAM read
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             fsm_im2col_pixel_vld_d   <= 1'b0;
             fsm_im2col_win_advance_d <= 1'b0;
             fsm_im2col_load_tile_d   <= 4'd0;
+            fsm_border_d             <= 1'b0;
         end else begin
             fsm_im2col_pixel_vld_d   <= fsm_im2col_pixel_vld;
             fsm_im2col_win_advance_d <= fsm_im2col_win_advance;
             fsm_im2col_load_tile_d   <= fsm_im2col_load_tile;
+            fsm_border_d             <= fsm_border;
         end
     end
+
+    // hw-pad: inject zero for border pixels (aligned with the delayed pixel data)
+    wire [ACT_DATA_W-1:0] im2col_pixel_data_mux =
+        fsm_border_d ? {ACT_DATA_W{1'b0}} : fsm_im2col_pixel_data;
 
     im2col_line_buffer #(
         .MAX_WIDTH   (MAX_WIDTH),
@@ -590,7 +608,7 @@ module npu_top #(
     ) u_im2col (
         .clk             (clk),
         .rst_n           (rst_n),
-        .i_pixel_data    (fsm_im2col_pixel_data),
+        .i_pixel_data    (im2col_pixel_data_mux),
         .i_pixel_vld     (fsm_im2col_pixel_vld_d),
         .i_pixel_tile    (fsm_im2col_load_tile_d),
         .i_ic_groups     (cfg_ic_groups),

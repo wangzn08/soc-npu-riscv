@@ -82,6 +82,9 @@ module param_regfile #(
     output wire                         o_relu_en,
     output wire                         o_out_ping_sel,  // CTRL[6]: NPU write bank for Out SRAM (independent of global ping_pong)
     output wire                         o_gemm_en,       // CTRL[7]: GEMM/FC mode (bypass im2col)
+    output wire                         o_hw_pad,        // CTRL[8]: hardware padding (FSM border zero-inject)
+    output wire [7:0]                   o_pad_w,         // NPU_PAD[7:0]: zero-pad columns each side
+    output wire [7:0]                   o_pad_h,         // NPU_PAD[15:8]: zero-pad rows each side
 
     // Status
     input  wire                         i_done_irq,
@@ -166,6 +169,8 @@ module param_regfile #(
     reg        ctrl_relu_en;
     reg        ctrl_out_ping;   // CTRL[6]: NPU write bank for Out SRAM
     reg        ctrl_gemm_en;    // CTRL[7]: GEMM/FC mode (bypass im2col)
+    reg        ctrl_hw_pad;     // CTRL[8]: hardware padding
+    reg [15:0] pad_cfg;         // NPU_PAD: {pad_h[15:8], pad_w[7:0]}
 
     // Status
     wire       status_done;
@@ -273,6 +278,8 @@ module param_regfile #(
             ctrl_relu_en    <= 1'b1;    // ReLU enabled by default
             ctrl_out_ping   <= 1'b0;    // NPU writes Out SRAM Ping bank by default
             ctrl_gemm_en    <= 1'b0;    // GEMM/FC mode off by default (conv path)
+            ctrl_hw_pad     <= 1'b0;    // hardware padding off by default
+            pad_cfg         <= 16'd0;
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
             act_addr_pong   <= {SRAM_ADDR_W{1'b0}};
             wgt_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -340,6 +347,7 @@ module param_regfile #(
                         ctrl_relu_en    <= s_axi_wdata[5];
                         ctrl_out_ping   <= s_axi_wdata[6];
                         ctrl_gemm_en    <= s_axi_wdata[7];
+                        ctrl_hw_pad     <= s_axi_wdata[8];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -420,6 +428,7 @@ module param_regfile #(
                         dma_wgt_ping_sel <= s_axi_wdata[1];
                         dma_out_ping_sel <= s_axi_wdata[2];
                     end
+                    10'h150: pad_cfg <= s_axi_wdata[15:0];  // {pad_h, pad_w}
 
                     default: ; // Ignore unmapped addresses
                 endcase
@@ -443,7 +452,7 @@ module param_regfile #(
             if (s_axi_arvalid && s_axi_arready && !rvalid) begin
                 rvalid <= 1'b1;
                 case (s_axi_araddr[ADDR_W-1:0])
-                    10'h00: rdata <= {24'd0, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
+                    10'h00: rdata <= {23'd0, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
                     10'h04: rdata <= {28'd0, i_dma_wr_err, i_dma_rd_err, i_busy, done_irq_latched};
                     10'h08: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_ping};
                     10'h0C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_pong};
@@ -501,6 +510,7 @@ module param_regfile #(
                     10'h13C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, dma_wr_sram_base};
                     10'h144: rdata <= {31'd0, dma_sram_sel};
                     10'h148: rdata <= {29'd0, dma_rd_sram_sel, dma_out_rd_sel};
+                    10'h150: rdata <= {16'd0, pad_cfg};
 
                     default: rdata <= 32'd0;
                 endcase
@@ -524,6 +534,9 @@ module param_regfile #(
     assign o_relu_en      = ctrl_relu_en;
     assign o_out_ping_sel = ctrl_out_ping;
     assign o_gemm_en      = ctrl_gemm_en;
+    assign o_hw_pad       = ctrl_hw_pad;
+    assign o_pad_w        = pad_cfg[7:0];
+    assign o_pad_h        = pad_cfg[15:8];
     assign o_clear_done   = ctrl_clear_done;
 
     assign o_act_addr_ping = act_addr_ping;

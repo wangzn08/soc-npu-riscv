@@ -28,6 +28,9 @@ module top_controller_fsm #(
     input  wire                     i_pool_en,
     input  wire                     i_eltwise_en,
     input  wire                     i_gemm_en,      // GEMM/FC mode: bypass im2col, act = vector
+    input  wire                     i_hw_pad,       // hardware padding: read tile-major, inject border zeros
+    input  wire [7:0]               i_pad_w,        // zero-pad columns each side
+    input  wire [7:0]               i_pad_h,        // zero-pad rows each side
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_ping,
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_pong,
     input  wire [SRAM_ADDR_W-1:0]   i_wgt_base_ping,
@@ -65,6 +68,7 @@ module top_controller_fsm #(
     output wire [3:0]               o_im2col_offset_sel,
     output wire [DATA_W-1:0]        o_im2col_pixel_data,
     output wire                     o_im2col_pixel_vld,
+    output wire                     o_border,             // hw-pad: current pixel is a border zero
     output wire [3:0]               o_im2col_load_tile,   // IC tile being streamed during LOAD_ROW
     input  wire                     i_im2col_win_vld,
     input  wire [15:0]              i_im2col_win_x,
@@ -180,13 +184,32 @@ module top_controller_fsm #(
     wire [SRAM_ADDR_W-1:0] gemm_act_addr;
     assign gemm_act_addr = act_base_addr + {{(SRAM_ADDR_W-12){1'b0}}, ic_tile[15:4]};
 
-    assign o_act_sram_addr = i_gemm_en ? gemm_act_addr : act_rd_addr;
+    // Hardware padding: read the previous layer's UNPADDED output tile-major and
+    // inject border zeros, so im2col sees the same padded stream as before but no
+    // CPU pad_activation is needed. unpad = i_dim_in_w/h - 2*pad (padded dims kept
+    // in i_dim_in_w/h so the output geometry is unchanged).
+    wire [15:0] unpad_w = i_dim_in_w - {7'd0, i_pad_w, 1'b0};
+    wire [15:0] unpad_h = i_dim_in_h - {7'd0, i_pad_h, 1'b0};
+    wire [SRAM_ADDR_W-1:0] unpad_spatial = unpad_w[SRAM_ADDR_W-1:0] * unpad_h[SRAM_ADDR_W-1:0];
+    wire at_border = i_hw_pad &&
+         ((cur_in_col <  {8'd0, i_pad_w}) || (cur_in_col >= i_dim_in_w - {8'd0, i_pad_w}) ||
+          (cur_in_row <  {8'd0, i_pad_h}) || (cur_in_row >= i_dim_in_h - {8'd0, i_pad_h}));
+    wire [SRAM_ADDR_W-1:0] tilemaj_addr = act_base_addr
+         + load_tile * unpad_spatial
+         + (cur_in_row - {8'd0, i_pad_h}) * unpad_w[SRAM_ADDR_W-1:0]
+         + (cur_in_col - {8'd0, i_pad_w});
+    assign o_border = at_border;
+
+    assign o_act_sram_addr = i_gemm_en ? gemm_act_addr
+                           : i_hw_pad  ? tilemaj_addr
+                           :             act_rd_addr;
     // GEMM reads the IC-tile word during PREFETCH (1-cycle SRAM latency; the
     // sdp_bram holds doa until the next read, so the word stays stable through
     // CALC where it is replicated to all 16 array rows).
     assign o_act_sram_en   = i_gemm_en
                            ? ((state == S_PREFETCH_WGT) && (pf_wait_cnt == 16'd0))
-                           : ((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && (load_col_cnt > 16'd0));
+                           : ((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && (load_col_cnt > 16'd0)
+                              && (!i_hw_pad || !at_border));   // skip SRAM read on border
 
     // Im2Col pixel feed (pass through from SRAM during LOAD_ROW)
     assign o_im2col_pixel_data = i_act_sram_data;

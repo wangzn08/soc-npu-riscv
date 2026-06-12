@@ -109,7 +109,7 @@ Argmax: find predicted digit                                          [CPU]
 
 **NPU operations:** 6 conv layers (all 3×3 INT8 with ReLU) via `npu_conv_pass()`, plus **Affine1 (1024→50) via `npu_gemm_pass()`** (GEMM/FC mode, decision F). Conv weights are preloaded into the Wgt SRAM **PING** bank once (`preload_conv_weights`); FC weights into the **PONG** bank once (`preload_fc_weights`); both stay resident across all images. Each NPU op configures registers, starts the NPU, waits for IRQ (`npu_irq_flag`), then DMA-reads results back to DDR.
 
-**CPU operations:** activation padding (`pad_activation`), data reorder, **Affine2 (50→10, raw INT32 logits)**, argmax. All in `deepnet_deploy.c`. (Max-pool is fused into the NPU conv pass via `pool_en`, see below — `cpu_max_pool_2x2` is unused.)
+**CPU operations:** Conv1 image formatting (image → tile-major DDR words), data reorder, **Affine2 (50→10, raw INT32 logits)**, argmax. All in `deepnet_deploy.c`. (Max-pool is fused into the NPU conv pass via `pool_en`; **activation padding is now done in hardware** — decision H — so `pad_activation` and `cpu_max_pool_2x2` are both unused.)
 
 **Note:** NPU pooling (`pool_en`) IS used — Conv2/Conv4/Conv6 fuse 2×2 max-pool into the same NPU pass. **Affine2 stays on CPU** because the NPU's INT8 post-process output saturates the final logits (argmax would be wrong); FC1 (the bottleneck) and any INT8-activation FC layer benefit from the NPU, the final logits layer does not.
 
@@ -129,7 +129,8 @@ Argmax: find predicted digit                                          [CPU]
 
 | Offset | Name | Description |
 |--------|------|-------------|
-| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en |
+| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad |
+| `0x150` | PAD | `[15:8]`pad_h, `[7:0]`pad_w (hardware padding border, with CTRL[8]) |
 | `0x004` | STATUS | `[0]`done_irq, `[1]`busy, `[2]`dma_rd_err, `[3]`dma_wr_err (RO) |
 | `0x008–0x01C` | SRAM addrs | Act/Wgt/Out SRAM base addresses (ping/pong) |
 | `0x020–0x02C` | Dimensions | IN_W, IN_H, IC, OC |
@@ -184,7 +185,26 @@ layer start / OC-tile change.
 - Result: conv (NPU) 8.64M → 2.15M cycles (all 6 layers −64..83%); full 10-image
   run **22.62M → 16.14M**, still bit-identical 10/10. Output is byte-for-byte
   unchanged (same weights, only their timing/source moves).
-- Next bottleneck is now CPU `pad_activation` (~6.4M).
+
+### H: Hardware padding (`hw_pad`, CTRL[8] + `NPU_PAD`)
+
+CPU `pad_activation` used to transpose (tile-major→position-major) AND zero-pad the
+previous layer's output in DDR (~6.4M cycles, memory-bound). Replaced by hardware
+padding: the FSM reads the previous output **tile-major directly from Act SRAM**
+and **injects border zeros** so im2col sees the same padded stream — no CPU pad,
+no transpose, no PAD_BUF round-trip. `NPU_IN_W/H` stay the padded dims (geometry
+unchanged); `NPU_PAD = {pad_h, pad_w}` (0x150) gives the per-side zero border;
+`CTRL[8] hw_pad` enables it. The border flag is delayed one cycle in `npu_top`
+(`fsm_border_d`) to match the SRAM read, muxing a zero into `im2col.i_pixel_data`.
+im2col/systolic/post are **unchanged**.
+- **General:** any pad (Conv4 uses pad=2, others pad=1), any dims/tiles — driven by
+  `NPU_PAD`. Firmware DMAs the previous layer's unpadded output straight in.
+- Result: `pad` 6.4M → ~1.0M (residual = Conv1 image-to-DDR formatting); inference
+  10.1M → 4.6M; full run **16.14M → 10.91M**, bit-identical 10/10. `pad_activation`
+  is removed (unused). When task E rewrites the im2col front-end, padding can
+  migrate fully into im2col.
+- Next bottleneck: the ~6M of sim UART prints / one-time preload (outside the
+  per-image inference path).
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 
