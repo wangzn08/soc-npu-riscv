@@ -5,7 +5,7 @@
 // parameters are included as register arrays.
 //
 // Address map (byte-offset, 32-bit word-aligned):
-//   0x00  CTRL           [0]start [1]ping_pong [2]pool_en [3]eltwise_en [4]clear_done [5]relu_en
+//   0x00  CTRL           [0]start [1]ping_pong [2]pool_en [3]eltwise_en [4]clear_done [5]relu_en [6]out_ping [7]gemm_en
 //   0x04  STATUS         [0]done_irq [1]busy [2]dma_rd_err [3]dma_wr_err
 //   0x08  ACT_ADDR_PING  Act SRAM ping buffer base address (in SRAM word addr)
 //   0x0C  ACT_ADDR_PONG
@@ -80,6 +80,8 @@ module param_regfile #(
     output wire                         o_pool_en,
     output wire                         o_eltwise_en,
     output wire                         o_relu_en,
+    output wire                         o_out_ping_sel,  // CTRL[6]: NPU write bank for Out SRAM (independent of global ping_pong)
+    output wire                         o_gemm_en,       // CTRL[7]: GEMM/FC mode (bypass im2col)
 
     // Status
     input  wire                         i_done_irq,
@@ -148,7 +150,8 @@ module param_regfile #(
 
     // DMA ping/pong buffer select for SRAM writes
     output wire                         o_dma_act_ping_sel, // 0=Ping, 1=Pong — Act SRAM DMA write target
-    output wire                         o_dma_wgt_ping_sel  // 0=Ping, 1=Pong — Wgt SRAM DMA write target
+    output wire                         o_dma_wgt_ping_sel, // 0=Ping, 1=Pong — Wgt SRAM DMA write target
+    output wire                         o_dma_out_ping_sel  // 0=Ping, 1=Pong — Out SRAM DMA read source (decoupled from NPU write bank)
 );
 
     // -------------------------------------------------------------------
@@ -161,6 +164,8 @@ module param_regfile #(
     reg        ctrl_eltwise_en;
     reg        ctrl_clear_done;
     reg        ctrl_relu_en;
+    reg        ctrl_out_ping;   // CTRL[6]: NPU write bank for Out SRAM
+    reg        ctrl_gemm_en;    // CTRL[7]: GEMM/FC mode (bypass im2col)
 
     // Status
     wire       status_done;
@@ -219,6 +224,7 @@ module param_regfile #(
     reg [1:0]  dma_rd_sram_sel; // 0=Out SRAM, 1=Act SRAM, 2=Wgt SRAM for DMA read source
     reg        dma_act_ping_sel; // 0=Ping, 1=Pong — Act SRAM DMA write target
     reg        dma_wgt_ping_sel; // 0=Ping, 1=Pong — Wgt SRAM DMA write target
+    reg        dma_out_ping_sel; // 0=Ping, 1=Pong — Out SRAM DMA read source (independent of NPU write bank)
 
     // -------------------------------------------------------------------
     // Write channel: decode address and update register
@@ -265,6 +271,8 @@ module param_regfile #(
             ctrl_eltwise_en <= 1'b0;
             ctrl_clear_done <= 1'b0;
             ctrl_relu_en    <= 1'b1;    // ReLU enabled by default
+            ctrl_out_ping   <= 1'b0;    // NPU writes Out SRAM Ping bank by default
+            ctrl_gemm_en    <= 1'b0;    // GEMM/FC mode off by default (conv path)
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
             act_addr_pong   <= {SRAM_ADDR_W{1'b0}};
             wgt_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -300,6 +308,7 @@ module param_regfile #(
             dma_rd_sram_sel  <= 2'd0;
             dma_act_ping_sel <= 1'b0;  // Default: DMA writes to Ping (same as NPU default)
             dma_wgt_ping_sel <= 1'b0;
+            dma_out_ping_sel <= 1'b0;  // Default: DMA reads Out SRAM Ping bank
             for (wi = 0; wi < NUM_OC; wi = wi + 1) begin
                 bias_val[wi]    <= 32'd0;
                 scale_mul[wi]   <= 32'd0;
@@ -329,6 +338,8 @@ module param_regfile #(
                         ctrl_eltwise_en <= s_axi_wdata[3];
                         ctrl_clear_done <= s_axi_wdata[4];
                         ctrl_relu_en    <= s_axi_wdata[5];
+                        ctrl_out_ping   <= s_axi_wdata[6];
+                        ctrl_gemm_en    <= s_axi_wdata[7];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -407,6 +418,7 @@ module param_regfile #(
                     10'h14C: begin
                         dma_act_ping_sel <= s_axi_wdata[0];
                         dma_wgt_ping_sel <= s_axi_wdata[1];
+                        dma_out_ping_sel <= s_axi_wdata[2];
                     end
 
                     default: ; // Ignore unmapped addresses
@@ -431,7 +443,7 @@ module param_regfile #(
             if (s_axi_arvalid && s_axi_arready && !rvalid) begin
                 rvalid <= 1'b1;
                 case (s_axi_araddr[ADDR_W-1:0])
-                    10'h00: rdata <= {26'd0, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
+                    10'h00: rdata <= {24'd0, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
                     10'h04: rdata <= {28'd0, i_dma_wr_err, i_dma_rd_err, i_busy, done_irq_latched};
                     10'h08: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_ping};
                     10'h0C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_pong};
@@ -510,6 +522,8 @@ module param_regfile #(
     assign o_pool_en      = ctrl_pool_en;
     assign o_eltwise_en   = ctrl_eltwise_en;
     assign o_relu_en      = ctrl_relu_en;
+    assign o_out_ping_sel = ctrl_out_ping;
+    assign o_gemm_en      = ctrl_gemm_en;
     assign o_clear_done   = ctrl_clear_done;
 
     assign o_act_addr_ping = act_addr_ping;
@@ -557,5 +571,6 @@ module param_regfile #(
     assign o_dma_rd_sram_sel  = dma_rd_sram_sel;
     assign o_dma_act_ping_sel = dma_act_ping_sel;
     assign o_dma_wgt_ping_sel = dma_wgt_ping_sel;
+    assign o_dma_out_ping_sel = dma_out_ping_sel;
 
 endmodule

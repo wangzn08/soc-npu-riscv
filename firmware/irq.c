@@ -8,12 +8,25 @@
 #include "firmware.h"
 
 volatile uint32_t npu_irq_flag = 0;
+volatile uint32_t dma_rd_irq_flag = 0;
+volatile uint32_t dma_wr_irq_flag = 0;
 
 uint32_t *irq(uint32_t *regs, uint32_t irqs)
 {
 	static unsigned int ext_irq_4_count = 0;
 	static unsigned int ext_irq_5_count = 0;
 	static unsigned int timer_irq_count = 0;
+
+	// DMA read/write done IRQ (bits 4/5)
+	// The DMA-done IRQ lines are level-sensitive latches in axi_sys.v.  We MUST
+	// ack them here (drop the line before retirq) or the handler re-fires forever.
+	// Reading NPU_DMA_STATUS clears both DMA-done latches in hardware.
+	if ((irqs & (1<<4)) != 0)
+		dma_rd_irq_flag = 1;
+	if ((irqs & (1<<5)) != 0)
+		dma_wr_irq_flag = 1;
+	if ((irqs & ((1<<4)|(1<<5))) != 0)
+		(void)*(volatile uint32_t *)(uint32_t)NPU_DMA_STATUS;  // ack: clears latches
 
 	// NPU done IRQ (bit 3)
 	if ((irqs & (1<<3)) != 0) {

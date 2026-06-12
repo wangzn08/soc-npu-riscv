@@ -7,6 +7,8 @@
 // irq.c
 uint32_t *irq(uint32_t *regs, uint32_t irqs);
 extern volatile uint32_t npu_irq_flag;
+extern volatile uint32_t dma_rd_irq_flag;   // set by IRQ handler when DMA read completes
+extern volatile uint32_t dma_wr_irq_flag;   // set by IRQ handler when DMA write completes
 
 // print.c
 void print_chr(char ch);
@@ -38,7 +40,7 @@ void usercode7(void);
 // ---- NPU 寄存器定义 (0x3000_0000 ~ 0x3000_0FFF) ----
 // 16×16 systolic array NPU register map (matches param_regfile.v)
 #define NPU_BASE       0x30000000
-#define NPU_CTRL       (NPU_BASE + 0x000)  // [0]start [1]ping_pong [2]pool_en [3]eltwise_en [4]clear_done [5]relu_en
+#define NPU_CTRL       (NPU_BASE + 0x000)  // [0]start [1]ping_pong [2]pool_en [3]eltwise_en [4]clear_done [5]relu_en [6]out_ping [7]gemm_en
 #define NPU_STATUS     (NPU_BASE + 0x004)  // [0]done_irq [1]busy [2]dma_rd_err [3]dma_wr_err (read-only)
 #define NPU_ACT_ADDR_A (NPU_BASE + 0x008)
 #define NPU_ACT_ADDR_B (NPU_BASE + 0x00C)
@@ -68,7 +70,8 @@ void usercode7(void);
 #define NPU_DMA_WR_SRAM_BASE (NPU_BASE + 0x13C)
 #define NPU_DMA_STATUS       (NPU_BASE + 0x140)  // [0]rd_done [1]wr_done (read-only)
 #define NPU_DMA_SRAM_SEL     (NPU_BASE + 0x144)  // 0=Act, 1=Wgt
-#define NPU_DMA_PATH_CTL    (NPU_BASE + 0x148)
+#define NPU_DMA_PATH_CTL     (NPU_BASE + 0x148)
+#define NPU_DMA_PING_SEL     (NPU_BASE + 0x14C)  // [0]=Act ping, [1]=Wgt ping, [2]=Out ping
 
 // CTRL bits
 #define NPU_CTRL_START      (1 << 0)
@@ -77,6 +80,8 @@ void usercode7(void);
 #define NPU_CTRL_ELTWISE_EN (1 << 3)
 #define NPU_CTRL_CLEAR_DONE (1 << 4)
 #define NPU_CTRL_RELU_EN    (1 << 5)
+#define NPU_CTRL_OUT_PING   (1 << 6)
+#define NPU_CTRL_GEMM_EN    (1 << 7)   // GEMM/FC mode: bypass im2col, vector x matrix
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)

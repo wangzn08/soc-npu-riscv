@@ -3,6 +3,7 @@ firmware/build/
 
 # ModelSim simulation artifacts
 sim/work/
+transcript
 sim/transcript
 sim/vsim.wlf
 sim/*.wlf
@@ -14,3 +15,4 @@ sim/axi_sys_tb.vcd
 .DS_Store
 Thumbs.db
 .tmp/
+tmp/

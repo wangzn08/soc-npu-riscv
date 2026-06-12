@@ -35,6 +35,8 @@ module axi_sys #(
     wire [31:0] cpu_axi_rdata;
 
     reg         npu_irq_latched;   // NPU done IRQ latch (declared early for CPU irq port)
+    reg         dma_rd_irq_latched; // DMA read done IRQ latch (declared early for CPU irq port)
+    reg         dma_wr_irq_latched; // DMA write done IRQ latch (declared early for CPU irq port)
 
     picorv32_axi #(
         .ENABLE_COUNTERS     (1),
@@ -50,7 +52,7 @@ module axi_sys #(
         .CATCH_ILLINSN       (0),
         .ENABLE_PCPI         (0),
         .ENABLE_MUL          (1),
-        .ENABLE_FAST_MUL     (0),
+        .ENABLE_FAST_MUL     (1),
         .ENABLE_DIV          (1),
         .ENABLE_IRQ          (1),
         .ENABLE_TRACE        (0),
@@ -79,7 +81,7 @@ module axi_sys #(
         .mem_axi_rvalid     (cpu_axi_rvalid),
         .mem_axi_rready     (cpu_axi_rready),
         .mem_axi_rdata      (cpu_axi_rdata),
-        .irq                ({28'b0, npu_irq_latched, 3'b0}),  // bit 3 = NPU done (avoids PicoRV32 bus-error irq[2])
+        .irq                ({26'b0, dma_wr_irq_latched, dma_rd_irq_latched, npu_irq_latched, 3'b0}),  // bit3=NPU done, bit4=DMA rd, bit5=DMA wr
         .eoi                (),
         .trace_valid        (),
         .trace_data         ()
@@ -156,6 +158,14 @@ module axi_sys #(
     // CPU MMIO reads are served by the NPU's register read port.
     // -----------------------------------------------------------------
     wire        npu_irq_done;
+    wire        npu_dma_rd_done;
+    wire        npu_dma_wr_done;
+
+    // Rising-edge detectors for DMA done (level→pulse, one IRQ per completion)
+    reg         dma_rd_done_d;
+    reg         dma_wr_done_d;
+    wire        dma_rd_done_rise = npu_dma_rd_done & ~dma_rd_done_d;
+    wire        dma_wr_done_rise = npu_dma_wr_done & ~dma_wr_done_d;
 
     reg         npu_reg_wr_en;
     reg  [9:0]  npu_reg_wr_addr;
@@ -174,6 +184,45 @@ module axi_sys #(
             npu_irq_latched <= 1'b1;
         else if (npu_reg_wr_en && npu_reg_wr_addr == 10'h000)
             npu_irq_latched <= 1'b0;  // cleared on any CTRL write (start or clear_done)
+    end
+
+    // Rising-edge delay registers
+    always @(posedge clk or negedge resetn) begin
+        if (!resetn) begin
+            dma_rd_done_d <= 1'b0;
+            dma_wr_done_d <= 1'b0;
+        end else begin
+            dma_rd_done_d <= npu_dma_rd_done;
+            dma_wr_done_d <= npu_dma_wr_done;
+        end
+    end
+
+    // DMA rd done IRQ latch: set on rising edge of DMA read done.
+    // Cleared by: (a) CPU writing NPU_DMA_RD_TRIG (0x120→word 0x48) for the next
+    // request, or (b) CPU reading NPU_DMA_STATUS (0x140→word 0x50) as an IRQ ack.
+    // The read-ack is essential: the IRQ line is level-sensitive, so without it the
+    // handler would re-fire forever (same reason NPU-done uses CLEAR_DONE).
+    always @(posedge clk or negedge resetn) begin
+        if (!resetn)
+            dma_rd_irq_latched <= 1'b0;
+        else if ((npu_reg_wr_en && npu_reg_wr_addr == 10'h048) ||
+                 (npu_reg_rd_en && npu_reg_rd_addr == 10'h050))
+            dma_rd_irq_latched <= 1'b0;
+        else if (dma_rd_done_rise)
+            dma_rd_irq_latched <= 1'b1;
+    end
+
+    // DMA wr done IRQ latch: set on rising edge of DMA write done.
+    // Cleared by CPU writing NPU_DMA_WR_TRIG (0x130→word 0x4C) or reading
+    // NPU_DMA_STATUS (0x140→word 0x50) as an IRQ ack (see note above).
+    always @(posedge clk or negedge resetn) begin
+        if (!resetn)
+            dma_wr_irq_latched <= 1'b0;
+        else if ((npu_reg_wr_en && npu_reg_wr_addr == 10'h04C) ||
+                 (npu_reg_rd_en && npu_reg_rd_addr == 10'h050))
+            dma_wr_irq_latched <= 1'b0;
+        else if (dma_wr_done_rise)
+            dma_wr_irq_latched <= 1'b1;
     end
 
     // MMIO 地址锁存
@@ -537,7 +586,11 @@ module axi_sys #(
         .m_axi_rlast        (npu_m_rlast),
         .m_axi_rresp        (npu_m_rresp),
         // Interrupt
-        .irq_done           (npu_irq_done)
+        .irq_done           (npu_irq_done),
+
+        // DMA completion
+        .dma_rd_done        (npu_dma_rd_done),
+        .dma_wr_done        (npu_dma_wr_done)
     );
 
     // 状态输出

@@ -66,7 +66,11 @@ module npu_axi_wrapper #(
     input  wire [1:0]                   m_axi_rresp,
 
     // === Interrupt ===
-    output wire                         irq_done
+    output wire                         irq_done,
+
+    // === DMA completion signals ===
+    output wire                         dma_rd_done,
+    output wire                         dma_wr_done
 );
 
     // ===================================================================
@@ -233,7 +237,11 @@ module npu_axi_wrapper #(
         .m_axi_bresp    (dma_bresp),
 
         // Interrupt
-        .irq_done       (irq_done)
+        .irq_done       (irq_done),
+
+        // DMA completion
+        .dma_rd_done    (dma_rd_done),
+        .dma_wr_done    (dma_wr_done)
     );
 
     // ===================================================================

@@ -108,7 +108,11 @@ module npu_top #(
     input  wire [1:0]                       m_axi_bresp,
 
     // === Interrupt ===
-    output wire                             irq_done
+    output wire                             irq_done,
+
+    // === DMA completion signals ===
+    output wire                             dma_rd_done,
+    output wire                             dma_wr_done
 );
 
     // ===================================================================
@@ -120,6 +124,8 @@ module npu_top #(
     wire                            cfg_eltwise_en;
     wire                            cfg_clear_done;
     wire                            cfg_relu_en;
+    wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
+    wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            status_done_irq;
     wire                            status_busy;
     wire                            dma_rd_err;
@@ -165,9 +171,7 @@ module npu_top #(
     wire [15:0]                     cfg_dma_wr_len;
     wire [SRAM_ADDR_W-1:0]          cfg_dma_wr_sram_base;
 
-    // DMA done signals (to register file)
-    wire                            dma_rd_done;
-    wire                            dma_wr_done;
+    // DMA done signals: driven by axi_dma, exposed as output ports for CPU IRQ
 
     // DMA SRAM select: 0=Act SRAM, 1=Wgt SRAM
     wire                            cfg_dma_sram_sel;
@@ -177,6 +181,7 @@ module npu_top #(
     wire [1:0]                      cfg_dma_rd_sram_sel;  // 0=Out, 1=Act, 2=Wgt
     wire                            cfg_dma_act_ping_sel; // DMA Act SRAM buffer select
     wire                            cfg_dma_wgt_ping_sel; // DMA Wgt SRAM buffer select
+    wire                            cfg_dma_out_ping_sel; // DMA Out SRAM read bank (decoupled from NPU write bank)
 
     // ===================================================================
     // Instantiate Parameter Register File
@@ -214,6 +219,8 @@ module npu_top #(
         .o_pool_en        (cfg_pool_en),
         .o_eltwise_en     (cfg_eltwise_en),
         .o_relu_en        (cfg_relu_en),
+        .o_out_ping_sel   (cfg_out_ping_sel),
+        .o_gemm_en        (cfg_gemm_en),
         .i_done_irq       (status_done_irq),
         .i_busy           (status_busy),
         .i_dma_rd_err     (dma_rd_err),
@@ -259,7 +266,8 @@ module npu_top #(
         .o_dma_out_rd_sel  (cfg_dma_out_rd_sel),
         .o_dma_rd_sram_sel (cfg_dma_rd_sram_sel),
         .o_dma_act_ping_sel(cfg_dma_act_ping_sel),
-        .o_dma_wgt_ping_sel(cfg_dma_wgt_ping_sel)
+        .o_dma_wgt_ping_sel(cfg_dma_wgt_ping_sel),
+        .o_dma_out_ping_sel(cfg_dma_out_ping_sel)
     );
 
     // ===================================================================
@@ -352,8 +360,8 @@ module npu_top #(
         .addrb         (out_sram_addrb),
         .dib           (out_sram_dib),
         .dob           (out_sram_dob),
-        .npu_ping_sel  (cfg_ping_pong_sel),
-        .dma_ping_sel  (cfg_ping_pong_sel)   // DMA reads from SAME buffer as NPU writes
+        .npu_ping_sel  (cfg_out_ping_sel),     // NPU write bank for Out SRAM (CTRL[6]), independent of global ping_pong
+        .dma_ping_sel  (cfg_dma_out_ping_sel) // DMA Out SRAM read bank is independent of NPU write bank
     );
 
     // synthesis translate_off
@@ -425,6 +433,7 @@ module npu_top #(
         .i_ping_pong_sel      (cfg_ping_pong_sel),
         .i_pool_en            (cfg_pool_en),
         .i_eltwise_en         (cfg_eltwise_en),
+        .i_gemm_en            (cfg_gemm_en),
         .i_act_base_ping      (cfg_act_addr_ping),
         .i_act_base_pong      (cfg_act_addr_pong),
         .i_wgt_base_ping      (cfg_wgt_addr_ping),
@@ -501,6 +510,9 @@ module npu_top #(
     wire [WGT_BUS_W-1:0]     wgt_reader_wgt;
     wire                     wgt_reader_wgt_vld;
 
+    // Runtime kernel-offset count for wgt_reader (conv 3x3 -> 9, GEMM 1x1 -> 1)
+    wire [7:0] cfg_kernel_offsets = {4'd0, cfg_kh[3:0]} * {4'd0, cfg_kw[3:0]};
+
     wgt_reader #(
         .NUM_OC         (ARRAY_COLS),
         .SRAM_ADDR_W    (SRAM_ADDR_W)
@@ -515,6 +527,7 @@ module npu_top #(
         .i_ic_group        (fsm_wgt_ic_group),
         .i_ic_groups_total (fsm_wgt_ic_groups_total),
         .i_wgt_base        (fsm_wgt_base),
+        .i_kernel_offsets  (cfg_kernel_offsets),
         .o_prefetch_done   (fsm_wgt_prefetch_done),
         .i_wgt_offset      (fsm_im2col_offset_sel),
         .o_wgt             (wgt_reader_wgt),
@@ -608,7 +621,11 @@ module npu_top #(
     ) u_systolic (
         .clk         (clk),
         .rst_n       (rst_n),
-        .i_act       (im2col_act_window),
+        // GEMM mode: replicate the current IC-tile activation word to all 16
+        // rows (same replication im2col does for conv) — every PE in a column
+        // computes the identical dot product, so drain/POST capture is
+        // phase-independent. Conv mode: im2col window as before.
+        .i_act       (cfg_gemm_en ? {ARRAY_ROWS{act_sram_doa}} : im2col_act_window),
         .i_wgt       (wgt_reader_wgt),
         .o_psum_col  (array_psum_col),
         .i_vld       (fsm_array_vld),

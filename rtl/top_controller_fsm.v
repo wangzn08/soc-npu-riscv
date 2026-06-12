@@ -27,6 +27,7 @@ module top_controller_fsm #(
     input  wire                     i_ping_pong_sel,
     input  wire                     i_pool_en,
     input  wire                     i_eltwise_en,
+    input  wire                     i_gemm_en,      // GEMM/FC mode: bypass im2col, act = vector
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_ping,
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_pong,
     input  wire [SRAM_ADDR_W-1:0]   i_wgt_base_ping,
@@ -141,6 +142,10 @@ module top_controller_fsm #(
     wire [15:0] ic_groups;
     assign ic_groups = (i_dim_in_c + 16'd15) >> 4;  // ceil(IC/16)
 
+    // Runtime kernel offsets (conv 3x3 -> 9, GEMM 1x1 -> 1); replaces KERNEL_OFFSETS
+    wire [7:0] ko_total;
+    assign ko_total = {4'd0, i_kernel_kh[3:0]} * {4'd0, i_kernel_kw[3:0]};
+
     // Input stride in 128-bit words per row
     wire [SRAM_ADDR_W-1:0] act_row_stride;
     assign act_row_stride = i_dim_in_w * ic_groups;
@@ -161,8 +166,17 @@ module top_controller_fsm #(
                        + cur_in_col * ic_groups
                        + load_tile;   // stream each IC tile of the column
 
-    assign o_act_sram_addr = act_rd_addr;
-    assign o_act_sram_en   = (state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && (load_col_cnt > 16'd0);
+    // GEMM: input vector word index = ic_tile/16 (ceil(IC/16) words at act_base)
+    wire [SRAM_ADDR_W-1:0] gemm_act_addr;
+    assign gemm_act_addr = act_base_addr + {{(SRAM_ADDR_W-12){1'b0}}, ic_tile[15:4]};
+
+    assign o_act_sram_addr = i_gemm_en ? gemm_act_addr : act_rd_addr;
+    // GEMM reads the IC-tile word during PREFETCH (1-cycle SRAM latency; the
+    // sdp_bram holds doa until the next read, so the word stays stable through
+    // CALC where it is replicated to all 16 array rows).
+    assign o_act_sram_en   = i_gemm_en
+                           ? ((state == S_PREFETCH_WGT) && (pf_wait_cnt == 16'd0))
+                           : ((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && (load_col_cnt > 16'd0));
 
     // Im2Col pixel feed (pass through from SRAM during LOAD_ROW)
     assign o_im2col_pixel_data = i_act_sram_data;
@@ -195,10 +209,11 @@ module top_controller_fsm #(
     // step during the sweep (NEXT_TILE).  The im2col keeps one shared timeline
     // and shifts all IC tiles' windows together.  For ic_groups==1 the LOAD term
     // fires every pixel cycle, identical to the original single-tile design.
-    assign o_im2col_win_advance = ((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w)
+    assign o_im2col_win_advance = !i_gemm_en &&
+                             (((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w)
                                      && !i_im2col_win_vld && (load_col_cnt > 16'd0)
                                      && (load_tile == (ic_groups[3:0] - 4'd1)))
-                             || ((state == S_NEXT_TILE) && (ko_cnt == 4'd0));
+                             || ((state == S_NEXT_TILE) && (ko_cnt == 4'd0)));
     assign o_im2col_offset_sel = ko_cnt;
     assign o_im2col_load_tile  = load_tile;
 
@@ -275,7 +290,8 @@ module top_controller_fsm #(
                         pf_wait_cnt<= 16'd0;
                         row_base_in_row <= 16'd0;
                         load_tile  <= 4'd0;
-                        state <= S_LOAD_ROW;
+                        // GEMM mode bypasses im2col line-load (S_LOAD_ROW/S_WAIT_WIN)
+                        state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
                     end
                 end
 
@@ -344,7 +360,7 @@ module top_controller_fsm #(
                 // CALC_KERNEL: 9 cycles, one per kernel offset
                 // -------------------------------------------------------
                 S_CALC_KERNEL: begin
-                    if (ko_cnt == (KERNEL_OFFSETS - 1)) begin
+                    if (ko_cnt == (ko_total[3:0] - 4'd1)) begin
                         ko_cnt <= 4'd0;
                         if (ic_tile + 16'd16 < i_dim_in_c) begin
                             // More IC tiles: accumulate across tiles, skip drain
@@ -419,8 +435,9 @@ module top_controller_fsm #(
                         if (oc_tile + 16'd16 < i_dim_out_c) begin
                             // Next OC tile
                             oc_tile <= oc_tile + 16'd16;
-                            state <= S_LOAD_ROW;
+                            state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
                             load_col_cnt <= 16'd0;
+                            pf_wait_cnt  <= 16'd0;
                         end else begin
                             state <= S_DONE;
                         end

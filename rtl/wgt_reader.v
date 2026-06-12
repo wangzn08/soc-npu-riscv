@@ -5,13 +5,18 @@
 // Im2Col kernel-offset sequence.
 //
 // Since the SRAM has one read port but the array needs 16×128 bits per
-// cycle, the reader pre-fetches 9 kernel-offset × 16 output-channel
-// weight groups during the line-load phase and holds them in registers.
-// During CALC_MAC the correct offset group is selected combinationally.
+// cycle, the reader pre-fetches i_kernel_offsets (= KH·KW: 9 for 3×3 conv,
+// 1 for 1×1 GEMM/FC) × 16 output-channel weight groups during the line-load
+// phase and holds them in registers.  During CALC_MAC the correct offset
+// group is selected combinationally.
+//
+// KERNEL_OFFSETS (param) = compile-time max buffer depth; i_kernel_offsets
+// (port) = runtime active offset count (≤ KERNEL_OFFSETS).
 //
 // Weight SRAM organization (NHWC mapping, innermost→outermost):
 //   KW → KH → IC_group → OC
-// Address = oc * IC_GROUPS * KH * KW + ic_group * KH * KW + kh * KW + kw
+// Address = oc * IC_GROUPS * KO + ic_group * KO + ko   (KO = i_kernel_offsets,
+//           ko = kh*KW+kw collapsed to the linear offset index)
 // -------------------------------------------------------------------
 
 module wgt_reader #(
@@ -40,6 +45,7 @@ module wgt_reader #(
     input  wire [9:0]                   i_ic_group,        // Input channel group index
     input  wire [15:0]                  i_ic_groups_total,  // IC/16 for the layer
     input  wire [SRAM_ADDR_W-1:0]       i_wgt_base,         // Wgt SRAM base (resident weights)
+    input  wire [7:0]                   i_kernel_offsets,  // runtime kh*kw (conv 9, GEMM 1)
     output wire                         o_prefetch_done,   // Pre-fetch complete
 
     // === Kernel offset selection (during CALC_MAC) ===
@@ -71,25 +77,25 @@ module wgt_reader #(
     reg [4:0] pf_oc_d;     // Delayed oc
     reg       pf_done_r;
 
-    // Address stride between consecutive OCs for the same (ic_group, kh, kw)
+    // Address stride between consecutive OCs for the same (ic_group, ko)
+    // KO = i_kernel_offsets (runtime kh*kw): conv 3x3 -> 9 (identical to old
+    // compile-time KH*KW), GEMM 1x1 -> 1.
     wire [SRAM_ADDR_W-1:0] oc_stride;
-    assign oc_stride = {{(SRAM_ADDR_W-10){1'b0}}, i_ic_groups_total} * KH * KW;
+    assign oc_stride = i_ic_groups_total[SRAM_ADDR_W-1:0]
+                     * {{(SRAM_ADDR_W-8){1'b0}}, i_kernel_offsets};
 
-    // Base address for current pre-fetch:
-    //   oc_base * IC_GROUPS * KH * KW + ic_group * KH * KW + kh * KW + kw
+    // Base address: oc_base*icg*KO + ic_group*KO + ko   (kh*KW+kw == pf_ko)
     wire [SRAM_ADDR_W-1:0] addr_oc_component;
     wire [SRAM_ADDR_W-1:0] addr_ic_component;
-    wire [SRAM_ADDR_W-1:0] addr_kh;
-    wire [SRAM_ADDR_W-1:0] addr_kw;
 
-    assign addr_oc_component = i_oc_base * i_ic_groups_total * KH * KW;
-    assign addr_ic_component = i_ic_group * KH * KW;
-    assign addr_kh = (pf_ko / KW) * KW;  // pf_ko / 3 * 3
-    assign addr_kw = pf_ko % KW;          // pf_ko % 3
+    assign addr_oc_component = {{(SRAM_ADDR_W-10){1'b0}}, i_oc_base} * oc_stride;
+    assign addr_ic_component = {{(SRAM_ADDR_W-10){1'b0}}, i_ic_group}
+                             * {{(SRAM_ADDR_W-8){1'b0}}, i_kernel_offsets};
 
     wire [SRAM_ADDR_W-1:0] sram_rd_addr;
     assign sram_rd_addr = i_wgt_base
-                        + addr_oc_component + addr_ic_component + addr_kh + addr_kw
+                        + addr_oc_component + addr_ic_component
+                        + {{(SRAM_ADDR_W-4){1'b0}}, pf_ko}
                         + pf_oc * oc_stride;
 
     assign o_sram_addr = sram_rd_addr;
@@ -134,7 +140,7 @@ module wgt_reader #(
 
                     // After last address presented, transition to PF_WAIT_LAST
                     // to capture the final SRAM read data (1-cycle latency).
-                    if (pf_ko == (KERNEL_OFFSETS - 1) && pf_oc == 5'd15) begin
+                    if (pf_ko == (i_kernel_offsets[3:0] - 4'd1) && pf_oc == 5'd15) begin
                         pf_state <= PF_WAIT_LAST;
                     end else begin
                         // Advance OC, then kernel offset
@@ -187,6 +193,6 @@ module wgt_reader #(
     endgenerate
 
     // Weight valid when pre-fetch is done and offset is within range
-    assign o_wgt_vld = (pf_state == PF_DONE) && (i_wgt_offset < KERNEL_OFFSETS);
+    assign o_wgt_vld = (pf_state == PF_DONE) && (i_wgt_offset < i_kernel_offsets[3:0]);
 
 endmodule
