@@ -42,7 +42,7 @@ static inline uint32_t rdcycle32(void) {
 }
 // Per-phase accumulators (summed over all 10 images).
 static uint32_t prof_pad, prof_load, prof_npu, prof_reorder,
-                prof_affine, prof_argmax, prof_infer;
+                prof_affine, prof_argmax, prof_infer, prof_preload;
 static uint32_t prof_npu_layer[6];   // per-conv NPU time
 static int      prof_conv_idx;       // reset to 0 at each image
 #define PROF_T0()       uint32_t _pt = rdcycle32()
@@ -842,9 +842,16 @@ void usercode7(void)
 
     // Preload all conv weights into Wgt SRAM once; they stay resident for
     // every image instead of being re-packed and re-DMA'd on every pass.
+    // This is one-time startup, NOT part of per-image inference.
+#if NPU_PROFILE
+    uint32_t _pre0 = rdcycle32();
+#endif
     preload_conv_weights();
     // Preload FC (affine) weights into the Wgt SRAM PONG bank (resident).
     preload_fc_weights();
+#if NPU_PROFILE
+    prof_preload = rdcycle32() - _pre0;
+#endif
 
     volatile int32_t *scr = (volatile int32_t *)SCORES;
 
@@ -897,7 +904,9 @@ void usercode7(void)
 #if NPU_PROFILE
     // Per-phase cycle breakdown, summed over all 10 images.
     print_str("\n=== CYCLE PROFILE (10 images total) ===\n");
+    print_str("preload(1x): "); print_dec(prof_preload); print_chr('\n');
     print_str("infer_total: "); print_dec(prof_infer);   print_chr('\n');
+    print_str("infer/image: "); print_dec(prof_infer / 10); print_chr('\n');
     print_str("  npu      : "); print_dec(prof_npu);     print_chr('\n');
     print_str("  pad      : "); print_dec(prof_pad);     print_chr('\n');
     print_str("  load     : "); print_dec(prof_load);    print_chr('\n');
