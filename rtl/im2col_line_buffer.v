@@ -49,6 +49,8 @@ module im2col_line_buffer #(
     input  wire                         i_win_advance,  // Shift window right 1 col (once/column)
     input  wire                         i_win_freeze,   // Hold window fixed
     input  wire [3:0]                   i_offset_sel,   // 0..8 kernel offset position
+    input  wire                         i_row_par_en,   // task E: 16-wide slice mode
+    input  wire [15:0]                  i_group_base,   // first output column of the 16-wide group
 
     // Output: one kernel-offset activation vector, replicated 16×
     output wire [ACT_BUS_W-1:0]         o_act_window,

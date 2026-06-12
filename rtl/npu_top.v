@@ -408,6 +408,7 @@ module npu_top #(
     wire                        fsm_im2col_pixel_vld;
     wire                        fsm_border;
     wire [3:0]                  fsm_im2col_load_tile;
+    wire [15:0]                 fsm_im2col_group_base;
     wire                        fsm_im2col_sweep_advance;
     wire                        fsm_im2col_win_vld;
     wire [15:0]                 fsm_im2col_win_x;
@@ -483,7 +484,9 @@ module npu_top #(
         .o_im2col_pixel_data  (fsm_im2col_pixel_data),
         .o_im2col_pixel_vld   (fsm_im2col_pixel_vld),
         .o_border             (fsm_border),
+        .i_row_par_en         (cfg_row_par_en),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
+        .o_im2col_group_base  (fsm_im2col_group_base),
         .i_im2col_win_vld     (fsm_im2col_win_vld),
         .i_im2col_win_x       (fsm_im2col_win_x),
         .i_im2col_win_y       (fsm_im2col_win_y),
@@ -621,6 +624,8 @@ module npu_top #(
         .i_win_advance   (fsm_im2col_win_advance_d),
         .i_win_freeze    (fsm_im2col_win_freeze),
         .i_offset_sel    (fsm_im2col_offset_sel),
+        .i_row_par_en    (cfg_row_par_en),
+        .i_group_base    (fsm_im2col_group_base),
         .o_act_window    (im2col_act_window),
         .o_win_vld       (im2col_win_vld),
         .o_win_x         (im2col_win_x),
