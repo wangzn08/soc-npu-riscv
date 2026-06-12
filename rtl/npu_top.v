@@ -806,15 +806,23 @@ module npu_top #(
     // only columns inside [group_base, group_base + group_size).
     reg  [4:0]  rp_vld_cnt;        // counts pp_feat_vld within a conv point
     reg         rp_active;         // 1 while draining a row-par non-pool group
+    reg         rp_in_drain_d;     // delayed fsm_in_drain (rising-edge detect)
+    // Arm at DRAIN start, not S_POST: the post-process pipeline (~6 stages) emits
+    // most of the 16 drained valids DURING S_DRAIN, before S_POST is entered, so
+    // arming at fsm_pp_start would miss them (S_POST would hang waiting on rp_done).
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            rp_vld_cnt <= 5'd0;
-            rp_active  <= 1'b0;
+            rp_vld_cnt    <= 5'd0;
+            rp_active     <= 1'b0;
+            rp_in_drain_d <= 1'b0;
         end else begin
-            if (fsm_pp_start) begin           // S_POST entry: new conv point
+            rp_in_drain_d <= fsm_in_drain;
+            if (fsm_in_drain && !rp_in_drain_d) begin   // rising edge: drain start
                 rp_vld_cnt <= 5'd0;
                 rp_active  <= cfg_row_par_en & ~cfg_pool_en;
             end else if (rp_active && pp_feat_vld) begin
+                if (rp_vld_cnt == 5'd15)
+                    rp_active <= 1'b0;                   // 16 drained pixels captured
                 rp_vld_cnt <= rp_vld_cnt + 5'd1;
             end
         end

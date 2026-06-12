@@ -323,7 +323,8 @@ static void npu_conv_pass(
     int out_spatial,   // out_w * out_h (conv output, before pooling)
     int wgt_base,      // Wgt SRAM word base of this layer's resident weights
     int pool_en,       // 1 = NPU does 2x2 maxpool on the conv output
-    int pad)           // hardware-pad amount each side (0 = caller pre-padded the input)
+    int pad,           // hardware-pad amount each side (0 = caller pre-padded the input)
+    int row_par)       // 1 = 16-row spatial parallelism (task E)
 {
     PROF_T0();
     int oc_passes  = oc / 16;
@@ -375,7 +376,8 @@ static void npu_conv_pass(
         npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_RELU_EN |
                          (pool_en ? NPU_CTRL_POOL_EN : 0) |
                          (out_bank ? NPU_CTRL_OUT_PING : 0) |
-                         (pad ? NPU_CTRL_HW_PAD : 0));
+                         (pad ? NPU_CTRL_HW_PAD : 0) |
+                         (row_par ? NPU_CTRL_ROW_PAR : 0));
 
 #if NPU_OC_OVERLAP
         // OVERLAP: while the NPU computes this pass, drain the PREVIOUS pass's
@@ -648,7 +650,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_A, 0, 28 * 28 * 1);   // 28x28x16, tiles=1 → 784 words
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   1, SCALE_CONV1, conv1_b,
-                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1);   // pad=1 (HW)
+                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1, 1);   // pad=1 (HW), row_par=1 (task E bring-up)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv1", ACT_BUF_B, 784 * 16);
     {
@@ -670,7 +672,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_B, 0, 28 * 28 * 1);   // 28x28x16, tiles=1 → 784 words
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1);   // pool_en=1, pad=1 (HW)
+                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 0);   // pool_en=1, pad=1 (HW)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool1", ACT_BUF_B, 196 * 16);
 #endif
@@ -679,7 +681,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_B, 0, 14 * 14 * 1);   // 14x14x16, tiles=1 → 196 words
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
                   16, SCALE_CONV3, conv3_b,
-                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1);   // pad=1 (HW)
+                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 0);   // pad=1 (HW)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
     {
@@ -697,7 +699,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv4 + Pool2: 16x16 conv -> 2x2 maxpool -> 8x8.
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
                   32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2);   // pool_en=1, pad=2 (HW)
+                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 0);   // pool_en=1, pad=2 (HW)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool2", ACT_BUF_A, 64 * 32);
 #endif
@@ -706,7 +708,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);   // 8x8x32, tiles=2 → 128 words
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
                   32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1);   // pad=1 (HW)
+                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 0);   // pad=1 (HW)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 #endif
@@ -716,7 +718,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv6 + Pool3: 8x8 conv -> 2x2 maxpool -> 4x4.
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
                   64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1);   // pool_en=1, pad=1 (HW)
+                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 0);   // pool_en=1, pad=1 (HW)
 
     // ---- Reorder Pool3 output: position-first → channels-first for affine ----
     // Pool3 output (ActBuf_B): spatial-first-per-tile layout
