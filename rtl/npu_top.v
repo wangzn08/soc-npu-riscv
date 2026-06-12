@@ -127,6 +127,7 @@ module npu_top #(
     wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
+    wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
     wire [7:0]                      cfg_pad_w;          // NPU_PAD[7:0]
     wire [7:0]                      cfg_pad_h;          // NPU_PAD[15:8]
     wire                            status_done_irq;
@@ -225,6 +226,7 @@ module npu_top #(
         .o_out_ping_sel   (cfg_out_ping_sel),
         .o_gemm_en        (cfg_gemm_en),
         .o_hw_pad         (cfg_hw_pad),
+        .o_row_par_en     (cfg_row_par_en),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
         .i_done_irq       (status_done_irq),
