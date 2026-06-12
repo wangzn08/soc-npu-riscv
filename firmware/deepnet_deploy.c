@@ -672,7 +672,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_B, 0, 28 * 28 * 1);   // 28x28x16, tiles=1 → 784 words
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 0);   // pool_en=1, pad=1 (HW)
+                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1);   // pool_en=1, pad=1 (HW), row_par=1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool1", ACT_BUF_B, 196 * 16);
 #endif

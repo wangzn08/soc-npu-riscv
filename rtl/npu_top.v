@@ -739,6 +739,8 @@ module npu_top #(
     wire [ACT_DATA_W-1:0] pp_feat;
     wire                  pp_feat_vld;
 
+    wire                  rp_pool_done;   // row-par pool replay complete (FSM advance)
+
     // Valid signal for post-process from FSM (during DRAIN + pipeline flush)
     wire pp_input_vld;
     assign pp_input_vld = fsm_array_drain_en || fsm_pp_start;
@@ -760,6 +762,9 @@ module npu_top #(
         .i_relu_en     (cfg_relu_en),
         .i_in_drain    (fsm_in_drain),
         .i_in_post     (fsm_in_post),
+        .i_row_par_en  (cfg_row_par_en),
+        .i_group_size  (fsm_group_size),
+        .o_rp_pool_done(rp_pool_done),
         .o_feat        (pp_feat),
         .o_feat_vld    (pp_feat_vld)
     );
@@ -868,9 +873,10 @@ module npu_top #(
     // point (pp_start pulses at S_POST entry) so the FSM does not stall on the
     // 3/4 of points where 2x2 pooling emits no output; the Out-SRAM write is
     // decoupled and self-timed by pp_feat_vld above.  Non-pool keeps alu_vld.
-    assign fsm_pp_done = cfg_pool_en    ? fsm_pp_start
-                       : cfg_row_par_en ? rp_done
-                       :                  alu_vld;
+    assign fsm_pp_done = (cfg_pool_en && cfg_row_par_en) ? rp_pool_done
+                       : cfg_pool_en                     ? fsm_pp_start
+                       : cfg_row_par_en                  ? rp_done
+                       :                                   alu_vld;
 
     // ===================================================================
     // DMA write port mux: Act SRAM or Wgt SRAM based on cfg_dma_sram_sel
