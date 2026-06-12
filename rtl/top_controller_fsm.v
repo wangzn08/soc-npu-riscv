@@ -72,6 +72,8 @@ module top_controller_fsm #(
     output wire                     o_border,             // hw-pad: current pixel is a border zero
     output wire [3:0]               o_im2col_load_tile,   // IC tile being streamed during LOAD_ROW
     output wire [15:0]              o_im2col_group_base,  // first output column of the current 16-wide group
+    output wire [15:0]              o_group_size,
+    output wire [15:0]              o_group_base,   // = cur_ox during the write window
     input  wire                     i_im2col_win_vld,
     input  wire [15:0]              i_im2col_win_x,
     input  wire [15:0]              i_im2col_win_y,
@@ -263,6 +265,8 @@ module top_controller_fsm #(
     assign o_im2col_offset_sel = ko_cnt;
     assign o_im2col_load_tile  = load_tile;
     assign o_im2col_group_base = cur_ox;
+    assign o_group_size = group_size;
+    assign o_group_base = cur_ox;
 
     // Out SRAM write — include OC tile offset so tiles don't overwrite each other
     wire [SRAM_ADDR_W-1:0] out_wr_addr_calc;
