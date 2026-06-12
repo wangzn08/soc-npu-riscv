@@ -23,6 +23,15 @@
 #define NPU_PROFILE 0
 #endif
 
+// VERBOSE_OUTPUT: 1 = print the banner + per-image "Digit d: pred=N OK/FAIL"
+//   chatter (handy when debugging).  0 (default) = quiet: only the final
+//   "=== Result: X/10 correct ===" + DEPLOY SUCCESS/FAILED line is printed.
+//   The testbench pass/fail does NOT depend on these prints (it watches the
+//   test-pass MMIO write), so quiet mode still reports ALL TESTS PASSED.
+#ifndef VERBOSE_OUTPUT
+#define VERBOSE_OUTPUT 0
+#endif
+
 #if NPU_PROFILE
 // Read the low 32 bits of PicoRV32's cycle counter (ENABLE_COUNTERS=1).
 // 32 bits suffice: the whole run is < 2^32 cycles.
@@ -827,7 +836,9 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
 // ================================================================
 void usercode7(void)
 {
+#if VERBOSE_OUTPUT
     print_str("=== MNIST DeepConvNet Deploy ===\n");
+#endif
 
     // Preload all conv weights into Wgt SRAM once; they stay resident for
     // every image instead of being re-packed and re-DMA'd on every pass.
@@ -839,7 +850,9 @@ void usercode7(void)
 
     int correct = 0;
     for (int d = 0; d < 10; d++) {
+#if VERBOSE_OUTPUT
         print_str("Digit "); print_dec(d); print_str(": ");
+#endif
 
 #if NPU_PROFILE
         uint32_t _ti = rdcycle32();
@@ -856,10 +869,12 @@ void usercode7(void)
             if (scr[i] > scr[best]) best = i;
         PROF_ADD(prof_argmax);
 
+        if (best == d)
+            correct++;
+#if VERBOSE_OUTPUT
         print_str("pred="); print_dec(best);
         if (best == d) {
             print_str(" OK\n");
-            correct++;
         } else {
             print_str(" FAIL (scores:");
             for (int i = 0; i < 10; i++) {
@@ -868,6 +883,7 @@ void usercode7(void)
             }
             print_str(")\n");
         }
+#endif
     }
 
     print_str("\n=== Result: "); print_dec(correct);
