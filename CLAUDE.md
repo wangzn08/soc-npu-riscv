@@ -129,7 +129,7 @@ Argmax: find predicted digit                                          [CPU]
 
 | Offset | Name | Description |
 |--------|------|-------------|
-| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad |
+| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en |
 | `0x150` | PAD | `[15:8]`pad_h, `[7:0]`pad_w (hardware padding border, with CTRL[8]) |
 | `0x004` | STATUS | `[0]`done_irq, `[1]`busy, `[2]`dma_rd_err, `[3]`dma_wr_err (RO) |
 | `0x008–0x01C` | SRAM addrs | Act/Wgt/Out SRAM base addresses (ping/pong) |
@@ -205,6 +205,42 @@ im2col/systolic/post are **unchanged**.
   migrate fully into im2col.
 - Next bottleneck: the ~6M of sim UART prints / one-time preload (outside the
   per-image inference path).
+
+### I: 16-row spatial parallelism (`row_par_en`, CTRL[9])
+
+The 16×16 array ran conv at **1/16 utilization**: im2col replicated **one** window
+to all 16 rows, so 15 rows computed the same thing (256 useful MAC/cycle of 4096).
+`row_par_en` makes the 16 rows compute **16 different output pixels** (a horizontal
+group of ≤16 adjacent output columns): one K_END now produces 16 pixels × 16 OC.
+Primary goal is **not wasting the silicon**; cycles are a secondary win.
+- **im2col (`im2col_line_buffer.v`):** in row-par mode `o_act_window[r]` is a
+  **16-wide combinational slice** of the line buffer — array row `r` reads input
+  column `group_base + off_col + r` from the bank selected by `bank_for_offrow`
+  (mirrors the legacy `win[]`-fill mapping). Legacy replicate path kept under the
+  `i_row_par_en` mux (byte-identical when off). No new storage (fan-out of `lb_bankX`).
+- **FSM (`top_controller_fsm.v`):** the sweep advances `cur_ox` by
+  `group_size = min(16, out_w - cur_ox)` per step (=1 when row-par off ⇒ identical).
+- **Drain is REVERSE:** `pe_core` drains row 15 first → row 0 last, so drain valid
+  `k` (0..15) = output column `group_base + 15 - k`.
+- **Non-pool write (`npu_top.v`):** a sequencer **armed at DRAIN start** (not S_POST —
+  the post-process pipeline emits most valids during S_DRAIN) counts `pp_feat_vld`
+  and writes each to column `group_base + 15 - rp_vld_cnt`, guarded to
+  `[group_base, group_base+group_size)`; `fsm_pp_done = rp_done` holds S_POST until
+  all 16 captured.
+- **Pool path (`post_process_top.v`):** the drain's reverse order breaks the pooler's
+  row-major 2×2 windowing, so a **16-deep reorder buffer** captures the drained
+  pixels by column-within-group (`rp_buf[15-k]`) then **replays `group_size`
+  row-major** into `max_pooling_2x2` (group boundaries fall on even columns, so no
+  2×2 pair is split). `fsm_pp_done = o_rp_pool_done` holds S_POST until replay done.
+- **General:** `group_size` is runtime from `out_w` (28→16+12, 16, 14, 8 all handled);
+  partial groups use ≤16 rows. Like the 16×16 array and 16-OC tiling, "16 pixels/group"
+  is a hardware width, not a model dimension. `systolic/gp/pe/wgt_reader/dma/sram`
+  unchanged (weights are shared across the 16 pixels).
+- Result: full run **10.91M → 10.05M**, bit-identical 10/10 (per-layer spot checks
+  byte-match: Conv1(7,10), Conv3(7,7), Pool1/Pool2 nz). Brought up incrementally
+  behind the mode bit: Conv1 → Conv3/5 (non-pool) → Conv2/4/6 (pool). PAD migration
+  into im2col (decision H follow-on) remains future work — currently row-par still
+  consumes the FSM's border-zero-injected stream.
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 
