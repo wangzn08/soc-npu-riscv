@@ -389,6 +389,8 @@ module npu_top #(
     wire [15:0]                 fsm_wgt_ic_groups_total;
     wire                        fsm_wgt_prefetch_done;
     wire [SRAM_ADDR_W-1:0]      fsm_wgt_base;
+    wire                        fsm_prefetch_all;
+    wire [3:0]                  fsm_wgt_ic_sel;
 
     wire                        fsm_im2col_row_start;
     wire                        fsm_im2col_win_advance;
@@ -458,6 +460,8 @@ module npu_top #(
         .o_wgt_ic_group       (fsm_wgt_ic_group),
         .o_wgt_ic_groups_total(fsm_wgt_ic_groups_total),
         .o_wgt_base           (fsm_wgt_base),
+        .o_prefetch_all       (fsm_prefetch_all),
+        .o_wgt_ic_sel         (fsm_wgt_ic_sel),
         .i_wgt_prefetch_done  (fsm_wgt_prefetch_done),
 
         .o_im2col_row_start   (fsm_im2col_row_start),
@@ -528,6 +532,8 @@ module npu_top #(
         .i_ic_groups_total (fsm_wgt_ic_groups_total),
         .i_wgt_base        (fsm_wgt_base),
         .i_kernel_offsets  (cfg_kernel_offsets),
+        .i_prefetch_all    (fsm_prefetch_all),
+        .i_wgt_ic_sel      (fsm_wgt_ic_sel),
         .o_prefetch_done   (fsm_wgt_prefetch_done),
         .i_wgt_offset      (fsm_im2col_offset_sel),
         .o_wgt             (wgt_reader_wgt),

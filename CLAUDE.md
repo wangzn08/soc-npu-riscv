@@ -166,6 +166,26 @@ Fully-connected layers run on the systolic array as a degenerate 1×1 conv. `gem
 - **Firmware:** `npu_gemm_pass(in_dim,out_dim,scale,bias,relu,in_ddr,out_ddr,wgt_base)`.
 - **Limitation:** the NPU post-process clamps output to INT8, which saturates final-classifier logits → Affine2 (50→10) stays on CPU. Intermediate FC layers with INT8 activations (Affine1) run on the NPU. This moved Affine1 from ~22.3M to ~0.6M cycles; full 10-image run 40.87M → 22.62M.
 
+### G: Weight-prefetch reuse — per-OC-tile, general (`ICG_BUF`)
+
+Conv weights are position-invariant, but the FSM used to re-prefetch an OC-tile's
+weights from Wgt SRAM **once per output pixel** (≈144 SRAM reads vs ~9 compute
+cycles — the array wants 16 OC-words/cycle, the single-port SRAM gives 1/cycle).
+Fix: prefetch each OC-tile's weights **once** and reuse across the whole spatial
+sweep. `wgt_reader`'s buffer is `wgt_buf[ko][oc][ICG_BUF]` (`ICG_BUF=4`); the FSM
+`reuse_mode = !gemm_en && ic_groups ≤ ICG_BUF` prefetches all IC-groups once
+(`o_prefetch_all`), then loops IC-tiles in CALC selecting from the buffer
+(`o_wgt_ic_sel`) with no re-prefetch; `wgt_loaded` tracks residency, cleared on
+layer start / OC-tile change.
+- **General, not model-specific:** any layer with `ic_groups ≤ ICG_BUF` benefits
+  (all current conv layers do); `ic_groups > ICG_BUF` and GEMM fall back to the
+  per-IC-tile prefetch — correct, just unaccelerated. `ICG_BUF` is a hardware
+  capacity knob (like the 16×16 array / 16-OC tiling), not a model dimension.
+- Result: conv (NPU) 8.64M → 2.15M cycles (all 6 layers −64..83%); full 10-image
+  run **22.62M → 16.14M**, still bit-identical 10/10. Output is byte-for-byte
+  unchanged (same weights, only their timing/source moves).
+- Next bottleneck is now CPU `pad_activation` (~6.4M).
+
 ### IRQ map (PicoRV32 `irq[]` bits)
 
 | Bit | Source | Set by | Cleared by |

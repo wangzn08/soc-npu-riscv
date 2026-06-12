@@ -54,6 +54,8 @@ module top_controller_fsm #(
     output wire [9:0]               o_wgt_ic_group,
     output wire [15:0]              o_wgt_ic_groups_total,
     output wire [SRAM_ADDR_W-1:0]   o_wgt_base,
+    output wire                     o_prefetch_all,  // 1 = reuse mode (prefetch all ic_groups once)
+    output wire [3:0]               o_wgt_ic_sel,    // current ic_group for the weight output mux
     input  wire                     i_wgt_prefetch_done,
 
     // === Im2Col control ===
@@ -137,6 +139,7 @@ module top_controller_fsm #(
     reg [15:0] pf_wait_cnt;   // Pre-fetch wait counter
     reg [15:0] row_base_in_row; // Starting cur_in_row for current output row
     reg [3:0]  load_tile;     // Current IC tile being streamed within a column (0..ic_groups-1)
+    reg        wgt_loaded;    // 1 = this OC tile's weights are resident in wgt_buf (reuse mode)
 
     // Derived
     wire [15:0] ic_groups;
@@ -145,6 +148,13 @@ module top_controller_fsm #(
     // Runtime kernel offsets (conv 3x3 -> 9, GEMM 1x1 -> 1); replaces KERNEL_OFFSETS
     wire [7:0] ko_total;
     assign ko_total = {4'd0, i_kernel_kh[3:0]} * {4'd0, i_kernel_kw[3:0]};
+
+    // Weight-prefetch reuse: when a whole OC tile's weights fit the on-chip
+    // buffer (ic_groups <= ICG_BUF), prefetch once per OC tile and reuse across
+    // the spatial sweep. General over any model; GEMM excluded (handled separately).
+    localparam ICG_BUF          = 4;
+    localparam WGT_REUSE_SETTLE = 16'd2;  // im2col window settle when skipping prefetch
+    wire reuse_mode = !i_gemm_en && (ic_groups <= ICG_BUF);
 
     // Input stride in 128-bit words per row
     wire [SRAM_ADDR_W-1:0] act_row_stride;
@@ -183,13 +193,18 @@ module top_controller_fsm #(
     assign o_im2col_pixel_vld  = (state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && (load_col_cnt > 16'd0);
 
     // Weight reader control
-    assign o_wgt_start_prefetch  = (state == S_PREFETCH_WGT) && (pf_wait_cnt == 16'd0);
+    // In reuse mode, only the OC tile's FIRST prefetch hits SRAM; later spatial
+    // positions reuse wgt_buf (no re-trigger).
+    assign o_wgt_start_prefetch  = (state == S_PREFETCH_WGT) && (pf_wait_cnt == 16'd0)
+                                 && (!reuse_mode || !wgt_loaded);
     assign o_wgt_oc_base         = oc_tile[9:0];
     // wgt_reader wants the IC *group* index (0,1,2..), but ic_tile counts
     // channels (0,16,32..) → convert by >>4.
     assign o_wgt_ic_group        = ic_tile[9:0] >> 4;
     assign o_wgt_ic_groups_total = ic_groups;
     assign o_wgt_base            = wgt_base_addr;
+    assign o_prefetch_all        = reuse_mode;
+    assign o_wgt_ic_sel          = ic_tile[7:4];   // current ic_group (reuse output mux)
 
     // Array control
     assign o_array_vld     = (state == S_CALC_KERNEL);
@@ -258,6 +273,7 @@ module top_controller_fsm #(
             pf_wait_cnt  <= 16'd0;
             row_base_in_row <= 16'd0;
             load_tile    <= 4'd0;
+            wgt_loaded   <= 1'b0;
             act_base_addr<= {SRAM_ADDR_W{1'b0}};
             wgt_base_addr<= {SRAM_ADDR_W{1'b0}};
             out_base_addr<= {SRAM_ADDR_W{1'b0}};
@@ -290,6 +306,7 @@ module top_controller_fsm #(
                         pf_wait_cnt<= 16'd0;
                         row_base_in_row <= 16'd0;
                         load_tile  <= 4'd0;
+                        wgt_loaded <= 1'b0;   // force first prefetch of this layer
                         // GEMM mode bypasses im2col line-load (S_LOAD_ROW/S_WAIT_WIN)
                         state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
                     end
@@ -350,7 +367,15 @@ module top_controller_fsm #(
                 // -------------------------------------------------------
                 S_PREFETCH_WGT: begin
                     pf_wait_cnt <= pf_wait_cnt + 16'd1;
-                    if (i_wgt_prefetch_done) begin
+                    if (reuse_mode && wgt_loaded) begin
+                        // Weights already resident from this OC tile's first prefetch;
+                        // just let the im2col window settle, then compute.
+                        if (pf_wait_cnt >= WGT_REUSE_SETTLE) begin
+                            ko_cnt <= 4'd0;
+                            state  <= S_CALC_KERNEL;
+                        end
+                    end else if (i_wgt_prefetch_done) begin
+                        if (reuse_mode) wgt_loaded <= 1'b1;
                         ko_cnt  <= 4'd0;
                         state   <= S_CALC_KERNEL;
                     end
@@ -365,8 +390,14 @@ module top_controller_fsm #(
                         if (ic_tile + 16'd16 < i_dim_in_c) begin
                             // More IC tiles: accumulate across tiles, skip drain
                             ic_tile <= ic_tile + 16'd16;
-                            state   <= S_PREFETCH_WGT;
-                            pf_wait_cnt <= 16'd0;
+                            if (reuse_mode) begin
+                                // Next ic_group already in wgt_buf; o_wgt_ic_sel
+                                // follows ic_tile — recompute directly, no prefetch.
+                                state <= S_CALC_KERNEL;
+                            end else begin
+                                state   <= S_PREFETCH_WGT;
+                                pf_wait_cnt <= 16'd0;
+                            end
                         end else begin
                             // Last IC tile: latch & drain
                             state  <= S_K_END;
@@ -435,6 +466,7 @@ module top_controller_fsm #(
                         if (oc_tile + 16'd16 < i_dim_out_c) begin
                             // Next OC tile
                             oc_tile <= oc_tile + 16'd16;
+                            wgt_loaded <= 1'b0;   // new OC tile → re-prefetch its weights
                             state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
                             load_col_cnt <= 16'd0;
                             pf_wait_cnt  <= 16'd0;
