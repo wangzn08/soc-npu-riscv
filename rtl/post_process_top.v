@@ -40,6 +40,13 @@ module post_process_top #(
     input  wire                             i_in_drain,
     input  wire                             i_in_post,
 
+    // Row-parallel (task E): the drain delivers 16 distinct pixels (one per array
+    // row), reverse column order (row 15 first). For pooling we reorder them to
+    // row-major and replay group_size pixels into the pooler.
+    input  wire                             i_row_par_en,
+    input  wire [15:0]                      i_group_size,
+    output wire                             o_rp_pool_done,   // replay complete (FSM advance)
+
     // Output feature data
     output wire [DATA_W-1:0]                o_feat,
     output wire                             o_feat_vld
@@ -170,6 +177,82 @@ module post_process_top #(
     end
 
     // -------------------------------------------------------------------
+    // Row-parallel pool feed (task E): the drain delivers 16 distinct pixels
+    // in REVERSE column order (drain cycle k -> array row 15-k -> output column
+    // group_base + 15 - k).  Capture all 16 into rp_buf indexed by column-within-
+    // group (15-k), then REPLAY group_size of them row-major (col 0,1,..) into the
+    // pooler so its row-major 2x2 windowing works unchanged.  Capture is armed at
+    // DRAIN start (like the non-pool sequencer) because the post-process pipeline
+    // emits most valids during S_DRAIN, before S_POST.
+    //
+    // POOLER BOUNDARY ASSUMPTION: 2x2 pooling pairs even/odd columns, so a group
+    // boundary must land on an EVEN column or a pair would split across groups.
+    // Non-final groups are always 16 (even); the final group = out_w mod 16. All
+    // pooled layers here have even out_w (28=16+12, 16, 8) so every boundary is even
+    // -> safe. A pooled layer with ODD out_w would need the split aligned to an even
+    // column (not just 16) — out of scope for the current model.
+    // -------------------------------------------------------------------
+    reg [DATA_W-1:0] rp_buf [0:15];
+    reg [4:0]        rp_cap_cnt;
+    reg              rp_cap_active;
+    reg              rp_in_drain_d;
+    reg [4:0]        rp_play_cnt;
+    reg              rp_play_active;
+    reg [DATA_W-1:0] rp_play_data;
+    reg              rp_play_vld;
+    reg              rp_play_done_r;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rp_cap_cnt     <= 5'd0;
+            rp_cap_active  <= 1'b0;
+            rp_in_drain_d  <= 1'b0;
+            rp_play_cnt    <= 5'd0;
+            rp_play_active <= 1'b0;
+            rp_play_data   <= {DATA_W{1'b0}};
+            rp_play_vld    <= 1'b0;
+            rp_play_done_r <= 1'b0;
+        end else begin
+            rp_in_drain_d  <= i_in_drain;
+            rp_play_done_r <= 1'b0;     // default: 1-cycle pulse
+
+            // ---- Capture: arm at drain start, store 16 drained pixels ----
+            if (i_in_drain && !rp_in_drain_d) begin
+                rp_cap_cnt    <= 5'd0;
+                rp_cap_active <= i_row_par_en;
+            end else if (rp_cap_active && s3_vld) begin
+                rp_buf[5'd15 - rp_cap_cnt] <= s3_act;   // column-within-group = 15-k
+                if (rp_cap_cnt == 5'd15)
+                    rp_cap_active <= 1'b0;
+                rp_cap_cnt <= rp_cap_cnt + 5'd1;
+            end
+
+            // ---- Replay: after the 16th capture, stream group_size row-major ----
+            if (rp_cap_active && s3_vld && (rp_cap_cnt == 5'd15)) begin
+                rp_play_active <= 1'b1;
+                rp_play_cnt    <= 5'd0;
+                rp_play_vld    <= 1'b0;
+            end else if (rp_play_active) begin
+                rp_play_data <= rp_buf[rp_play_cnt];
+                rp_play_vld  <= 1'b1;
+                if (rp_play_cnt == i_group_size[4:0] - 5'd1) begin
+                    rp_play_active <= 1'b0;
+                    rp_play_done_r <= 1'b1;
+                end
+                rp_play_cnt <= rp_play_cnt + 5'd1;
+            end else begin
+                rp_play_vld <= 1'b0;
+            end
+        end
+    end
+
+    assign o_rp_pool_done = rp_play_done_r;
+
+    // Pooler feed: row-par replay vs legacy single-latch gating.
+    wire [DATA_W-1:0] pool_feat_in     = i_row_par_en ? rp_play_data : pool_gated_data;
+    wire              pool_feat_vld_in = i_row_par_en ? rp_play_vld  : pool_gated_vld;
+
+    // -------------------------------------------------------------------
     // Stage 4: Optional 2×2 Max Pooling
     // -------------------------------------------------------------------
     wire [DATA_W-1:0] pool_out;
@@ -184,8 +267,8 @@ module post_process_top #(
         .clk         (clk),
         .rst_n       (rst_n),
         .i_start     (i_start),
-        .i_feat      (pool_gated_data),
-        .i_feat_vld  (pool_gated_vld),
+        .i_feat      (pool_feat_in),
+        .i_feat_vld  (pool_feat_vld_in),
         .i_width     (i_width),
         .o_pool      (pool_out),
         .o_pool_vld  (pool_vld)

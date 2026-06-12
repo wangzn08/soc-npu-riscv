@@ -127,6 +127,7 @@ module npu_top #(
     wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
+    wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
     wire [7:0]                      cfg_pad_w;          // NPU_PAD[7:0]
     wire [7:0]                      cfg_pad_h;          // NPU_PAD[15:8]
     wire                            status_done_irq;
@@ -225,6 +226,7 @@ module npu_top #(
         .o_out_ping_sel   (cfg_out_ping_sel),
         .o_gemm_en        (cfg_gemm_en),
         .o_hw_pad         (cfg_hw_pad),
+        .o_row_par_en     (cfg_row_par_en),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
         .i_done_irq       (status_done_irq),
@@ -406,6 +408,7 @@ module npu_top #(
     wire                        fsm_im2col_pixel_vld;
     wire                        fsm_border;
     wire [3:0]                  fsm_im2col_load_tile;
+    wire [15:0]                 fsm_im2col_group_base;
     wire                        fsm_im2col_sweep_advance;
     wire                        fsm_im2col_win_vld;
     wire [15:0]                 fsm_im2col_win_x;
@@ -416,6 +419,8 @@ module npu_top #(
     wire                        fsm_array_drain_en;
 
     wire                        fsm_pp_start;
+    wire [15:0]                 fsm_group_size;
+    wire [15:0]                 fsm_group_base;
     wire [SRAM_ADDR_W-1:0]      fsm_out_wr_addr;
     wire                        fsm_out_wr_en;
     wire [15:0]                 fsm_out_x;
@@ -481,7 +486,11 @@ module npu_top #(
         .o_im2col_pixel_data  (fsm_im2col_pixel_data),
         .o_im2col_pixel_vld   (fsm_im2col_pixel_vld),
         .o_border             (fsm_border),
+        .i_row_par_en         (cfg_row_par_en),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
+        .o_im2col_group_base  (fsm_im2col_group_base),
+        .o_group_size         (fsm_group_size),
+        .o_group_base         (fsm_group_base),
         .i_im2col_win_vld     (fsm_im2col_win_vld),
         .i_im2col_win_x       (fsm_im2col_win_x),
         .i_im2col_win_y       (fsm_im2col_win_y),
@@ -619,6 +628,8 @@ module npu_top #(
         .i_win_advance   (fsm_im2col_win_advance_d),
         .i_win_freeze    (fsm_im2col_win_freeze),
         .i_offset_sel    (fsm_im2col_offset_sel),
+        .i_row_par_en    (cfg_row_par_en),
+        .i_group_base    (fsm_im2col_group_base),
         .o_act_window    (im2col_act_window),
         .o_win_vld       (im2col_win_vld),
         .o_win_x         (im2col_win_x),
@@ -728,6 +739,8 @@ module npu_top #(
     wire [ACT_DATA_W-1:0] pp_feat;
     wire                  pp_feat_vld;
 
+    wire                  rp_pool_done;   // row-par pool replay complete (FSM advance)
+
     // Valid signal for post-process from FSM (during DRAIN + pipeline flush)
     wire pp_input_vld;
     assign pp_input_vld = fsm_array_drain_en || fsm_pp_start;
@@ -749,6 +762,9 @@ module npu_top #(
         .i_relu_en     (cfg_relu_en),
         .i_in_drain    (fsm_in_drain),
         .i_in_post     (fsm_in_post),
+        .i_row_par_en  (cfg_row_par_en),
+        .i_group_size  (fsm_group_size),
+        .o_rp_pool_done(rp_pool_done),
         .o_feat        (pp_feat),
         .o_feat_vld    (pp_feat_vld)
     );
@@ -788,14 +804,56 @@ module npu_top #(
             pool_out_addr_cnt <= pool_out_addr_cnt + {{SRAM_ADDR_W-1{1'b0}}, 1'b1};
     end
 
+    // ---- Row-parallel non-pool Out-SRAM write sequencer ----
+    // Drain emits row 15 first -> row 0 last (pe_core). Array row r holds output
+    // column (group_base + r). We count post-process valids within a conv point
+    // and map the k-th valid (k=0..15) to column = group_base + (15 - k), writing
+    // only columns inside [group_base, group_base + group_size).
+    reg  [4:0]  rp_vld_cnt;        // counts pp_feat_vld within a conv point
+    reg         rp_active;         // 1 while draining a row-par non-pool group
+    reg         rp_in_drain_d;     // delayed fsm_in_drain (rising-edge detect)
+    // Arm at DRAIN start, not S_POST: the post-process pipeline (~6 stages) emits
+    // most of the 16 drained valids DURING S_DRAIN, before S_POST is entered, so
+    // arming at fsm_pp_start would miss them (S_POST would hang waiting on rp_done).
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rp_vld_cnt    <= 5'd0;
+            rp_active     <= 1'b0;
+            rp_in_drain_d <= 1'b0;
+        end else begin
+            rp_in_drain_d <= fsm_in_drain;
+            if (fsm_in_drain && !rp_in_drain_d) begin   // rising edge: drain start
+                rp_vld_cnt <= 5'd0;
+                rp_active  <= cfg_row_par_en & ~cfg_pool_en;
+            end else if (rp_active && pp_feat_vld) begin
+                if (rp_vld_cnt == 5'd15)
+                    rp_active <= 1'b0;                   // 16 drained pixels captured
+                rp_vld_cnt <= rp_vld_cnt + 5'd1;
+            end
+        end
+    end
+    wire [15:0] rp_col = fsm_group_base + (16'd15 - {11'd0, rp_vld_cnt});
+    wire        rp_col_valid = rp_active && pp_feat_vld
+                             && (rp_col >= fsm_group_base)
+                             && (rp_col <  fsm_group_base + fsm_group_size);
+    // fsm_out_wr_addr = out_base + oc_off + cur_oy*stride + cur_ox(=group_base).
+    // Strip group_base, add the per-pixel rp_col.
+    wire [SRAM_ADDR_W-1:0] rp_wr_addr = fsm_out_wr_addr
+                             - fsm_group_base[SRAM_ADDR_W-1:0]
+                             + rp_col[SRAM_ADDR_W-1:0];
+    wire rp_wr_en = cfg_row_par_en & ~cfg_pool_en & rp_col_valid;
+    wire rp_done  = rp_active && (rp_vld_cnt == 5'd15) && pp_feat_vld;
+
     // In pool mode the Out-SRAM write is self-timed by the pooler's output
     // valid (pool_vld = pp_feat_vld) with the contiguous pool_out_addr_cnt;
     // in non-pool mode it is FSM-driven exactly as before.
-    assign out_sram_ena   = cfg_pool_en ? pp_feat_vld : fsm_out_wr_en;
-    assign out_sram_wea   = cfg_pool_en ? pp_feat_vld : fsm_out_wr_en;
-    assign out_sram_addra = cfg_pool_en
-                          ? pool_out_addr_cnt[OUT_SRAM_ADDR_W-1:0]
-                          : fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
+    assign out_sram_ena   = cfg_pool_en    ? pp_feat_vld
+                          : cfg_row_par_en ? rp_wr_en
+                          :                  fsm_out_wr_en;
+    assign out_sram_wea   = out_sram_ena;
+    assign out_sram_addra = cfg_pool_en    ? pool_out_addr_cnt[OUT_SRAM_ADDR_W-1:0]
+                          : cfg_row_par_en ? rp_wr_addr[OUT_SRAM_ADDR_W-1:0]
+                          :                  fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
     assign out_sram_dia   = alu_res;
 
     // synthesis translate_off
@@ -815,7 +873,10 @@ module npu_top #(
     // point (pp_start pulses at S_POST entry) so the FSM does not stall on the
     // 3/4 of points where 2x2 pooling emits no output; the Out-SRAM write is
     // decoupled and self-timed by pp_feat_vld above.  Non-pool keeps alu_vld.
-    assign fsm_pp_done = cfg_pool_en ? fsm_pp_start : alu_vld;
+    assign fsm_pp_done = (cfg_pool_en && cfg_row_par_en) ? rp_pool_done
+                       : cfg_pool_en                     ? fsm_pp_start
+                       : cfg_row_par_en                  ? rp_done
+                       :                                   alu_vld;
 
     // ===================================================================
     // DMA write port mux: Act SRAM or Wgt SRAM based on cfg_dma_sram_sel

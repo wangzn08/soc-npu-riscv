@@ -23,6 +23,15 @@
 #define NPU_PROFILE 0
 #endif
 
+// VERBOSE_OUTPUT: 1 = print the banner + per-image "Digit d: pred=N OK/FAIL"
+//   chatter (handy when debugging).  0 (default) = quiet: only the final
+//   "=== Result: X/10 correct ===" + DEPLOY SUCCESS/FAILED line is printed.
+//   The testbench pass/fail does NOT depend on these prints (it watches the
+//   test-pass MMIO write), so quiet mode still reports ALL TESTS PASSED.
+#ifndef VERBOSE_OUTPUT
+#define VERBOSE_OUTPUT 0
+#endif
+
 #if NPU_PROFILE
 // Read the low 32 bits of PicoRV32's cycle counter (ENABLE_COUNTERS=1).
 // 32 bits suffice: the whole run is < 2^32 cycles.
@@ -33,7 +42,7 @@ static inline uint32_t rdcycle32(void) {
 }
 // Per-phase accumulators (summed over all 10 images).
 static uint32_t prof_pad, prof_load, prof_npu, prof_reorder,
-                prof_affine, prof_argmax, prof_infer;
+                prof_affine, prof_argmax, prof_infer, prof_preload;
 static uint32_t prof_npu_layer[6];   // per-conv NPU time
 static int      prof_conv_idx;       // reset to 0 at each image
 #define PROF_T0()       uint32_t _pt = rdcycle32()
@@ -323,7 +332,8 @@ static void npu_conv_pass(
     int out_spatial,   // out_w * out_h (conv output, before pooling)
     int wgt_base,      // Wgt SRAM word base of this layer's resident weights
     int pool_en,       // 1 = NPU does 2x2 maxpool on the conv output
-    int pad)           // hardware-pad amount each side (0 = caller pre-padded the input)
+    int pad,           // hardware-pad amount each side (0 = caller pre-padded the input)
+    int row_par)       // 1 = 16-row spatial parallelism (task E)
 {
     PROF_T0();
     int oc_passes  = oc / 16;
@@ -375,7 +385,8 @@ static void npu_conv_pass(
         npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_RELU_EN |
                          (pool_en ? NPU_CTRL_POOL_EN : 0) |
                          (out_bank ? NPU_CTRL_OUT_PING : 0) |
-                         (pad ? NPU_CTRL_HW_PAD : 0));
+                         (pad ? NPU_CTRL_HW_PAD : 0) |
+                         (row_par ? NPU_CTRL_ROW_PAR : 0));
 
 #if NPU_OC_OVERLAP
         // OVERLAP: while the NPU computes this pass, drain the PREVIOUS pass's
@@ -648,7 +659,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_A, 0, 28 * 28 * 1);   // 28x28x16, tiles=1 → 784 words
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   1, SCALE_CONV1, conv1_b,
-                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1);   // pad=1 (HW)
+                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1, 1);   // pad=1 (HW), row_par=1 (task E bring-up)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv1", ACT_BUF_B, 784 * 16);
     {
@@ -670,7 +681,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_B, 0, 28 * 28 * 1);   // 28x28x16, tiles=1 → 784 words
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1);   // pool_en=1, pad=1 (HW)
+                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1);   // pool_en=1, pad=1 (HW), row_par=1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool1", ACT_BUF_B, 196 * 16);
 #endif
@@ -679,7 +690,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_B, 0, 14 * 14 * 1);   // 14x14x16, tiles=1 → 196 words
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
                   16, SCALE_CONV3, conv3_b,
-                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1);   // pad=1 (HW)
+                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1);   // pad=1 (HW), row_par=1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
     {
@@ -697,7 +708,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv4 + Pool2: 16x16 conv -> 2x2 maxpool -> 8x8.
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
                   32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2);   // pool_en=1, pad=2 (HW)
+                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1);   // pool_en=1, pad=2 (HW), row_par=1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool2", ACT_BUF_A, 64 * 32);
 #endif
@@ -706,7 +717,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);   // 8x8x32, tiles=2 → 128 words
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
                   32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1);   // pad=1 (HW)
+                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1);   // pad=1 (HW), row_par=1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 #endif
@@ -716,7 +727,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv6 + Pool3: 8x8 conv -> 2x2 maxpool -> 4x4.
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
                   64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1);   // pool_en=1, pad=1 (HW)
+                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1);   // pool_en=1, pad=1 (HW), row_par=1
 
     // ---- Reorder Pool3 output: position-first → channels-first for affine ----
     // Pool3 output (ActBuf_B): spatial-first-per-tile layout
@@ -825,19 +836,30 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
 // ================================================================
 void usercode7(void)
 {
+#if VERBOSE_OUTPUT
     print_str("=== MNIST DeepConvNet Deploy ===\n");
+#endif
 
     // Preload all conv weights into Wgt SRAM once; they stay resident for
     // every image instead of being re-packed and re-DMA'd on every pass.
+    // This is one-time startup, NOT part of per-image inference.
+#if NPU_PROFILE
+    uint32_t _pre0 = rdcycle32();
+#endif
     preload_conv_weights();
     // Preload FC (affine) weights into the Wgt SRAM PONG bank (resident).
     preload_fc_weights();
+#if NPU_PROFILE
+    prof_preload = rdcycle32() - _pre0;
+#endif
 
     volatile int32_t *scr = (volatile int32_t *)SCORES;
 
     int correct = 0;
     for (int d = 0; d < 10; d++) {
+#if VERBOSE_OUTPUT
         print_str("Digit "); print_dec(d); print_str(": ");
+#endif
 
 #if NPU_PROFILE
         uint32_t _ti = rdcycle32();
@@ -854,10 +876,12 @@ void usercode7(void)
             if (scr[i] > scr[best]) best = i;
         PROF_ADD(prof_argmax);
 
+        if (best == d)
+            correct++;
+#if VERBOSE_OUTPUT
         print_str("pred="); print_dec(best);
         if (best == d) {
             print_str(" OK\n");
-            correct++;
         } else {
             print_str(" FAIL (scores:");
             for (int i = 0; i < 10; i++) {
@@ -866,6 +890,7 @@ void usercode7(void)
             }
             print_str(")\n");
         }
+#endif
     }
 
     print_str("\n=== Result: "); print_dec(correct);
@@ -879,7 +904,9 @@ void usercode7(void)
 #if NPU_PROFILE
     // Per-phase cycle breakdown, summed over all 10 images.
     print_str("\n=== CYCLE PROFILE (10 images total) ===\n");
+    print_str("preload(1x): "); print_dec(prof_preload); print_chr('\n');
     print_str("infer_total: "); print_dec(prof_infer);   print_chr('\n');
+    print_str("infer/image: "); print_dec(prof_infer / 10); print_chr('\n');
     print_str("  npu      : "); print_dec(prof_npu);     print_chr('\n');
     print_str("  pad      : "); print_dec(prof_pad);     print_chr('\n');
     print_str("  load     : "); print_dec(prof_load);    print_chr('\n');

@@ -84,6 +84,7 @@ void usercode7(void);
 #define NPU_CTRL_OUT_PING   (1 << 6)
 #define NPU_CTRL_GEMM_EN    (1 << 7)   // GEMM/FC mode: bypass im2col, vector x matrix
 #define NPU_CTRL_HW_PAD     (1 << 8)   // hardware padding: FSM injects border zeros, reads tile-major
+#define NPU_CTRL_ROW_PAR    (1 << 9)   // 16-row spatial parallelism (task E): 16 output pixels/group
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)

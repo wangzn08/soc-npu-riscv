@@ -49,6 +49,8 @@ module im2col_line_buffer #(
     input  wire                         i_win_advance,  // Shift window right 1 col (once/column)
     input  wire                         i_win_freeze,   // Hold window fixed
     input  wire [3:0]                   i_offset_sel,   // 0..8 kernel offset position
+    input  wire                         i_row_par_en,   // task E: 16-wide slice mode
+    input  wire [15:0]                  i_group_base,   // first output column of the 16-wide group
 
     // Output: one kernel-offset activation vector, replicated 16×
     output wire [ACT_BUS_W-1:0]         o_act_window,
@@ -234,10 +236,46 @@ module im2col_line_buffer #(
 
     wire [ACT_GROUP_W-1:0] selected_offset = win[i_win_tile][off_row_dec][off_col_dec];
 
+    // Map the kernel-offset row (0=top,1=mid,2=bottom of the 3-row window) to a
+    // physical line-buffer bank, mirroring the win[]-fill case(row_sel) mapping
+    // (cur_v=bottom=bank[row_sel], p1_v=mid=bank[row_sel-1], p2_v=top=bank[row_sel-2]).
+    function [1:0] bank_for_offrow;
+        input [1:0] off_r;       // 0=top, 1=mid, 2=bottom
+        input [1:0] rsel;        // row_sel
+        reg   [1:0] bottom, mid, top;
+        begin
+            bottom = rsel;                                  // newest (this) row
+            mid    = (rsel == 2'd0) ? 2'd2 : rsel - 2'd1;
+            top    = (rsel == 2'd1) ? 2'd2 :
+                     (rsel == 2'd0) ? 2'd1 : rsel - 2'd2;
+            bank_for_offrow = (off_r == 2'd2) ? bottom :
+                              (off_r == 2'd1) ? mid : top;
+        end
+    endfunction
+
+    wire [1:0] rp_bank = bank_for_offrow(off_row_dec, row_sel);
+
     genvar gi;
     generate
-        for (gi = 0; gi < ARRAY_ROWS; gi = gi + 1) begin : gen_repl
-            assign o_act_window[gi*ACT_GROUP_W +: ACT_GROUP_W] = selected_offset;
+        for (gi = 0; gi < ARRAY_ROWS; gi = gi + 1) begin : gen_window
+            // Row-par: array row gi reads input column (group_base + off_col + gi).
+            wire [15:0] rp_col = i_group_base + {14'd0, off_col_dec} + gi[15:0];
+            reg  [ACT_GROUP_W-1:0] rp_val;
+            always @(*) begin
+                if (rp_col >= i_width) begin
+                    rp_val = {ACT_GROUP_W{1'b0}};
+                end else begin
+                    case (rp_bank)
+                        2'd0: rp_val = lb_bank0[rp_col[ADDR_W-1:0]][i_win_tile];
+                        2'd1: rp_val = lb_bank1[rp_col[ADDR_W-1:0]][i_win_tile];
+                        2'd2: rp_val = lb_bank2[rp_col[ADDR_W-1:0]][i_win_tile];
+                        default: rp_val = {ACT_GROUP_W{1'b0}};
+                    endcase
+                end
+            end
+            // Legacy (replicate) when row_par off — MUST stay byte-identical.
+            assign o_act_window[gi*ACT_GROUP_W +: ACT_GROUP_W] =
+                       i_row_par_en ? rp_val : selected_offset;
         end
     endgenerate
 

@@ -29,6 +29,7 @@ module top_controller_fsm #(
     input  wire                     i_eltwise_en,
     input  wire                     i_gemm_en,      // GEMM/FC mode: bypass im2col, act = vector
     input  wire                     i_hw_pad,       // hardware padding: read tile-major, inject border zeros
+    input  wire                     i_row_par_en,   // 16-row spatial parallelism (task E)
     input  wire [7:0]               i_pad_w,        // zero-pad columns each side
     input  wire [7:0]               i_pad_h,        // zero-pad rows each side
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_ping,
@@ -70,6 +71,9 @@ module top_controller_fsm #(
     output wire                     o_im2col_pixel_vld,
     output wire                     o_border,             // hw-pad: current pixel is a border zero
     output wire [3:0]               o_im2col_load_tile,   // IC tile being streamed during LOAD_ROW
+    output wire [15:0]              o_im2col_group_base,  // first output column of the current 16-wide group
+    output wire [15:0]              o_group_size,
+    output wire [15:0]              o_group_base,   // = cur_ox during the write window
     input  wire                     i_im2col_win_vld,
     input  wire [15:0]              i_im2col_win_x,
     input  wire [15:0]              i_im2col_win_y,
@@ -168,6 +172,12 @@ module top_controller_fsm #(
     wire [SRAM_ADDR_W-1:0] out_row_stride;
     assign out_row_stride = out_w;
 
+    // Row-parallel: number of valid output columns in the current 16-wide group
+    wire [15:0] rp_remaining = out_w - cur_ox;
+    wire [15:0] group_size   = (i_row_par_en && rp_remaining > 16'd16) ? 16'd16
+                             : (i_row_par_en)                          ? rp_remaining
+                             :                                          16'd1;
+
     // -------------------------------------------------------------------
     // Output assignments
     // -------------------------------------------------------------------
@@ -254,6 +264,9 @@ module top_controller_fsm #(
                              || ((state == S_NEXT_TILE) && (ko_cnt == 4'd0)));
     assign o_im2col_offset_sel = ko_cnt;
     assign o_im2col_load_tile  = load_tile;
+    assign o_im2col_group_base = cur_ox;
+    assign o_group_size = group_size;
+    assign o_group_base = cur_ox;
 
     // Out SRAM write — include OC tile offset so tiles don't overwrite each other
     wire [SRAM_ADDR_W-1:0] out_wr_addr_calc;
@@ -465,10 +478,10 @@ module top_controller_fsm #(
                 // NEXT_TILE: Advance spatial position or OC tile
                 // -------------------------------------------------------
                 S_NEXT_TILE: begin
-                    if (cur_ox + 16'd1 < out_w) begin
-                        // Next column in current row
-                        cur_ox <= cur_ox + 16'd1;
-                        cur_in_col <= cur_in_col + {8'd0, i_stride_sx}; // Slide by stride
+                    if (cur_ox + group_size < out_w) begin
+                        // Next group of output columns in current row
+                        cur_ox <= cur_ox + group_size;
+                        cur_in_col <= cur_in_col + group_size * {8'd0, i_stride_sx}; // slide by group*stride
                         // Pre-fetch weights for IC tile 0 at new position
                         state <= S_PREFETCH_WGT;
                         pf_wait_cnt <= 16'd0;
