@@ -184,6 +184,13 @@ module post_process_top #(
     // pooler so its row-major 2x2 windowing works unchanged.  Capture is armed at
     // DRAIN start (like the non-pool sequencer) because the post-process pipeline
     // emits most valids during S_DRAIN, before S_POST.
+    //
+    // POOLER BOUNDARY ASSUMPTION: 2x2 pooling pairs even/odd columns, so a group
+    // boundary must land on an EVEN column or a pair would split across groups.
+    // Non-final groups are always 16 (even); the final group = out_w mod 16. All
+    // pooled layers here have even out_w (28=16+12, 16, 8) so every boundary is even
+    // -> safe. A pooled layer with ODD out_w would need the split aligned to an even
+    // column (not just 16) — out of scope for the current model.
     // -------------------------------------------------------------------
     reg [DATA_W-1:0] rp_buf [0:15];
     reg [4:0]        rp_cap_cnt;
