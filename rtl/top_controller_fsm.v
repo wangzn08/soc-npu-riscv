@@ -170,6 +170,12 @@ module top_controller_fsm #(
     wire [SRAM_ADDR_W-1:0] out_row_stride;
     assign out_row_stride = out_w;
 
+    // Row-parallel: number of valid output columns in the current 16-wide group
+    wire [15:0] rp_remaining = out_w - cur_ox;
+    wire [15:0] group_size   = (i_row_par_en && rp_remaining > 16'd16) ? 16'd16
+                             : (i_row_par_en)                          ? rp_remaining
+                             :                                          16'd1;
+
     // -------------------------------------------------------------------
     // Output assignments
     // -------------------------------------------------------------------
@@ -468,10 +474,10 @@ module top_controller_fsm #(
                 // NEXT_TILE: Advance spatial position or OC tile
                 // -------------------------------------------------------
                 S_NEXT_TILE: begin
-                    if (cur_ox + 16'd1 < out_w) begin
-                        // Next column in current row
-                        cur_ox <= cur_ox + 16'd1;
-                        cur_in_col <= cur_in_col + {8'd0, i_stride_sx}; // Slide by stride
+                    if (cur_ox + group_size < out_w) begin
+                        // Next group of output columns in current row
+                        cur_ox <= cur_ox + group_size;
+                        cur_in_col <= cur_in_col + group_size * {8'd0, i_stride_sx}; // slide by group*stride
                         // Pre-fetch weights for IC tile 0 at new position
                         state <= S_PREFETCH_WGT;
                         pf_wait_cnt <= 16'd0;
