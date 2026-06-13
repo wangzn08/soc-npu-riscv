@@ -33,3 +33,4 @@ rtl/vector_alu.v
 rtl/sram_models.v
 rtl/axi_dma.v
 rtl/sram_copy.v
+rtl/img_expand.v
