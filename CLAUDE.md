@@ -139,6 +139,8 @@ Argmax: find predicted digit                                          [CPU]
 | `0x080–0x0BC` | SCALE_MUL | 16× per-OC 32-bit scale multipliers |
 | `0x0C0–0x0FC` | SCALE_SHIFT | 16× per-OC 6-bit shift amounts |
 | `0x120–0x148` | DMA | Read/write triggers, DDR addr, length, SRAM base, status, sel |
+| `0x140` | DMA_STATUS | `[0]`rd_done `[1]`wr_done `[2]`copy_done (RO) |
+| `0x154` | COPY_TRIG | write → start on-chip Out→Act copy (`sram_copy`, decision J); src/dst/len reuse DMA RD_SRAM_BASE/WR_SRAM_BASE/RD_LEN |
 
 ### Interrupt Handling
 
@@ -241,6 +243,49 @@ Primary goal is **not wasting the silicon**; cycles are a secondary win.
   behind the mode bit: Conv1 → Conv3/5 (non-pool) → Conv2/4/6 (pool). PAD migration
   into im2col (decision H follow-on) remains future work — currently row-par still
   consumes the FSM's border-zero-injected stream.
+
+### J: On-chip SRAM residency for conv→conv (`sram_copy`, 0x154)
+
+Every conv layer used to round-trip its result through DDR: layer N drains Out SRAM
+→ DDR, then layer N+1 loads DDR → Act SRAM. After hardware padding (decision H) the
+CPU does nothing between conv layers, so this DDR bounce was pure transport overhead.
+A small `sram_copy` engine (`rtl/sram_copy.v`) copies Out SRAM → Act SRAM **on-chip**,
+eliminating the round-trip.
+- **Engine:** time-shares the SRAM **Port B** paths (Out Port B read → Act Port B
+  write), isolated from `axi_dma` (DDR path untouched). Out Port B read is
+  **combinational** (`out_sram_wrapper COMB_B=1`), so it reads `Out[src+cnt]` and
+  writes `Act[dst+cnt]` in the **same cycle** (one word/cycle, no pipeline — a 1-cycle
+  read-latency version copies off-by-one). `copy_busy` gives the engine Port-B priority
+  over the DMA muxes in `npu_top`.
+- **Registers:** trigger `NPU_DMA_COPY_TRIG` (0x154) → regfile `o_copy_trig`; completion
+  polled via `NPU_DMA_STATUS[2]` (`copy_done`) — **no IRQ** (avoids start7.S mask
+  plumbing). src/dst/len **reuse** the DMA `RD_SRAM_BASE`/`WR_SRAM_BASE`/`RD_LEN`
+  registers; banks reuse `dma_out_ping_sel`/`dma_act_ping_sel`. `i_len` = full word count.
+- **Two Act regions (firmware), NOT Act ping-pong:** the global `ping_pong_sel` couples
+  the Act and Wgt read banks (conv weights are resident in Wgt PING), so it can't be
+  flipped to alternate Act banks. Instead two **address regions** in the PING bank
+  ping-pong via `NPU_ACT_ADDR_A`: R0=word 0, R1=word 1024 (`ACT_RES_B`). A conv reads
+  region A while its copy writes region B; the next conv reads B. Different addresses ⇒
+  no input corruption even though the copy is serial.
+- **Serial per-pass copy:** resident layers copy each OC-pass's output right after that
+  pass (NPU idle), `act_dst + pass*out_words`, reading that pass's Out bank. This frees
+  the per-pass Out bank before the next pass reuses it (works for >2-pass layers,
+  Conv5/6) and sidesteps any same-bank dual-port concern. The DDR path keeps the
+  OC-pass overlap; resident layers don't use it (the copy is on the critical path but
+  far cheaper than the DDR round-trip).
+- **Firmware:** `dma_out_to_act(act_dst_word, out_src_word, nwords, out_bank)`;
+  `npu_conv_pass(... , act_in, act_dst)` (`act_dst>=0` ⇒ resident copy; `<0` ⇒ DDR).
+- **Scope:** the 5 conv→conv boundaries (Conv1→…→Conv6). Conv6→reorder→FC stays DDR
+  (CPU channels-first reorder + FC2/argmax need DDR). Conv1's input (the image) loads
+  from DDR.
+- **General:** the copy is a layout-agnostic word copy (Out tile-major == next-layer Act
+  tile-major); works for any dims/IC/OC/tiles, pooled or not. With `act_dst<0` the
+  behavior is byte-identical to the DDR path.
+- Result: per-image inference **374K → 289K (−23%)**; full run **9.86M → 8.83M**
+  (−1.03M), bit-identical 10/10 (Pool1 nz 711/379/784/838, Pool2 618/458/673 byte-match).
+  `prof_npu` dropped (the output-DDR-drain it included is gone) and `prof_load` dropped
+  (input DDR reads gone, copy folded in). Next bottleneck: `pad` (Conv1 image→DDR
+  formatting, ~101K/image).
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 

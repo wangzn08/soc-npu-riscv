@@ -70,6 +70,11 @@ static inline uint32_t npu_rd(uint32_t addr) {
 // ---- DDR buffer layout ----
 #define ACT_BUF_A    0x40001000   // 12288 int32 (48KB)
 #define ACT_BUF_B    0x40004000   // 12288 int32 (48KB)
+// SRAM-residency: a second Act SRAM region (word base) used as the ping-pong
+// target for on-chip Out->Act copies. Conv reads input region A (base 0) while
+// the copy writes region B (base 1024); next layer reads B. Max layer = 784
+// words, so 1024 spacing is safe (Act SRAM = 16384 words).
+#define ACT_RES_B    1024
 #define WGT_BUF      0x40007000   // 16384 int32 (64KB)
 #define NPU_OUT_BUF  0x40010000   // 4096 int32 (16KB)
 #define PAD_BUF      0x40012000   // 3072 int32 (12KB)
@@ -198,6 +203,30 @@ static void dma_out_to_ddr(uint32_t ddr_addr, uint32_t sram_base, int nbeats,
 
         sent += chunk;
     }
+}
+
+// ================================================================
+// On-chip copy: Out SRAM -> Act SRAM (no DDR round-trip, SRAM residency).
+// Reads Out bank `out_bank`, writes Act PING (the conv input bank). Polls
+// NPU_DMA_STATUS bit2 for completion. nwords = FULL word count.
+// ================================================================
+static void dma_out_to_act(uint32_t act_dst_word, uint32_t out_src_word,
+                           int nwords, int out_bank)
+{
+    PROF_T0();
+    npu_wr(NPU_DMA_PING_SEL, out_bank ? 0x4 : 0x0);   // Out read bank (bit2); Act write bank = PING
+    npu_wr(NPU_DMA_RD_SRAM_BASE, out_src_word);       // src = Out SRAM word base
+    npu_wr(NPU_DMA_WR_SRAM_BASE, act_dst_word);       // dst = Act SRAM word base
+    npu_wr(NPU_DMA_RD_LEN, nwords);                   // FULL word count (copy convention)
+    npu_wr(NPU_DMA_COPY_TRIG, 1);                     // start; clears STATUS copy_done
+
+    int t = DMA_IRQ_TIMEOUT;
+    while (t-- > 0)
+        if (npu_rd(NPU_DMA_STATUS) & NPU_DMA_STATUS_COPY_DONE) break;
+    if (t <= 0) print_str("  COPY timeout!\n");
+
+    npu_wr(NPU_DMA_PING_SEL, 0x0);                    // restore default banks
+    PROF_ADD(prof_load);
 }
 
 // ================================================================
@@ -333,7 +362,9 @@ static void npu_conv_pass(
     int wgt_base,      // Wgt SRAM word base of this layer's resident weights
     int pool_en,       // 1 = NPU does 2x2 maxpool on the conv output
     int pad,           // hardware-pad amount each side (0 = caller pre-padded the input)
-    int row_par)       // 1 = 16-row spatial parallelism (task E)
+    int row_par,       // 1 = 16-row spatial parallelism (task E)
+    int act_in,        // Act SRAM word base the NPU reads input from (region ping-pong)
+    int act_dst)       // >=0: copy output to Act SRAM word base act_dst (resident); <0: DMA to out_ddr_addr
 {
     PROF_T0();
     int oc_passes  = oc / 16;
@@ -366,7 +397,7 @@ static void npu_conv_pass(
         npu_wr(NPU_PAD, (pad << 8) | pad);   // hardware padding (0 = none)
 
         // SRAM addresses
-        npu_wr(NPU_ACT_ADDR_A, 0);   // padded data at SRAM base 0
+        npu_wr(NPU_ACT_ADDR_A, act_in);   // input region base (resident ping-pong)
         // Weights resident in Wgt SRAM (preloaded once); select this pass's
         // 16-OC tile by base address instead of reloading every pass.
         npu_wr(NPU_WGT_ADDR_A, wgt_base + pass * tile_words);
@@ -389,10 +420,10 @@ static void npu_conv_pass(
                          (row_par ? NPU_CTRL_ROW_PAR : 0));
 
 #if NPU_OC_OVERLAP
-        // OVERLAP: while the NPU computes this pass, drain the PREVIOUS pass's
-        // output (in prev_bank) to DDR.  The two banks differ, so there is no
-        // conflict between NPU Port-A writes and DMA Port-B reads.
-        if (prev_pass >= 0)
+        // OVERLAP (DDR path only): while the NPU computes this pass, drain the
+        // PREVIOUS pass's output (in prev_bank) to DDR.  Resident layers copy
+        // serially after compute (below) and do not use the overlap drain.
+        if (act_dst < 0 && prev_pass >= 0)
             dma_out_to_ddr(out_ddr_addr + prev_pass * out_words * 16, 0,
                            out_nbeats, prev_bank);
 #endif
@@ -405,21 +436,28 @@ static void npu_conv_pass(
         if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_RD_ERR) print_str("  NPU DMA rd err!\n");
         if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_WR_ERR) print_str("  NPU DMA wr err!\n");
 
+        if (act_dst >= 0) {
+            // RESIDENT: copy this pass's output (Out bank out_bank, word base 0)
+            // to Act SRAM act_dst + pass*out_words.  Serial (NPU idle) — no
+            // overlap, so the per-pass Out bank is freed before the next pass.
+            dma_out_to_act((uint32_t)act_dst + pass * out_words, 0, out_words, out_bank);
+        } else {
 #if NPU_OC_OVERLAP
-        prev_pass = pass;
-        prev_bank = out_bank;
+            prev_pass = pass;
+            prev_bank = out_bank;
 #else
-        // SERIAL baseline: no overlap — drain THIS pass right after it finishes,
-        // before starting the next pass.  Compute and drain never run together.
-        dma_out_to_ddr(out_ddr_addr + pass * out_words * 16, 0,
-                       out_nbeats, out_bank);
+            // SERIAL baseline: drain THIS pass to DDR before the next pass.
+            dma_out_to_ddr(out_ddr_addr + pass * out_words * 16, 0,
+                           out_nbeats, out_bank);
 #endif
+        }
     }
 
 #if NPU_OC_OVERLAP
-    // Drain the final pass's output (no further compute to overlap with).
-    dma_out_to_ddr(out_ddr_addr + prev_pass * out_words * 16, 0,
-                   out_nbeats, prev_bank);
+    // Drain the final pass's output to DDR (DDR path only).
+    if (act_dst < 0 && prev_pass >= 0)
+        dma_out_to_ddr(out_ddr_addr + prev_pass * out_words * 16, 0,
+                       out_nbeats, prev_bank);
 #endif
 #if NPU_PROFILE
     {
@@ -659,7 +697,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     dma_ddr_to_act(ACT_BUF_A, 0, 28 * 28 * 1);   // 28x28x16, tiles=1 → 784 words
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   1, SCALE_CONV1, conv1_b,
-                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1, 1);   // pad=1 (HW), row_par=1 (task E bring-up)
+                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1, 1, 0, ACT_RES_B);   // resident: copy out -> Act ACT_RES_B
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv1", ACT_BUF_B, 784 * 16);
     {
@@ -678,19 +716,21 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // ---- Conv2: ActBuf_B(28×28×16) → HW-pad(30×30) → Conv → 28×28 → 2x2 pool → ActBuf_B ----
     // Hardware padding (pad=1): DMA the unpadded Conv1 output straight into Act
     // SRAM (tile-major); the FSM injects border zeros. No CPU pad_activation.
-    dma_ddr_to_act(ACT_BUF_B, 0, 28 * 28 * 1);   // 28x28x16, tiles=1 → 784 words
+    // Conv2 input resident in Act SRAM region ACT_RES_B (copied from Conv1) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_B, 0, 28 * 28 * 1);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1);   // pool_en=1, pad=1 (HW), row_par=1
+                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1, ACT_RES_B, 0);   // resident in=R1, out->R0
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool1", ACT_BUF_B, 196 * 16);
 #endif
 
     // ---- Conv3: ActBuf_B(14×14×16) → HW-pad(16×16) → Conv → 14×14×32 → ActBuf_A ----
-    dma_ddr_to_act(ACT_BUF_B, 0, 14 * 14 * 1);   // 14x14x16, tiles=1 → 196 words
+    // Conv3 input resident in Act region R0 (copied from Conv2) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_B, 0, 14 * 14 * 1);
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
                   16, SCALE_CONV3, conv3_b,
-                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1);   // pad=1 (HW), row_par=1
+                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1, 0, ACT_RES_B);   // resident in=R0, out->R1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
     {
@@ -704,30 +744,33 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
 #endif
 
     // ---- Conv4: ActBuf_A(14×14×32) → HW-pad(18×18, pad=2) → Conv → 16×16×32 → 2x2 pool → ActBuf_A ----
-    dma_ddr_to_act(ACT_BUF_A, 0, 14 * 14 * 2);   // 14x14x32, tiles=2 → 392 words
+    // Conv4 input resident in Act region R1 (copied from Conv3) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_A, 0, 14 * 14 * 2);
     // NPU does Conv4 + Pool2: 16x16 conv -> 2x2 maxpool -> 8x8.
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
                   32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1);   // pool_en=1, pad=2 (HW), row_par=1
+                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, ACT_RES_B, 0);   // resident in=R1, out->R0
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool2", ACT_BUF_A, 64 * 32);
 #endif
 
     // ---- Conv5: ActBuf_A(8×8×32) → HW-pad(10×10) → Conv → 8×8×64 → ActBuf_B ----
-    dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);   // 8x8x32, tiles=2 → 128 words
+    // Conv5 input resident in Act region R0 (copied from Conv4) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
                   32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1);   // pad=1 (HW), row_par=1
+                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, ACT_RES_B);   // resident in=R0, out->R1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 #endif
 
     // ---- Conv6: ActBuf_B(8×8×64) → HW-pad(10×10) → Conv → 8×8×64 → 2x2 pool → ActBuf_B ----
-    dma_ddr_to_act(ACT_BUF_B, 0, 8 * 8 * 4);   // 8x8x64, tiles=4 → 256 words
+    // Conv6 input resident in Act region R1 (copied from Conv5) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_B, 0, 8 * 8 * 4);
     // NPU does Conv6 + Pool3: 8x8 conv -> 2x2 maxpool -> 4x4.
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
                   64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1);   // pool_en=1, pad=1 (HW), row_par=1
+                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, ACT_RES_B, -1);   // resident in=R1; out->DDR (reorder)
 
     // ---- Reorder Pool3 output: position-first → channels-first for affine ----
     // Pool3 output (ActBuf_B): spatial-first-per-tile layout
