@@ -155,7 +155,9 @@ module param_regfile #(
     // DMA ping/pong buffer select for SRAM writes
     output wire                         o_dma_act_ping_sel, // 0=Ping, 1=Pong — Act SRAM DMA write target
     output wire                         o_dma_wgt_ping_sel, // 0=Ping, 1=Pong — Wgt SRAM DMA write target
-    output wire                         o_dma_out_ping_sel  // 0=Ping, 1=Pong — Out SRAM DMA read source (decoupled from NPU write bank)
+    output wire                         o_dma_out_ping_sel, // 0=Ping, 1=Pong — Out SRAM DMA read source (decoupled from NPU write bank)
+    output wire                         o_copy_trig,        // 0x154 write: pulse to start on-chip Out->Act copy
+    input  wire                         i_copy_done         // copy engine: completion (level), exposed in STATUS[2]
 );
 
     // -------------------------------------------------------------------
@@ -226,6 +228,7 @@ module param_regfile #(
     reg [SRAM_ADDR_W-1:0] dma_wr_sram_base;
     reg        dma_rd_req_d;   // 1-cycle delayed pulse for DMA read request
     reg        dma_wr_req_d;   // 1-cycle delayed pulse for DMA write request
+    reg        copy_trig_d;    // 1-cycle delayed pulse for on-chip Out->Act copy trigger
     reg        dma_sram_sel;   // 0=Act SRAM, 1=Wgt SRAM for DMA write target
     reg        dma_out_rd_sel; // 0=skip path owns Out SRAM Port B, 1=DMA owns it
     reg [1:0]  dma_rd_sram_sel; // 0=Out SRAM, 1=Act SRAM, 2=Wgt SRAM for DMA read source
@@ -313,6 +316,7 @@ module param_regfile #(
             dma_wr_sram_base <= {SRAM_ADDR_W{1'b0}};
             dma_rd_req_d     <= 1'b0;
             dma_wr_req_d     <= 1'b0;
+            copy_trig_d      <= 1'b0;
             dma_sram_sel     <= 1'b0;
             dma_out_rd_sel   <= 1'b0;
             dma_rd_sram_sel  <= 2'd0;
@@ -332,6 +336,7 @@ module param_regfile #(
             // DMA request pulse: auto-clear after 1 cycle
             dma_rd_req_d <= 1'b0;
             dma_wr_req_d <= 1'b0;
+            copy_trig_d  <= 1'b0;
 
             if (wr_en) begin
                 // synthesis translate_off
@@ -433,6 +438,7 @@ module param_regfile #(
                         dma_out_ping_sel <= s_axi_wdata[2];
                     end
                     10'h150: pad_cfg <= s_axi_wdata[15:0];  // {pad_h, pad_w}
+                    10'h154: copy_trig_d <= 1'b1;            // trigger on-chip Out->Act copy
 
                     default: ; // Ignore unmapped addresses
                 endcase
@@ -503,7 +509,7 @@ module param_regfile #(
                     10'h114: rdata <= {16'd0, total_ops_w};
 
                     // DMA status (0x140, read-only)
-                    10'h140: rdata <= {30'd0, i_dma_wr_done, i_dma_rd_done};
+                    10'h140: rdata <= {29'd0, i_copy_done, i_dma_wr_done, i_dma_rd_done};
 
                     // DMA register readback (0x124-0x13C)
                     10'h124: rdata <= dma_rd_ddr_addr;
@@ -590,5 +596,6 @@ module param_regfile #(
     assign o_dma_act_ping_sel = dma_act_ping_sel;
     assign o_dma_wgt_ping_sel = dma_wgt_ping_sel;
     assign o_dma_out_ping_sel = dma_out_ping_sel;
+    assign o_copy_trig        = copy_trig_d;
 
 endmodule

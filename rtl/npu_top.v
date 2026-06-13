@@ -128,6 +128,8 @@ module npu_top #(
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
     wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
+    wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
+    wire                            copy_done = 1'b0;   // TEMP: replaced by the copy engine in Task 3
     wire [7:0]                      cfg_pad_w;          // NPU_PAD[7:0]
     wire [7:0]                      cfg_pad_h;          // NPU_PAD[15:8]
     wire                            status_done_irq;
@@ -275,7 +277,9 @@ module npu_top #(
         .o_dma_rd_sram_sel (cfg_dma_rd_sram_sel),
         .o_dma_act_ping_sel(cfg_dma_act_ping_sel),
         .o_dma_wgt_ping_sel(cfg_dma_wgt_ping_sel),
-        .o_dma_out_ping_sel(cfg_dma_out_ping_sel)
+        .o_dma_out_ping_sel(cfg_dma_out_ping_sel),
+        .o_copy_trig       (cfg_copy_trig),
+        .i_copy_done       (copy_done)
     );
 
     // ===================================================================
