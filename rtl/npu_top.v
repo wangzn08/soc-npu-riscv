@@ -130,7 +130,12 @@ module npu_top #(
     wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
-    wire                            expand_done = 1'b0; // TEMP: replaced by the engine in Task 4
+    wire                            expand_done;
+    wire                            expand_busy;
+    wire [SRAM_ADDR_W-1:0]          expand_addr;
+    wire                            expand_en;
+    wire                            expand_we;
+    wire [ACT_DATA_W-1:0]           expand_wdata;
     wire                            copy_done;
     wire                            copy_busy;
     wire [SRAM_ADDR_W-1:0]          copy_out_rd_addr;
@@ -917,12 +922,16 @@ module npu_top #(
     wire act_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd1);
 
     // Copy engine takes Act Port B while busy (writes); else the DMA muxes.
-    assign act_sram_addrb = copy_busy ? copy_act_wr_addr
+    assign act_sram_addrb = expand_busy ? expand_addr
+                          : copy_busy ? copy_act_wr_addr
                           : act_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
-    assign act_sram_enb   = copy_busy ? copy_act_wr_en
+    assign act_sram_enb   = expand_busy ? expand_en
+                          : copy_busy ? copy_act_wr_en
                           : (act_dma_wr_active | act_dma_rd_active);
-    assign act_sram_dib   = copy_busy ? copy_act_wr_data : dma_sram_wr_data;
-    assign act_sram_web   = copy_busy ? copy_act_wr_en : act_dma_wr_active;
+    assign act_sram_dib   = expand_busy ? expand_wdata
+                          : copy_busy ? copy_act_wr_data : dma_sram_wr_data;
+    assign act_sram_web   = expand_busy ? expand_we
+                          : copy_busy ? copy_act_wr_en : act_dma_wr_active;
 
     // Wgt SRAM Port B: DMA writes (sel=1) or DMA reads (rd_sram_sel=2)
     wire wgt_dma_wr_active = dma_sram_wr_en & cfg_dma_sram_sel;
@@ -992,6 +1001,30 @@ module npu_top #(
         .o_act_wr_data (copy_act_wr_data),
         .o_busy        (copy_busy),
         .o_done        (copy_done)
+    );
+
+    // ===================================================================
+    // Image expand engine (Conv1 input formatting): Act scratch (packed bytes)
+    // -> Act output region (zero-extended 16-ch words). Shares Act Port B
+    // (read+write on different cycles), highest priority via expand_busy.
+    // ===================================================================
+    img_expand #(
+        .ADDR_W (SRAM_ADDR_W),
+        .DATA_W (ACT_DATA_W)
+    ) u_img_expand (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .i_trig     (cfg_expand_trig),
+        .i_src_base (cfg_dma_rd_sram_base),
+        .i_dst_base (cfg_dma_wr_sram_base),
+        .i_n_out    (cfg_dma_rd_len),
+        .o_addr     (expand_addr),
+        .o_en       (expand_en),
+        .o_we       (expand_we),
+        .o_wdata    (expand_wdata),
+        .i_rdata    (act_sram_dob),
+        .o_busy     (expand_busy),
+        .o_done     (expand_done)
     );
 
     // ===================================================================
