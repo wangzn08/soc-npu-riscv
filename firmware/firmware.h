@@ -75,6 +75,8 @@ void usercode7(void);
 #define NPU_DMA_PING_SEL     (NPU_BASE + 0x14C)  // [0]=Act ping, [1]=Wgt ping, [2]=Out ping
 #define NPU_DMA_COPY_TRIG    (NPU_BASE + 0x154)  // write any value: trigger on-chip Out->Act copy
 #define NPU_DMA_STATUS_COPY_DONE (1 << 2)        // NPU_DMA_STATUS bit2: on-chip copy complete
+#define NPU_DMA_EXPAND_TRIG  (NPU_BASE + 0x158)  // write any value: trigger img_expand (byte->word)
+#define NPU_DMA_STATUS_EXPAND_DONE (1 << 3)      // NPU_DMA_STATUS bit3: img_expand complete
 
 // CTRL bits
 #define NPU_CTRL_START      (1 << 0)

@@ -129,6 +129,8 @@ module npu_top #(
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
     wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
+    wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
+    wire                            expand_done = 1'b0; // TEMP: replaced by the engine in Task 4
     wire                            copy_done;
     wire                            copy_busy;
     wire [SRAM_ADDR_W-1:0]          copy_out_rd_addr;
@@ -285,7 +287,9 @@ module npu_top #(
         .o_dma_wgt_ping_sel(cfg_dma_wgt_ping_sel),
         .o_dma_out_ping_sel(cfg_dma_out_ping_sel),
         .o_copy_trig       (cfg_copy_trig),
-        .i_copy_done       (copy_done)
+        .i_copy_done       (copy_done),
+        .o_expand_trig     (cfg_expand_trig),
+        .i_expand_done     (expand_done)
     );
 
     // ===================================================================
