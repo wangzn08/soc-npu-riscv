@@ -129,7 +129,13 @@ module npu_top #(
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
     wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
-    wire                            copy_done = 1'b0;   // TEMP: replaced by the copy engine in Task 3
+    wire                            copy_done;
+    wire                            copy_busy;
+    wire [SRAM_ADDR_W-1:0]          copy_out_rd_addr;
+    wire                            copy_out_rd_en;
+    wire [SRAM_ADDR_W-1:0]          copy_act_wr_addr;
+    wire                            copy_act_wr_en;
+    wire [ACT_DATA_W-1:0]           copy_act_wr_data;
     wire [7:0]                      cfg_pad_w;          // NPU_PAD[7:0]
     wire [7:0]                      cfg_pad_h;          // NPU_PAD[15:8]
     wire                            status_done_irq;
@@ -906,10 +912,13 @@ module npu_top #(
     wire act_dma_wr_active = dma_sram_wr_en & ~cfg_dma_sram_sel;
     wire act_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd1);
 
-    assign act_sram_addrb = act_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
-    assign act_sram_enb   = act_dma_wr_active | act_dma_rd_active;
-    assign act_sram_dib   = dma_sram_wr_data;
-    assign act_sram_web   = act_dma_wr_active;
+    // Copy engine takes Act Port B while busy (writes); else the DMA muxes.
+    assign act_sram_addrb = copy_busy ? copy_act_wr_addr
+                          : act_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
+    assign act_sram_enb   = copy_busy ? copy_act_wr_en
+                          : (act_dma_wr_active | act_dma_rd_active);
+    assign act_sram_dib   = copy_busy ? copy_act_wr_data : dma_sram_wr_data;
+    assign act_sram_web   = copy_busy ? copy_act_wr_en : act_dma_wr_active;
 
     // Wgt SRAM Port B: DMA writes (sel=1) or DMA reads (rd_sram_sel=2)
     wire wgt_dma_wr_active = dma_sram_wr_en & cfg_dma_sram_sel;
@@ -932,8 +941,9 @@ module npu_top #(
     assign out_sram_addrb_mux = cfg_dma_out_rd_sel ? out_sram_addrb_dma : skip_rd_addr;
     assign out_sram_enb_mux   = cfg_dma_out_rd_sel ? out_sram_enb_dma   : skip_rd_en;
 
-    assign out_sram_addrb = out_sram_addrb_mux;
-    assign out_sram_enb   = out_sram_enb_mux;
+    // Copy engine takes Out Port B while busy (reads); else the skip/DMA mux.
+    assign out_sram_addrb = copy_busy ? copy_out_rd_addr : out_sram_addrb_mux;
+    assign out_sram_enb   = copy_busy ? copy_out_rd_en   : out_sram_enb_mux;
     assign out_sram_web   = 1'b0;
     assign out_sram_dib   = {ACT_DATA_W{1'b0}};
 
@@ -952,6 +962,33 @@ module npu_top #(
     end
     `endif
     // synthesis translate_on
+
+    // ===================================================================
+    // On-chip Out->Act copy engine (SRAM residency). src/dst/len reuse the DMA
+    // SRAM-base/len registers; banks follow cfg_dma_out_ping_sel /
+    // cfg_dma_act_ping_sel via the SRAM wrappers' dma_ping_sel. i_len = full
+    // word count (cfg_dma_rd_len). Time-shares Port B with axi_dma (mutually
+    // exclusive — firmware never overlaps them).
+    // ===================================================================
+    sram_copy #(
+        .ADDR_W (SRAM_ADDR_W),
+        .DATA_W (ACT_DATA_W)
+    ) u_sram_copy (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .i_trig        (cfg_copy_trig),
+        .i_src_base    (cfg_dma_rd_sram_base),
+        .i_dst_base    (cfg_dma_wr_sram_base),
+        .i_len         (cfg_dma_rd_len),
+        .o_out_rd_addr (copy_out_rd_addr),
+        .o_out_rd_en   (copy_out_rd_en),
+        .i_out_rd_data (out_sram_dob),
+        .o_act_wr_addr (copy_act_wr_addr),
+        .o_act_wr_en   (copy_act_wr_en),
+        .o_act_wr_data (copy_act_wr_data),
+        .o_busy        (copy_busy),
+        .o_done        (copy_done)
+    );
 
     // ===================================================================
     // AXI DMA — connect to SRAM Port B (DDR ↔ SRAM)
