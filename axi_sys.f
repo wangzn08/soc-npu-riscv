@@ -16,6 +16,7 @@ rtl/axi_lite_ram.v
 rtl/axi_lite_to_axi_full.v
 rtl/axi_arbiter_2to1.v
 rtl/axi_full_slave_v1_0_S00_AXI.v
+rtl/axi_upsizer_32_128.v
 
 # NPU Wrapper + NPU RTL
 rtl/npu_axi_wrapper.v

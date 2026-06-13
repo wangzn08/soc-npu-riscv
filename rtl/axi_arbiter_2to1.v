@@ -18,7 +18,7 @@ module axi_arbiter_2to1 #(
     input  wire        m0_axi_wvalid,
     output wire        m0_axi_wready,
     input  wire [DATA_WIDTH-1:0] m0_axi_wdata,
-    input  wire [3:0]  m0_axi_wstrb,
+    input  wire [DATA_WIDTH/8-1:0]  m0_axi_wstrb,
     input  wire        m0_axi_wlast,
     output wire        m0_axi_bvalid,
     input  wire        m0_axi_bready,
@@ -45,7 +45,7 @@ module axi_arbiter_2to1 #(
     input  wire        m1_axi_wvalid,
     output wire        m1_axi_wready,
     input  wire [DATA_WIDTH-1:0] m1_axi_wdata,
-    input  wire [3:0]  m1_axi_wstrb,
+    input  wire [DATA_WIDTH/8-1:0]  m1_axi_wstrb,
     input  wire        m1_axi_wlast,
     output wire        m1_axi_bvalid,
     input  wire        m1_axi_bready,
@@ -72,7 +72,7 @@ module axi_arbiter_2to1 #(
     output reg         s_axi_wvalid,
     input  wire        s_axi_wready,
     output reg  [DATA_WIDTH-1:0] s_axi_wdata,
-    output reg  [3:0]  s_axi_wstrb,
+    output reg  [DATA_WIDTH/8-1:0]  s_axi_wstrb,
     output reg         s_axi_wlast,
     input  wire        s_axi_bvalid,
     output wire        s_axi_bready,
@@ -146,7 +146,7 @@ module axi_arbiter_2to1 #(
     always @* begin
         s_axi_wvalid = 1'b0;
         s_axi_wdata  = {DATA_WIDTH{1'b0}};
-        s_axi_wstrb  = 4'b0;
+        s_axi_wstrb  = {(DATA_WIDTH/8){1'b0}};
         s_axi_wlast  = 1'b0;
         if (wr_active) begin
             case (wr_grant)

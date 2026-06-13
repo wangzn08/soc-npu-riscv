@@ -14,7 +14,7 @@
 
 module npu_axi_wrapper #(
     parameter NPU_AXI_DATA_W  = 128,   // NPU native DMA width
-    parameter SOC_AXI_DATA_W  = 32,    // SoC bus width
+    parameter SOC_AXI_DATA_W  = 128,    // SoC bus width
     parameter AXI_ADDR_W      = 32,
     parameter AXI_ID_W        = 4,
     parameter AXI_LEN_W       = 8,
@@ -245,264 +245,41 @@ module npu_axi_wrapper #(
     );
 
     // ===================================================================
-    // AXI Width Converter: 128-bit (NPU) ↔ 32-bit (SoC)
+    // DMA AXI pass-through (Stage 2): npu_top's native 128-bit DMA master
+    // drives the SoC bus directly. The old 128->32 width converter is removed;
+    // the SoC data path / arbiter / shared memory are now 128-bit, so there is
+    // no 4x down-conversion. NPU writes full beats, so axi_sys ties the write
+    // strobe to all-ones and this wrapper carries no WSTRB port. dma_wstrb from
+    // npu_top is intentionally left unused (full-beat writes).
     // ===================================================================
-    // Each 128-bit beat → 4 × 32-bit beats.
-    // Write: latch 128-bit, serialize 4 × 32-bit
-    // Read:  collect 4 × 32-bit, assemble 128-bit
-
-    // ---- Write path state machine ----
-    // DMA sends burst: one address (WR_ADDR) then N data beats (WR_DATA).
-    // Each 128-bit DMA beat → 4 × 32-bit slave beats.
-    // Total slave burst = 4*(dma_awlen+1) beats, single address, wlast on last.
-    //
-    // States: WR_IDLE → WR_WAIT_DATA → WR_SEND → (WR_WAIT_DATA or WR_WAIT_RESP)
-
-    localparam WR_IDLE      = 2'd0;
-    localparam WR_WAIT_DATA = 2'd1;
-    localparam WR_SEND      = 2'd2;
-    localparam WR_WAIT_RESP = 2'd3;
-
-    reg [1:0]                wr_state;
-    reg [AXI_ADDR_W-1:0]    wr_base_addr;
-    reg [7:0]               wr_awlen;        // DMA burst length (N-1)
-    reg [7:0]               wr_dma_beat_cnt;  // current DMA beat index
-    reg [NPU_AXI_DATA_W-1:0] wr_data_buf;
-    reg [1:0]               wr_sub_cnt;       // 32-bit sub-beat index (0..3)
-    reg                     wr_aw_sent;       // awvalid accepted by slave
-
-    wire wr_xfer = m_axi_wvalid && m_axi_wready;
-
-    // DMA handshake: accept address in IDLE, accept data in WAIT_DATA
-    assign dma_awready = (wr_state == WR_IDLE);
-    assign dma_wready  = (wr_state == WR_WAIT_DATA);
-
-    // Write state machine
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            wr_state        <= WR_IDLE;
-            wr_base_addr    <= {AXI_ADDR_W{1'b0}};
-            wr_awlen        <= 8'd0;
-            wr_dma_beat_cnt <= 8'd0;
-            wr_data_buf     <= {NPU_AXI_DATA_W{1'b0}};
-            wr_sub_cnt      <= 2'd0;
-            wr_aw_sent      <= 1'b0;
-        end else begin
-            case (wr_state)
-                WR_IDLE: begin
-                    if (dma_awvalid) begin
-                        wr_base_addr    <= dma_awaddr;
-                        wr_awlen        <= dma_awlen;
-                        wr_dma_beat_cnt <= 8'd0;
-                        wr_state        <= WR_WAIT_DATA;
-                    end
-                end
-
-                WR_WAIT_DATA: begin
-                    if (dma_wvalid) begin
-                        wr_data_buf <= dma_wdata;
-                        wr_sub_cnt  <= 2'd0;
-                        wr_aw_sent  <= 1'b0;
-                        wr_state    <= WR_SEND;
-                    end
-                end
-
-                WR_SEND: begin
-                    // Track awvalid/awready handshake
-                    if (m_axi_awvalid && m_axi_awready)
-                        wr_aw_sent <= 1'b1;
-                    // Track wvalid/wready data beats
-                    if (wr_xfer) begin
-                        if (wr_sub_cnt == 2'd3) begin
-                            wr_dma_beat_cnt <= wr_dma_beat_cnt + 8'd1;
-                            if (wr_dma_beat_cnt == wr_awlen)
-                                wr_state <= WR_WAIT_RESP;  // last beat done
-                            else
-                                wr_state <= WR_WAIT_DATA;   // more beats
-                        end else begin
-                            wr_sub_cnt <= wr_sub_cnt + 2'd1;
-                        end
-                    end
-                end
-
-                WR_WAIT_RESP: begin
-                    if (m_axi_bvalid)
-                        wr_state <= WR_IDLE;
-                end
-            endcase
-        end
-    end
-
-    // ---- Slave write address channel ----
-    // awvalid sent once at start of burst, cleared when slave accepts
-    assign m_axi_awvalid = (wr_state == WR_SEND) && !wr_aw_sent;
-    assign m_axi_awaddr  = wr_base_addr;
-    assign m_axi_awlen   = {wr_awlen, 2'b11};   // ×4: NPU awlen=N-1 → SoC awlen=4N-1
-    assign m_axi_awsize  = 3'd2;                  // 4 bytes
-    assign m_axi_awburst = 2'b01;                 // INCR
-
-    // ---- Slave write data channel ----
-    reg [SOC_AXI_DATA_W-1:0] wdata_mux;
-    always @(*) begin
-        case (wr_sub_cnt)
-            2'd0:    wdata_mux = wr_data_buf[31:0];
-            2'd1:    wdata_mux = wr_data_buf[63:32];
-            2'd2:    wdata_mux = wr_data_buf[95:64];
-            default: wdata_mux = wr_data_buf[127:96];
-        endcase
-    end
-
-    assign m_axi_wvalid = (wr_state == WR_SEND);
-    assign m_axi_wdata  = wdata_mux;
-    assign m_axi_wlast  = (wr_state == WR_SEND) && (wr_sub_cnt == 2'd3) &&
-                          (wr_dma_beat_cnt == wr_awlen);
-
-    // ---- Write response ----
-    assign m_axi_bready  = 1'b1;
-    assign dma_bvalid    = m_axi_bvalid && (wr_state == WR_WAIT_RESP);
+    // Write address
+    assign m_axi_awvalid = dma_awvalid;
+    assign dma_awready   = m_axi_awready;
+    assign m_axi_awaddr  = dma_awaddr;
+    assign m_axi_awlen   = dma_awlen;
+    assign m_axi_awsize  = dma_awsize;
+    assign m_axi_awburst = dma_awburst;
+    // Write data
+    assign m_axi_wvalid  = dma_wvalid;
+    assign dma_wready    = m_axi_wready;
+    assign m_axi_wdata   = dma_wdata;
+    assign m_axi_wlast   = dma_wlast;
+    // Write response
+    assign dma_bvalid    = m_axi_bvalid;
+    assign m_axi_bready  = dma_bready;
     assign dma_bresp     = m_axi_bresp;
-
-    // ---- Read path: AXI width conversion with burst splitting ----
-    // Each 128-bit DMA beat → 4 × 32-bit SoC beats.
-    // Maximum AXI burst length is 256 (arlen=255), supporting 64 DMA beats
-    // per SoC burst. Larger DMA transfers are split into multiple AXI bursts.
-
-    localparam RD_IDLE = 2'd0;
-    localparam RD_ADDR = 2'd1;
-    localparam RD_DATA = 2'd2;
-
-    reg [1:0]               rd_state;
-    reg [AXI_ADDR_W-1:0]    rd_addr;
-    reg [7:0]               rd_dma_total;   // DMA burst length (N-1)
-    reg [7:0]               rd_dma_done;    // DMA beats completed
-    reg [7:0]               rd_soc_arlen;   // current SoC burst arlen
-    reg [1:0]               rd_sub_cnt;     // 32-bit sub-beat index
-    reg [NPU_AXI_DATA_W-1:0] rd_data_buf;
-    reg                     rd_word_done;
-
-    // DMA address handshake
-    assign dma_arready = (rd_state == RD_IDLE);
-
-    // SoC address channel
-    assign m_axi_arvalid = (rd_state == RD_ADDR);
-    assign m_axi_araddr  = rd_addr;
-    assign m_axi_arlen   = rd_soc_arlen;
-    assign m_axi_arsize  = 3'd2;
-    assign m_axi_arburst = 2'b01;
-
-    // SoC data channel
-    assign m_axi_rready = 1'b1;
-    wire rd_xfer = m_axi_rvalid && m_axi_rready;
-
-    // DMA data channel
-    assign dma_rvalid = rd_word_done;
-    assign dma_rdata  = rd_data_buf;
-    assign dma_rresp  = m_axi_rresp;
-
-    // dma_rlast: registered, sampled in the same cycle as rd_word_done assertion.
-    // Using the registered rd_dma_done ONE CYCLE LATER would cause rlast to fire
-    // one beat early (rd_dma_done was already incremented past the current beat).
-    reg dma_rlast_r;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            dma_rlast_r <= 1'b0;
-        else if (rd_state == RD_DATA && rd_xfer &&
-                 (m_axi_rlast || rd_sub_cnt == 2'd3))
-            dma_rlast_r <= (rd_dma_done == rd_dma_total);
-        else
-            dma_rlast_r <= 1'b0;
-    end
-    assign dma_rlast = dma_rlast_r;
-
-    // Combinational: remaining DMA beats after current
-    wire [7:0] rd_dma_remaining = rd_dma_total - rd_dma_done;
-    // Next SoC burst chunk size (DMA beats, max 64)
-    wire [5:0] rd_next_chunk = (rd_dma_remaining > 8'd64) ? 6'd64 : rd_dma_remaining[5:0];
-    // Next SoC arlen = (chunk-1)*4 + 3 = {chunk-1, 2'b11}
-    wire [7:0] rd_next_arlen = {rd_next_chunk - 6'd1, 2'b11};
-    // Next SoC address = current + (arlen+1)*4
-    wire [AXI_ADDR_W-1:0] rd_next_addr = rd_addr +
-        {{(AXI_ADDR_W-10){1'b0}}, rd_soc_arlen, 2'b00} + 32'd4;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            rd_state     <= RD_IDLE;
-            rd_addr      <= {AXI_ADDR_W{1'b0}};
-            rd_dma_total <= 8'd0;
-            rd_dma_done  <= 8'd0;
-            rd_soc_arlen <= 8'd0;
-            rd_sub_cnt   <= 2'd0;
-            rd_data_buf  <= {NPU_AXI_DATA_W{1'b0}};
-            rd_word_done <= 1'b0;
-        end else begin
-            rd_word_done <= 1'b0;
-
-            case (rd_state)
-                RD_IDLE: begin
-                    if (dma_arvalid) begin
-                        rd_addr      <= dma_araddr;
-                        rd_dma_total <= dma_arlen;
-                        rd_dma_done  <= 8'd0;
-                        rd_sub_cnt   <= 2'd0;
-                        // First burst: min(dma_arlen+1, 64) DMA beats
-                        rd_soc_arlen <= (dma_arlen > 8'd63) ?
-                            8'd255 :
-                            {dma_arlen[5:0], 2'b00} + 8'd3;
-                        rd_state     <= RD_ADDR;
-                    end
-                end
-
-                RD_ADDR: begin
-                    if (m_axi_arready) begin
-                        rd_state <= RD_DATA;
-                    end
-                end
-
-                RD_DATA: begin
-                    if (rd_xfer) begin
-                        case (rd_sub_cnt)
-                            2'd0: rd_data_buf[31:0]   <= m_axi_rdata;
-                            2'd1: rd_data_buf[63:32]  <= m_axi_rdata;
-                            2'd2: rd_data_buf[95:64]  <= m_axi_rdata;
-                            2'd3: rd_data_buf[127:96] <= m_axi_rdata;
-                        endcase
-
-                        if (m_axi_rlast || rd_sub_cnt == 2'd3) begin
-                            rd_sub_cnt   <= 2'd0;
-                            rd_word_done <= 1'b1;
-
-                            if (rd_dma_done == rd_dma_total) begin
-                                rd_state <= RD_IDLE;
-                            end else begin
-                                rd_dma_done  <= rd_dma_done + 8'd1;
-                                if (m_axi_rlast) begin
-                                    rd_addr      <= rd_next_addr;
-                                    rd_soc_arlen <= rd_next_arlen;
-                                    rd_state     <= RD_ADDR;
-                                end
-                            end
-                        end else begin
-                            rd_sub_cnt <= rd_sub_cnt + 2'd1;
-                        end
-                    end
-                end
-            endcase
-        end
-    end
-
-    // synthesis translate_off
-    // always @(posedge clk) begin
-    //     if (dma_arvalid && dma_arready)
-    //         $display("WRAP_RD_ACCEPT: addr=%0h len=%0d", dma_araddr, dma_arlen);
-    //     if (m_axi_arvalid && m_axi_arready)
-    //         $display("WRAP_RD_SEND: addr=%0h len=%0d", m_axi_araddr, m_axi_arlen);
-    //     if (rd_xfer)
-    //         $display("WRAP_RD_DATA: rdata=%0h sub=%0d rlast=%0b", m_axi_rdata, rd_sub_cnt, m_axi_rlast);
-    //     if (rd_word_done)
-    //         $display("WRAP_RD_WORD: data=%0h done_cnt=%0d total=%0d", rd_data_buf, rd_dma_done, rd_dma_total);
-    //     if (dma_rvalid)
-    //         $display("WRAP_RD_DMA: rdata=%0h rlast=%0b", dma_rdata, dma_rlast);
-    // end
-    // synthesis translate_on
+    // Read address
+    assign m_axi_arvalid = dma_arvalid;
+    assign dma_arready   = m_axi_arready;
+    assign m_axi_araddr  = dma_araddr;
+    assign m_axi_arlen   = dma_arlen;
+    assign m_axi_arsize  = dma_arsize;
+    assign m_axi_arburst = dma_arburst;
+    // Read data
+    assign dma_rvalid    = m_axi_rvalid;
+    assign m_axi_rready  = dma_rready;
+    assign dma_rdata     = m_axi_rdata;
+    assign dma_rresp     = m_axi_rresp;
+    assign dma_rlast     = m_axi_rlast;
 
 endmodule

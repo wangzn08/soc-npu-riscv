@@ -519,6 +519,45 @@ module axi_sys #(
     );
 
     // -----------------------------------------------------------------
+    // CPU 32->128 upsizer: lets the 32-bit CPU share the 128-bit memory.
+    // bridge (32-bit) -> upsizer -> arbiter Master0 (128-bit)
+    // -----------------------------------------------------------------
+    wire        up_awvalid, up_awready;
+    wire [31:0] up_awaddr;
+    wire [7:0]  up_awlen;
+    wire [2:0]  up_awsize;
+    wire [1:0]  up_awburst;
+    wire        up_wvalid, up_wready;
+    wire [127:0] up_wdata;
+    wire [15:0] up_wstrb;
+    wire        up_wlast;
+    wire        up_bvalid, up_bready;
+    wire [1:0]  up_bresp;
+    wire        up_arvalid, up_arready;
+    wire [31:0] up_araddr;
+    wire [7:0]  up_arlen;
+    wire [2:0]  up_arsize;
+    wire [1:0]  up_arburst;
+    wire        up_rvalid, up_rready;
+    wire [127:0] up_rdata;
+    wire [1:0]  up_rresp;
+    wire        up_rlast;
+
+    axi_upsizer_32_128 cpu_upsizer (
+        .clk(clk), .resetn(resetn),
+        .s_awvalid(bridge_awvalid), .s_awready(bridge_awready), .s_awaddr(bridge_awaddr), .s_awsize(bridge_awsize), .s_awburst(bridge_awburst),
+        .s_wvalid(bridge_wvalid), .s_wready(bridge_wready), .s_wdata(bridge_wdata), .s_wstrb(bridge_wstrb), .s_wlast(bridge_wlast),
+        .s_bvalid(bridge_bvalid), .s_bready(bridge_bready), .s_bresp(bridge_bresp),
+        .s_arvalid(bridge_arvalid), .s_arready(bridge_arready), .s_araddr(bridge_araddr), .s_arsize(bridge_arsize), .s_arburst(bridge_arburst),
+        .s_rvalid(bridge_rvalid), .s_rready(bridge_rready), .s_rdata(bridge_rdata), .s_rresp(bridge_rresp),
+        .m_awvalid(up_awvalid), .m_awready(up_awready), .m_awaddr(up_awaddr), .m_awlen(up_awlen), .m_awsize(up_awsize), .m_awburst(up_awburst),
+        .m_wvalid(up_wvalid), .m_wready(up_wready), .m_wdata(up_wdata), .m_wstrb(up_wstrb), .m_wlast(up_wlast),
+        .m_bvalid(up_bvalid), .m_bready(up_bready), .m_bresp(up_bresp),
+        .m_arvalid(up_arvalid), .m_arready(up_arready), .m_araddr(up_araddr), .m_arlen(up_arlen), .m_arsize(up_arsize), .m_arburst(up_arburst),
+        .m_rvalid(up_rvalid), .m_rready(up_rready), .m_rdata(up_rdata), .m_rresp(up_rresp), .m_rlast(up_rlast)
+    );
+
+    // -----------------------------------------------------------------
     // NPU Wrapper 实例 (16×16 systolic NPU + 128→32 宽度转换)
     // -----------------------------------------------------------------
     wire        npu_m_awvalid, npu_m_awready;
@@ -527,7 +566,7 @@ module axi_sys #(
     wire [2:0]  npu_m_awsize;
     wire [1:0]  npu_m_awburst;
     wire        npu_m_wvalid, npu_m_wready;
-    wire [31:0] npu_m_wdata;
+    wire [127:0] npu_m_wdata;
     wire        npu_m_wlast;
     wire        npu_m_bvalid, npu_m_bready;
     wire [1:0]  npu_m_bresp;
@@ -537,13 +576,13 @@ module axi_sys #(
     wire [2:0]  npu_m_arsize;
     wire [1:0]  npu_m_arburst;
     wire        npu_m_rvalid, npu_m_rready;
-    wire [31:0] npu_m_rdata;
+    wire [127:0] npu_m_rdata;
     wire        npu_m_rlast;
     wire [1:0]  npu_m_rresp;
 
     npu_axi_wrapper #(
         .NPU_AXI_DATA_W (128),
-        .SOC_AXI_DATA_W (32),
+        .SOC_AXI_DATA_W (128),
         .AXI_ADDR_W     (32),
         .AXI_ID_W       (4),
         .AXI_LEN_W      (8),
@@ -606,8 +645,8 @@ module axi_sys #(
     wire [2:0]  arb_awsize;
     wire [1:0]  arb_awburst;
     wire        arb_wvalid, arb_wready;
-    wire [31:0] arb_wdata;
-    wire [3:0]  arb_wstrb;
+    wire [127:0] arb_wdata;
+    wire [15:0] arb_wstrb;
     wire        arb_wlast;
     wire        arb_bvalid, arb_bready;
     wire [1:0]  arb_bresp;
@@ -617,39 +656,39 @@ module axi_sys #(
     wire [2:0]  arb_arsize;
     wire [1:0]  arb_arburst;
     wire        arb_rvalid, arb_rready;
-    wire [31:0] arb_rdata;
+    wire [127:0] arb_rdata;
     wire        arb_rlast;
     wire [1:0]  arb_rresp;
 
-    axi_arbiter_2to1 arbiter (
+    axi_arbiter_2to1 #(.DATA_WIDTH(128)) arbiter (
         .clk             (clk),
         .resetn          (resetn),
-        // Master 0 (CPU 桥接器)
-        .m0_axi_awvalid  (bridge_awvalid),
-        .m0_axi_awready  (bridge_awready),
-        .m0_axi_awaddr   (bridge_awaddr),
-        .m0_axi_awlen    (8'd0),
-        .m0_axi_awsize   (bridge_awsize),
-        .m0_axi_awburst  (bridge_awburst),
-        .m0_axi_wvalid   (bridge_wvalid),
-        .m0_axi_wready   (bridge_wready),
-        .m0_axi_wdata    (bridge_wdata),
-        .m0_axi_wstrb    (bridge_wstrb),
-        .m0_axi_wlast    (bridge_wlast),
-        .m0_axi_bvalid   (bridge_bvalid),
-        .m0_axi_bready   (bridge_bready),
-        .m0_axi_bresp    (bridge_bresp),
-        .m0_axi_arvalid  (bridge_arvalid),
-        .m0_axi_arready  (bridge_arready),
-        .m0_axi_araddr   (bridge_araddr),
-        .m0_axi_arlen    (8'd0),
-        .m0_axi_arsize   (bridge_arsize),
-        .m0_axi_arburst  (bridge_arburst),
-        .m0_axi_rvalid   (bridge_rvalid),
-        .m0_axi_rready   (bridge_rready),
-        .m0_axi_rdata    (bridge_rdata),
-        .m0_axi_rresp    (bridge_rresp),
-        .m0_axi_rlast    (),
+        // Master 0 (CPU, 经 32->128 upsizer)
+        .m0_axi_awvalid  (up_awvalid),
+        .m0_axi_awready  (up_awready),
+        .m0_axi_awaddr   (up_awaddr),
+        .m0_axi_awlen    (up_awlen),
+        .m0_axi_awsize   (up_awsize),
+        .m0_axi_awburst  (up_awburst),
+        .m0_axi_wvalid   (up_wvalid),
+        .m0_axi_wready   (up_wready),
+        .m0_axi_wdata    (up_wdata),
+        .m0_axi_wstrb    (up_wstrb),
+        .m0_axi_wlast    (up_wlast),
+        .m0_axi_bvalid   (up_bvalid),
+        .m0_axi_bready   (up_bready),
+        .m0_axi_bresp    (up_bresp),
+        .m0_axi_arvalid  (up_arvalid),
+        .m0_axi_arready  (up_arready),
+        .m0_axi_araddr   (up_araddr),
+        .m0_axi_arlen    (up_arlen),
+        .m0_axi_arsize   (up_arsize),
+        .m0_axi_arburst  (up_arburst),
+        .m0_axi_rvalid   (up_rvalid),
+        .m0_axi_rready   (up_rready),
+        .m0_axi_rdata    (up_rdata),
+        .m0_axi_rresp    (up_rresp),
+        .m0_axi_rlast    (up_rlast),
         // Master 1 (NPU)
         .m1_axi_awvalid  (npu_m_awvalid),
         .m1_axi_awready  (npu_m_awready),
@@ -660,7 +699,7 @@ module axi_sys #(
         .m1_axi_wvalid   (npu_m_wvalid),
         .m1_axi_wready   (npu_m_wready),
         .m1_axi_wdata    (npu_m_wdata),
-        .m1_axi_wstrb    (4'b1111),
+        .m1_axi_wstrb    (16'hFFFF),
         .m1_axi_wlast    (npu_m_wlast),
         .m1_axi_bvalid   (npu_m_bvalid),
         .m1_axi_bready   (npu_m_bready),
@@ -719,7 +758,7 @@ module axi_sys #(
     // synthesis translate_on
 
     axi_full_slave_v1_0_S00_AXI #(
-        .C_S_AXI_DATA_WIDTH(32),
+        .C_S_AXI_DATA_WIDTH(128),
         .C_S_AXI_ADDR_WIDTH(24)
     ) shared_mem (
         .S_AXI_ACLK     (clk),

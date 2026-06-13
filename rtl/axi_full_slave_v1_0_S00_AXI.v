@@ -174,7 +174,6 @@
 	reg  	axi_arready;
 	wire [C_S_AXI_DATA_WIDTH-1 : 0] 	axi_rdata;
 	reg [1 : 0] 	axi_rresp;
-	reg  	axi_rlast;
 	reg [C_S_AXI_RUSER_WIDTH-1 : 0] 	axi_ruser;
 	reg  	axi_rvalid;
 	// aw_wrap_en determines wrap boundary and enables wrapping
@@ -206,8 +205,12 @@
 	//ADDR_LSB = 2 for 32 bits (n downto 2) 
 	//ADDR_LSB = 3 for 42 bits (n downto 3)
 
-	localparam integer ADDR_LSB = (C_S_AXI_DATA_WIDTH/32)+ 1;
-	localparam integer OPT_MEM_ADDR_BITS = 21;
+	// ADDR_LSB = log2(bytes per beat): 2 for 32b, 4 for 128b. The old
+	// (DATA_WIDTH/32)+1 form was only correct for 32/64b and gave 5 (wrong) at 128b.
+	localparam integer ADDR_LSB = $clog2(C_S_AXI_DATA_WIDTH/8);
+	// Word-address width auto-sized to the byte address space (keeps the same
+	// 16 MB span and init time at any data width: 4M words @32b, 1M words @128b).
+	localparam integer OPT_MEM_ADDR_BITS = C_S_AXI_ADDR_WIDTH - ADDR_LSB - 1;
 	localparam integer USER_NUM_MEM = 1;
 	//----------------------------------------------
 	//-- Signals for user logic memory space example
@@ -222,6 +225,8 @@
 
 	// I/O Connections assignments
 
+	reg  axi_read_last;  // registered RLAST, driven by pipelined read FSM
+
 	assign S_AXI_AWREADY	= axi_awready;
 	assign S_AXI_WREADY	= axi_wready;
 	assign S_AXI_BRESP	= axi_bresp;
@@ -230,7 +235,7 @@
 	assign S_AXI_ARREADY	= axi_arready;
 	assign S_AXI_RDATA	= axi_rdata;
 	assign S_AXI_RRESP	= axi_rresp;
-	assign S_AXI_RLAST	= axi_rlast;
+	assign S_AXI_RLAST	= axi_read_last; // back-to-back: rlast on last beat
 	assign S_AXI_RUSER	= axi_ruser;
 	assign S_AXI_RVALID	= axi_rvalid;
 	assign S_AXI_BID = S_AXI_AWID;
@@ -400,148 +405,81 @@
 	        end
 	    end
 	 end   
-	// Implement axi_arready generation
-
-	// axi_arready is asserted for one S_AXI_ACLK clock cycle when
-	// S_AXI_ARVALID is asserted. axi_awready is 
-	// de-asserted when reset (active low) is asserted. 
-	// The read address is also latched when S_AXI_ARVALID is 
-	// asserted. axi_araddr is reset to zero on reset assertion.
-
+	// Implement pipelined registered read (BRAM-style)
+	// ------------------------------------------------------------------
+	// Pipelined REGISTERED read: mem_data_out <= byte_ram[araddr] is a real
+	// 1-cycle synchronous read (maps to FPGA Block RAM). The address is
+	// issued one cycle AHEAD of the data, so read beats stream back-to-back
+	// (1 beat/clk) instead of the original template's 2-clk-per-beat toggle.
+	// (S_AXI_RREADY || ~axi_rvalid) safely stalls the 1-deep pipeline if the
+	// master ever deasserts RREADY (the NPU wrapper holds it high).
+	// ------------------------------------------------------------------
 	always @( posedge S_AXI_ACLK )
 	begin
 	  if ( S_AXI_ARESETN == 1'b0 )
 	    begin
-	      axi_arready <= 1'b0;
+	      axi_arready      <= 1'b0;
 	      axi_arv_arr_flag <= 1'b0;
-	    end 
+	      axi_araddr       <= 0;
+	      axi_arlen        <= 0;
+	      axi_arburst      <= 0;
+	      axi_arlen_cntr   <= 0;
+	      axi_rvalid       <= 1'b0;
+	      axi_read_last    <= 1'b0;
+	      axi_rresp        <= 2'b0;
+	      axi_ruser        <= 0;
+	    end
 	  else
-	    begin    
-	 //wzn     if (~axi_arready && S_AXI_ARVALID && ~axi_awv_awr_flag && ~axi_arv_arr_flag)
-	 if (~axi_arready && S_AXI_ARVALID && ~axi_arv_arr_flag)
+	    begin
+	      if (~axi_arv_arr_flag && ~axi_rvalid && S_AXI_ARVALID && ~axi_arready)
 	        begin
-	          axi_arready <= 1'b1;
+	          // accept the read address only when no read beat is still pending
+	          // (~axi_rvalid): a new burst must not clobber an unconsumed last
+	          // beat if the master backpressures on it (RREADY low). first fetch
+	          // happens next cycle.
+	          axi_arready      <= 1'b1;
 	          axi_arv_arr_flag <= 1'b1;
+	          axi_araddr       <= S_AXI_ARADDR[C_S_AXI_ADDR_WIDTH-1:0];
+	          axi_arlen        <= S_AXI_ARLEN;
+	          axi_arburst      <= S_AXI_ARBURST;
+	          axi_arlen_cntr   <= 0;
+	          axi_rvalid       <= 1'b0;
+	          axi_read_last    <= 1'b0;
+	          axi_rresp        <= 2'b0;
 	        end
-	      else if (axi_rvalid && S_AXI_RREADY && axi_arlen_cntr == axi_arlen)
-	      // preparing to accept next address after current read completion
-	        begin
-	          axi_arv_arr_flag  <= 1'b0;
-	        end
-	      else        
+	      else
 	        begin
 	          axi_arready <= 1'b0;
-	        end
-	    end 
-	end       
-	// Implement axi_araddr latching
-
-	//This process is used to latch the address when both 
-	//S_AXI_ARVALID and S_AXI_RVALID are valid. 
-	always @( posedge S_AXI_ACLK )
-	begin
-	  if ( S_AXI_ARESETN == 1'b0 )
-	    begin
-	      axi_araddr <= 0;
-	      axi_arlen_cntr <= 0;
-	      axi_arburst <= 0;
-	      axi_arlen <= 0;
-	      axi_rlast <= 1'b0;
-	      axi_ruser <= 0;
-	    end 
-	  else
-	    begin    
-	      if (~axi_arready && S_AXI_ARVALID && ~axi_arv_arr_flag)
-	        begin
-	          // address latching 
-	          axi_araddr <= S_AXI_ARADDR[C_S_AXI_ADDR_WIDTH - 1:0]; 
-	          axi_arburst <= S_AXI_ARBURST; 
-	          axi_arlen <= S_AXI_ARLEN;     
-	          // start address of transfer
-	          axi_arlen_cntr <= 0;
-	          axi_rlast <= (S_AXI_ARLEN == 0) ? 1'b1 : 1'b0;
-	        end   
-	      else if((axi_arlen_cntr <= axi_arlen) && axi_rvalid && S_AXI_RREADY)        
-	        begin
-	         
-	          axi_arlen_cntr <= axi_arlen_cntr + 1;
-	          axi_rlast <= 1'b0;
-	        
-	          case (axi_arburst)
-	            2'b00: // fixed burst
-	             // The read address for all the beats in the transaction are fixed
-	              begin
-	                axi_araddr       <= axi_araddr;        
-	                //for arsize = 4 bytes (010)
-	              end   
-	            2'b01: //incremental burst
-	            // The read address for all the beats in the transaction are increments by awsize
-	              begin
-	                axi_araddr[C_S_AXI_ADDR_WIDTH - 1:ADDR_LSB] <= axi_araddr[C_S_AXI_ADDR_WIDTH - 1:ADDR_LSB] + 1; 
-	                //araddr aligned to 4 byte boundary
-	                axi_araddr[ADDR_LSB-1:0]  <= {ADDR_LSB{1'b0}};   
-	                //for awsize = 4 bytes (010)
-	              end   
-	            2'b10: //Wrapping burst
-	            // The read address wraps when the address reaches wrap boundary 
-	              if (ar_wrap_en) 
+	          if (axi_arv_arr_flag && (S_AXI_RREADY || ~axi_rvalid))
+	            begin
+	              // a fetch (mem_rden) is happening this cycle; its data is
+	              // presented next cycle, so assert rvalid for the next clock.
+	              axi_rvalid    <= 1'b1;
+	              axi_read_last <= (axi_arlen_cntr == axi_arlen);
+	              if (axi_arlen_cntr == axi_arlen)
 	                begin
-	                  axi_araddr <= (axi_araddr - ar_wrap_size); 
+	                  axi_arv_arr_flag <= 1'b0;   // last address issued
 	                end
-	              else 
+	              else
 	                begin
-	                axi_araddr[C_S_AXI_ADDR_WIDTH - 1:ADDR_LSB] <= axi_araddr[C_S_AXI_ADDR_WIDTH - 1:ADDR_LSB] + 1; 
-	                //araddr aligned to 4 byte boundary
-	                axi_araddr[ADDR_LSB-1:0]  <= {ADDR_LSB{1'b0}};   
-	                end                      
-	            default: //reserved (incremental burst for example)
-	              begin
-	                axi_araddr <= axi_araddr[C_S_AXI_ADDR_WIDTH - 1:ADDR_LSB]+1;
-	                //for arsize = 4 bytes (010)
-	              end
-	          endcase              
+	                  if (axi_arburst != 2'b00)   // INCR (and wrap): advance addr
+	                    begin
+	                      axi_araddr[C_S_AXI_ADDR_WIDTH-1:ADDR_LSB] <=
+	                          axi_araddr[C_S_AXI_ADDR_WIDTH-1:ADDR_LSB] + 1;
+	                      axi_araddr[ADDR_LSB-1:0] <= {ADDR_LSB{1'b0}};
+	                    end
+	                  axi_arlen_cntr <= axi_arlen_cntr + 1;
+	                end
+	            end
+	          else if (~axi_arv_arr_flag && S_AXI_RREADY && axi_rvalid)
+	            begin
+	              axi_rvalid    <= 1'b0;          // burst done, last beat taken
+	              axi_read_last <= 1'b0;
+	            end
 	        end
-	      else if((axi_arlen_cntr == axi_arlen) && ~axi_rlast && axi_arv_arr_flag )   
-	        begin
-	          axi_rlast <= 1'b1;
-	        end          
-	      else if (S_AXI_RREADY)   
-	        begin
-	      axi_rlast <= 1'b0;
-	        end          
-	    end 
-	end       
-	// Implement axi_arvalid generation
-
-	// axi_rvalid is asserted for one S_AXI_ACLK clock cycle when both 
-	// S_AXI_ARVALID and axi_arready are asserted. The slave registers 
-	// data are available on the axi_rdata bus at this instance. The 
-	// assertion of axi_rvalid marks the validity of read data on the 
-	// bus and axi_rresp indicates the status of read transaction.axi_rvalid 
-	// is deasserted on reset (active low). axi_rresp and axi_rdata are 
-	// cleared to zero on reset (active low).  
-
-	always @( posedge S_AXI_ACLK )
-	begin
-	  if ( S_AXI_ARESETN == 1'b0 )
-	    begin
-	      axi_rvalid <= 0;
-	      axi_rresp  <= 0;
-	    end 
-	  else
-	    begin    
-	      if (axi_arv_arr_flag && ~axi_rvalid)
-	        begin
-	          axi_rvalid <= 1'b1;
-	          axi_rresp  <= 2'b0; 
-	          // 'OKAY' response
-	        end   
-	      else if (axi_rvalid && S_AXI_RREADY)
-	        begin
-	          axi_rvalid <= 1'b0;
-	        end            
 	    end
-	end    
+	end
+    
 	// ------------------------------------------
 	// -- Example code to access user logic memory region
 	// ------------------------------------------
@@ -571,18 +509,18 @@
 	      wire mem_wren;
 	
 	      assign mem_wren = axi_wready && S_AXI_WVALID ;
-	      assign mem_rden = axi_arv_arr_flag ; 
+	      assign mem_rden = axi_arv_arr_flag && (S_AXI_RREADY || ~axi_rvalid); 
 	     
 	      for(mem_byte_index=0; mem_byte_index<= (C_S_AXI_DATA_WIDTH/8-1); mem_byte_index=mem_byte_index+1)
 	      begin:BYTE_BRAM_GEN
 	        wire [8-1:0] data_in ;
 	        wire [8-1:0] data_out;
-	        reg  [8-1:0] byte_ram [0 : 4194303];
+	        reg  [8-1:0] byte_ram [0 : (1<<(OPT_MEM_ADDR_BITS+1))-1];
 
 	        // Initialize shared memory to 0 to prevent x propagation
 	        integer bram_init_i;
 	        initial begin
-	            for (bram_init_i = 0; bram_init_i <= 4194303; bram_init_i = bram_init_i + 1)
+	            for (bram_init_i = 0; bram_init_i <= (1<<(OPT_MEM_ADDR_BITS+1))-1; bram_init_i = bram_init_i + 1)
 	                byte_ram[bram_init_i] = 8'h0;
 	        end
 	     
@@ -607,12 +545,10 @@
 	        end    
 	      
 	        always @( posedge S_AXI_ACLK )
-	        begin
-	          if (mem_rden)
-	            begin
-	              mem_data_out[i][(mem_byte_index*8+7) -: 8] <= data_out;
-	            end   
-	        end    
+		begin
+		  if (mem_rden)   // 1-cycle registered read (real BRAM)
+		      mem_data_out[i][(mem_byte_index*8+7) -: 8] <= data_out;
+		end
 	      end
         end // 结束 BRAM_GEN
 	endgenerate
@@ -625,7 +561,7 @@
 	always @(posedge S_AXI_ACLK) begin
 	    if (axi_rvalid && S_AXI_RREADY)
 	        $display("SHMEM_RD: addr=%0h data=%0h beat=%0d/%0d rlast=%0b",
-	                 axi_araddr, axi_rdata, axi_arlen_cntr, axi_arlen, axi_rlast);
+	                 axi_araddr, axi_rdata, axi_arlen_cntr, axi_arlen, axi_read_last);
 	    if (axi_arready && S_AXI_ARVALID)
 	        $display("SHMEM_RD_ACCEPT: araddr=%0h arlen=%0d",
 	                 S_AXI_ARADDR, S_AXI_ARLEN);

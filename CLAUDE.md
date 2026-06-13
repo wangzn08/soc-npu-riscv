@@ -48,10 +48,24 @@ picorv32_axi (AXI-Lite master)
   ├─ 0x1000_0000             → UART tx (write char → simulator $write)
   ├─ 0x2000_0000             → test-pass register (write 123456789 → tests_passed)
   ├─ 0x3000_0000–0x3000_0FFF → NPU registers (pulse interface to npu_axi_wrapper)
-  └─ 0x4000_0000–...         → shared memory ("DDR"):
-        axi_lite_to_axi_full bridge → axi_arbiter_2to1 ← npu DMA master
-                                          └→ axi_full_slave_v1_0_S00_AXI
+  └─ 0x4000_0000–...         → shared memory ("DDR", 128-bit AXI4 data path):
+        axi_lite_to_axi_full bridge (32b) → axi_upsizer_32_128 ┐
+                                                               ├→ axi_arbiter_2to1 (128b) → axi_full_slave_v1_0_S00_AXI (128b)
+        npu_top native 128-bit DMA master ─────────────────────┘
 ```
+
+### 128-bit AXI shared-memory path (AXI utilization)
+
+The shared-memory data path is **128-bit end to end** so the NPU's native 128-bit
+DMA drives the bus directly — the old 128→32 width converter inside
+`npu_axi_wrapper` is removed (NPU writes/reads full beats, no 4× down-conversion,
+so bus utilization is no longer the bottleneck). The low-traffic 32-bit CPU reaches
+the 128-bit fabric through `axi_upsizer_32_128` (single-beat 32→128 adapter:
+partial writes via WSTRB on the lane selected by `addr[3:2]`; reads mux that lane
+back out). `axi_arbiter_2to1` and `axi_full_slave_v1_0_S00_AXI` are parameterized
+to `DATA_WIDTH=128` (wstrb = `DATA_WIDTH/8`); `npu_axi_wrapper`'s `SOC_AXI_DATA_W`
+is 128. NPU DMA writes tie WSTRB all-ones (full-beat). Directed testbenches:
+`tests/tb_axi_upsizer.v`, `tests/tb_axi_read_backpressure.v`.
 
 ### NPU Register Interface
 
