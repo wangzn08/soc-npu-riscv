@@ -2,14 +2,16 @@
 // -------------------------------------------------------------------
 // On-chip SRAM copy engine (SRAM residency).
 // Copies `i_len` 128-bit words from Out SRAM (Port B read) to Act SRAM
-// (Port B write), src/dst word bases configurable.  One word/cycle with a
-// 1-cycle SRAM read latency (read addr issued at cycle T, data lands at T+1 and
-// is written).  Banks are selected by the SRAM wrappers' dma_ping_sel (driven by
+// (Port B write), src/dst word bases configurable.  Out Port B read is
+// COMBINATIONAL (out_sram_wrapper COMB_B=1): the word at addr src+cnt is
+// available the SAME cycle, so it is written to Act addr dst+cnt that cycle
+// (Act write is synchronous, latched on the edge).  One word/cycle, no pipeline.
+// Banks are selected by the SRAM wrappers' dma_ping_sel (driven by
 // cfg_dma_out_ping_sel / cfg_dma_act_ping_sel in npu_top) — not here.
 //   i_len is the FULL word count (not count-1).
 //
-// 片上 SRAM 拷贝引擎（SRAM 驻留）：Out SRAM(Port B 读) → Act SRAM(Port B 写)，
-// 1 字/周期，1 拍 SRAM 读延迟。bank 由 wrapper 的 dma_ping_sel 决定。
+// 片上 SRAM 拷贝引擎（SRAM 驻留）：Out SRAM(Port B 组合读) → Act SRAM(Port B 写)，
+// 1 字/周期，读写同拍（Out 读是组合的）。bank 由 wrapper 的 dma_ping_sel 决定。
 // -------------------------------------------------------------------
 module sram_copy #(
     parameter ADDR_W = 14,
@@ -33,36 +35,25 @@ module sram_copy #(
     output reg                 o_done         // set on completion, cleared on i_trig
 );
     reg              busy;
-    reg [15:0]       rd_cnt;       // reads issued
-    reg [15:0]       wr_cnt;       // writes completed
+    reg [15:0]       cnt;          // words processed (read+write same cycle)
     reg [15:0]       len_q;
     reg [ADDR_W-1:0] src_q, dst_q;
-    reg              rd_vld_d;     // a read was issued last cycle -> data valid now
-    reg [ADDR_W-1:0] wr_addr_d;    // matching write address
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; rd_cnt <= 16'd0; wr_cnt <= 16'd0; len_q <= 16'd0;
-            src_q <= {ADDR_W{1'b0}}; dst_q <= {ADDR_W{1'b0}};
-            rd_vld_d <= 1'b0; wr_addr_d <= {ADDR_W{1'b0}}; o_done <= 1'b0;
+            busy <= 1'b0; cnt <= 16'd0; len_q <= 16'd0;
+            src_q <= {ADDR_W{1'b0}}; dst_q <= {ADDR_W{1'b0}}; o_done <= 1'b0;
         end else begin
-            rd_vld_d <= 1'b0;
             if (i_trig) begin
-                busy   <= 1'b1;
-                rd_cnt <= 16'd0; wr_cnt <= 16'd0;
-                len_q  <= i_len; src_q <= i_src_base; dst_q <= i_dst_base;
+                busy  <= 1'b1;
+                cnt   <= 16'd0;
+                len_q <= i_len; src_q <= i_src_base; dst_q <= i_dst_base;
                 o_done <= 1'b0;
             end else if (busy) begin
-                // Issue a read each cycle while reads remain
-                if (rd_cnt < len_q) begin
-                    rd_vld_d  <= 1'b1;
-                    wr_addr_d <= dst_q + rd_cnt[ADDR_W-1:0];
-                    rd_cnt    <= rd_cnt + 16'd1;
-                end
-                // A write completes the cycle after its read was issued
-                if (rd_vld_d) begin
-                    wr_cnt <= wr_cnt + 16'd1;
-                    if (wr_cnt + 16'd1 == len_q) begin
+                if (cnt < len_q) begin
+                    // read Out[src+cnt] (combinational) and write Act[dst+cnt] this cycle
+                    cnt <= cnt + 16'd1;
+                    if (cnt + 16'd1 == len_q) begin
                         busy   <= 1'b0;
                         o_done <= 1'b1;
                     end
@@ -71,10 +62,11 @@ module sram_copy #(
         end
     end
 
-    assign o_out_rd_addr = src_q + rd_cnt[ADDR_W-1:0];
-    assign o_out_rd_en   = busy && (rd_cnt < len_q);
-    assign o_act_wr_addr = wr_addr_d;
-    assign o_act_wr_en   = rd_vld_d;
-    assign o_act_wr_data = i_out_rd_data;   // Out Port B read data -> Act Port B write
+    wire active = busy && (cnt < len_q);
+    assign o_out_rd_addr = src_q + cnt[ADDR_W-1:0];
+    assign o_out_rd_en   = active;
+    assign o_act_wr_addr = dst_q + cnt[ADDR_W-1:0];
+    assign o_act_wr_en   = active;
+    assign o_act_wr_data = i_out_rd_data;   // combinational Out read -> Act write (same cycle)
     assign o_busy        = busy;
 endmodule
