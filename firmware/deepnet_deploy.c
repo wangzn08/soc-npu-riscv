@@ -720,16 +720,17 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // dma_ddr_to_act(ACT_BUF_B, 0, 28 * 28 * 1);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1, ACT_RES_B, -1);   // act_in=ACT_RES_B (resident); out->DDR
+                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1, ACT_RES_B, 0);   // resident in=R1, out->R0
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool1", ACT_BUF_B, 196 * 16);
 #endif
 
     // ---- Conv3: ActBuf_B(14×14×16) → HW-pad(16×16) → Conv → 14×14×32 → ActBuf_A ----
-    dma_ddr_to_act(ACT_BUF_B, 0, 14 * 14 * 1);   // 14x14x16, tiles=1 → 196 words
+    // Conv3 input resident in Act region R0 (copied from Conv2) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_B, 0, 14 * 14 * 1);
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
                   16, SCALE_CONV3, conv3_b,
-                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1, 0, -1);   // pad=1, row_par=1; act_in=0, act_dst=-1 (DDR)
+                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1, 0, ACT_RES_B);   // resident in=R0, out->R1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
     {
@@ -743,30 +744,33 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
 #endif
 
     // ---- Conv4: ActBuf_A(14×14×32) → HW-pad(18×18, pad=2) → Conv → 16×16×32 → 2x2 pool → ActBuf_A ----
-    dma_ddr_to_act(ACT_BUF_A, 0, 14 * 14 * 2);   // 14x14x32, tiles=2 → 392 words
+    // Conv4 input resident in Act region R1 (copied from Conv3) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_A, 0, 14 * 14 * 2);
     // NPU does Conv4 + Pool2: 16x16 conv -> 2x2 maxpool -> 8x8.
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
                   32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, 0, -1);   // pool=1,pad=2,row_par=1; act_in=0, act_dst=-1 (DDR)
+                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, ACT_RES_B, 0);   // resident in=R1, out->R0
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool2", ACT_BUF_A, 64 * 32);
 #endif
 
     // ---- Conv5: ActBuf_A(8×8×32) → HW-pad(10×10) → Conv → 8×8×64 → ActBuf_B ----
-    dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);   // 8x8x32, tiles=2 → 128 words
+    // Conv5 input resident in Act region R0 (copied from Conv4) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
                   32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, -1);   // pad=1, row_par=1; act_in=0, act_dst=-1 (DDR)
+                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, ACT_RES_B);   // resident in=R0, out->R1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 #endif
 
     // ---- Conv6: ActBuf_B(8×8×64) → HW-pad(10×10) → Conv → 8×8×64 → 2x2 pool → ActBuf_B ----
-    dma_ddr_to_act(ACT_BUF_B, 0, 8 * 8 * 4);   // 8x8x64, tiles=4 → 256 words
+    // Conv6 input resident in Act region R1 (copied from Conv5) — no DDR load.
+    // dma_ddr_to_act(ACT_BUF_B, 0, 8 * 8 * 4);
     // NPU does Conv6 + Pool3: 8x8 conv -> 2x2 maxpool -> 4x4.
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
                   64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, 0, -1);   // pool=1,pad=1,row_par=1; act_in=0, act_dst=-1 (DDR)
+                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, ACT_RES_B, -1);   // resident in=R1; out->DDR (reorder)
 
     // ---- Reorder Pool3 output: position-first → channels-first for affine ----
     // Pool3 output (ActBuf_B): spatial-first-per-tile layout
