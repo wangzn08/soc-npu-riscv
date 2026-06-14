@@ -29,33 +29,30 @@ Implemented behind `gemm_reduce` (CTRL[10]). Note: the spec's "FC1 ≈ 55K/img,
 so the realized win was −0.09% full run. The utilization goal (6.25%→~100%) was
 met. Plan: `docs/superpowers/plans/2026-06-14-gemm-array-util.md`.
 
-### ~~`2026-06-14-row-block-packing-design.md`~~ — #4 ABANDONED after Phase 0 (2026-06-14)
-Row-parallel idles rows when out_w<16 (Conv5/6 = 50% util). Pack R=⌊16/group_size⌋
-output rows. **Measured and dropped** — the spec's "~6–8K/img" was wrong:
-- Phase 0 A/B (toggle `row_par` on Conv5/6, measure firmware `prof_busy_layer`):
-  per-group cost Conv5=390, Conv6=566 cyc. #4 cuts groups 32→16/layer → saves
-  only **~1,530/img** (~1.1% inference, ~0.2% full run) for the **highest-risk**
-  change (drain-reverse + pool reorder replay).
-- Why: FSM-state decomposition (`FSMDBG` counters, npu_top translate_off) shows
-  the array-utilization (group-dependent) slice is only ~14% of Conv5/6 NPU-busy.
-  LOAD 24.7% / CALC 17.8% / DRAIN 10.5% / OTHER(prefetch/wait/post) 47%.
-- **The real Conv5/6 fat is per-OC-pass NPU-start overhead.** Firmware-measured
-  busy (23.2K/img) vs RTL `fsm_busy` (9.7K/img): **~58% is CPU-side start +
-  MMIO config + IRQ round-trip ≈ 1,683 cyc/start**, 8 starts/img (4 OC-passes ×
-  Conv5/6). Reducing OC-passes/layer (OC-tiling inside one start) could save
-  ~10K/img — but conflicts with **decision D** (16 bias/scale regs; needs HW for
-  >16 OC or mid-run bias reload). Cross-OC-pass im2col reuse alone (cutting LOAD
-  4×→1×) is only ~1,800/img — same modest tier as #4.
-- Probe infra (keep): firmware `prof_busy_layer[6]` (per-conv NPU-busy IRQ-wait),
-  npu_top `FSMDBG` final-block counters (LOAD/CALC/DRAIN split, gated in_w==10).
+### ~~`2026-06-14-row-block-packing-design.md`~~ — #4 DONE (decision N, 2026-06-14)
+Pack R=2 output rows into the array for out_w==8 layers (Conv5/6). Util **50%→100%**.
+**Implemented behind `row_block_en` (CTRL[11])**, bit-identical `SCORE_CHK=D30179DF`.
+- Result (clean row_block on/off full-run A/B): **7,680,437 → 7,427,997 (−252,440,
+  −3.3%)**. Conv5 done first (non-pool), then Conv6 (pool — R=2 aligns with the
+  2×2 row-pair, no reorder pain). No debug cycles needed; both bit-identical
+  first try.
+- **Phase-0 LESSON (important):** Phase 0 first ABANDONED this, estimating ~0.2%
+  full run from the firmware `prof_busy_layer` (IRQ-wait) proxy + a per-group-cost
+  extrapolation. That proxy **under-counted by ~15×** — the real on/off A/B showed
+  −3.3%. So: a Phase-0 *proxy* can be as wrong as a spec estimate. When the change
+  is bounded and mode-gated, the cheapest true measurement is to **build it behind
+  the bit-identical gate and A/B the mode bit**, not extrapolate from a proxy.
+- Probe infra (keep): firmware `prof_busy_layer[6]`, npu_top `FSMDBG` counters.
 
 ## Recommended order
-1. ~~GEMM array util~~ — DONE (decision M). Utilization fixed; cycle win marginal.
-2. ~~#4 row-block packing~~ — ABANDONED (Phase 0: ~0.2% full run, highest risk).
-3. **Open (if pursuing conv cycles): reduce per-OC-pass start/IRQ overhead** —
-   the measured dominant Conv5/6 cost. Either OC-tiling-in-one-start (big, bumps
-   decision D) or cheaper firmware MMIO trims (e.g. broadcast scale/shift instead
-   of 16 identical per-channel writes). Phase 0 the MMIO-vs-IRQ-latency split first.
+1. ~~GEMM array util~~ — DONE (decision M). Util 6.25%→100%; cycle win marginal.
+2. ~~#4 row-block packing~~ — DONE (decision N). Util 50%→100%; **−3.3% full run**.
+3. **Open (if pursuing more conv cycles): reduce per-OC-pass start/IRQ overhead**
+   (~1,683 cyc/start × 4 OC-passes/layer). OC-tiling-in-one-start (big, bumps
+   decision D) or firmware MMIO trims (broadcast scale/shift). Phase 0 first — but
+   per the #4 lesson, prefer a mode-gated A/B over a proxy extrapolation.
+4. **Open (capability generality, not cycles): output bit-width (let final FC run
+   on NPU) / depthwise conv.** Not bandwidth-trap-prone; payoff more certain.
 
 ## Methodology (do not skip)
 - Branch from `feat/npu-hw-reorder`.

@@ -143,7 +143,7 @@ Argmax: find predicted digit                                          [CPU]
 
 | Offset | Name | Description |
 |--------|------|-------------|
-| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en, `[10]`gemm_reduce |
+| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en, `[10]`gemm_reduce, `[11]`row_block_en |
 | `0x150` | PAD | `[15:8]`pad_h, `[7:0]`pad_w (hardware padding border, with CTRL[8]) |
 | `0x004` | STATUS | `[0]`done_irq, `[1]`busy, `[2]`dma_rd_err, `[3]`dma_wr_err (RO) |
 | `0x008–0x01C` | SRAM addrs | Act/Wgt/Out SRAM base addresses (ping/pong) |
@@ -373,6 +373,36 @@ wasting the silicon**, not cycles.
   not compute — dominates. The redesign fixes utilization, not the bottleneck.
   (Consistent with Phase 0: FC1 was ~5× the weight floor, overhead/bandwidth-
   bound, not compute-bound.)
+
+### N: Row-block packing — fill idle array rows for narrow layers (`row_block_en`, CTRL[11])
+
+Row-parallel (decision I) makes the 16 rows compute 16 columns of ONE output row;
+when `out_w < 16` the rest idle (Conv5/6 out_w=8 → **50% utilization**). `row_block_en`
+packs **R output rows** into the array (R = ⌊16/group_size⌋, capped MAX_R=2):
+array row `gi` → block `b=gi/group_size` (output row `cur_oy+b`), col `c=gi%group_size`.
+Conv5/6 (group_size=8) → R=2 → 100% utilization. Like decisions I/M, the goal is
+**not wasting the silicon**; cycles are a secondary (here large) win.
+- **im2col (`im2col_line_buffer.v`):** a **4th line-buffer bank** (R+2 rows), mod-4
+  `row_sel` rotation, and a `(block,col)` window read — block b's 3-row window is
+  the base window slid down b input rows: `bank = (row_sel + b + off_row + 1) mod 4`.
+  All gated by `i_row_block_en`; **byte-identical when off** (R=1 = decision I).
+  Exact only when `2*group_size==16` (group_size==8), so R=2 engages only there.
+- **FSM (`top_controller_fsm.v`):** loads R+2 rows/block (`lr_target = cur_oy+R+kh-2`),
+  sweeps `cur_oy += R`. `rows_per_grp` (=2 iff `row_block_en && group_size==8`).
+- **Drain/Out-SRAM (`npu_top.v` rp sequencer):** drained array row r → `(b,c)`,
+  writes `out_base + oc_off + (cur_oy+b)*out_row_stride + group_base + c`.
+- **Pool path (`post_process_top.v`):** R=2 **aligns with the 2×2 pool row-pair**
+  (oy even). `rp_buf[r]` is already row-major (`b*group_size+c = r`), so the pool
+  replay just streams `R*group_size` pixels (both rows) into `max_pooling_2x2`
+  in one drain; the pooler pairs rows oy/oy+1. Contiguous `pool_out_addr_cnt`
+  still yields row-major 4×4.
+- **Firmware:** auto-engages on `row_par && out_w==8` (Conv5 non-pool + Conv6 pool).
+- **General:** any narrow layer with out_w==8; runtime `group_size`/`R`. (out_w in
+  9..15 stays R=1 — packing needs 2*group_size≤16; out of scope, see spec.)
+- Result: array util **50% → ~100%** (Conv5/6); full run **7,680,437 → 7,427,997
+  (−252,440, −3.3%)**, bit-identical `SCORE_CHK=D30179DF` 10/10. (The Phase-0
+  `prof_busy_layer` IRQ-wait proxy under-estimated this at ~0.2%; the clean
+  row_block on/off full-run A/B is the ground truth — measure, don't extrapolate.)
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 
