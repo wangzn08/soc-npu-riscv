@@ -57,12 +57,12 @@ module img_expand #(
             state <= S_IDLE; src_q <= 0; dst_q <= 0; n_q <= 0;
             out_cnt <= 0; sw <= 0; b <= 0; word_q <= 0; o_done <= 0;
         end else begin
-            o_done <= 1'b0;
             case (state)
                 S_IDLE: begin
                     if (i_trig) begin
                         src_q <= i_src_base; dst_q <= i_dst_base; n_q <= i_n_out;
                         out_cnt <= 16'd0; sw <= 16'd0; b <= 4'd0;
+                        o_done <= 1'b0;   // clear on start; held as a level otherwise
                         state <= S_READ;
                     end
                 end
@@ -88,4 +88,13 @@ module img_expand #(
             endcase
         end
     end
+
+    // synthesis translate_off
+    always @(posedge clk) begin
+        if (state == S_READ && i_rdata != {DATA_W{1'b0}})
+            $display("EXP_READ_NZ sw=%0d addr=%0d rdata=%032h", sw, o_addr, i_rdata);
+        if (state == S_WRITE && o_wdata != {DATA_W{1'b0}})
+            $display("EXP_WR_NZ out=%0d sw=%0d b=%0d addr=%0d wdata_lo=%08h", out_cnt, sw, b, o_addr, o_wdata[31:0]);
+    end
+    // synthesis translate_on
 endmodule
