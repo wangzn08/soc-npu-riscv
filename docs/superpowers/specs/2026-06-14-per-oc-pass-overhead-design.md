@@ -18,7 +18,19 @@ re-written every pass.
 
 ## Two levels (do the cheap one first; Phase-0 the expensive one)
 
-### Level 1 — firmware MMIO hoist (zero hardware risk, DO FIRST)
+### ⚠️ Level 1 — firmware MMIO hoist — TRIED 2026-06-14, REGRESSED, abandoned
+**Result: bit-identical (`D30179DF`) but the clean non-profiled full-run A/B got
+WORSE: 7,427,997 → 7,559,173 (+131K).** Hoisting the invariant config (dims, ACT/
+OUT addr, scale, shift) out of the pass loop reduced MMIO count (Conv6 232→113)
+yet total cycles rose. (Confusingly, the *profiled* per-image `infer` dropped
+~7K/img — a probe artifact; the non-profiled total is the true score and it
+regressed.) **Conclusion: the per-OC-pass MMIO config is NOT the bottleneck** —
+removing those writes doesn't help (some deterministic sim-timing/overlap
+interaction makes it worse). Don't retry Level 1. The real per-start cost is the
+IRQ round-trip / NPU re-init, which only Level 2 addresses. The original (working)
+per-pass code is on `master`; this regression was reverted, not committed.
+
+#### (original Level-1 idea, kept for context)
 Hoist the layer-invariant config OUT of the per-pass loop in `npu_conv_pass`
 (and `npu_gemm_pass`). The regfile holds these values across NPU starts, so write
 them once per layer:
