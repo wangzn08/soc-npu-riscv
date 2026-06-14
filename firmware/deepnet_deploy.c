@@ -230,6 +230,51 @@ static void dma_out_to_act(uint32_t act_dst_word, uint32_t out_src_word,
 }
 
 // ================================================================
+// On-chip transpose: one OC-pass of Out SRAM (tile-major, 16ch x n_pos) ->
+// Act SRAM PONG (channel-major, the FC1 GEMM input). Reads Out bank `out_bank`,
+// writes Act PONG at word base `act_dst`. Polls NPU_DMA_STATUS bit4. Replaces
+// the CPU position-first->channels-first reorder (decision L).
+// ================================================================
+static void dma_out_transpose_to_act(uint32_t act_dst_word, uint32_t out_src_word,
+                                     int n_pos, int out_bank)
+{
+    PROF_T0();
+    // Out read bank (bit2) = out_bank; Act write bank (bit0) = PONG (GEMM input).
+    npu_wr(NPU_DMA_PING_SEL, (out_bank ? 0x4 : 0x0) | 0x1);
+    npu_wr(NPU_DMA_RD_SRAM_BASE, out_src_word);
+    npu_wr(NPU_DMA_WR_SRAM_BASE, act_dst_word);
+    npu_wr(NPU_DMA_RD_LEN, n_pos);                    // positions this pass
+    npu_wr(NPU_DMA_TRANSPOSE_TRIG, 1);
+
+    int t = DMA_IRQ_TIMEOUT;
+    while (t-- > 0)
+        if (npu_rd(NPU_DMA_STATUS) & NPU_DMA_STATUS_TRANSPOSE_DONE) break;
+    if (t <= 0) print_str("  TRANSPOSE timeout!\n");
+
+    npu_wr(NPU_DMA_PING_SEL, 0x0);                    // restore default banks
+    PROF_ADD(prof_reorder);
+}
+
+// ================================================================
+// Trigger the HW img_expand engine: Act scratch (packed bytes) -> Act dst
+// (zero-extended 16-ch words, pixel in ch0). n_out = output word count (= pixels).
+// Poll NPU_DMA_STATUS bit3.
+// ================================================================
+static void img_expand(uint32_t act_dst_word, uint32_t act_src_word, int n_out)
+{
+    npu_wr(NPU_DMA_PING_SEL, 0x0);                // Act read+write bank = PING
+    npu_wr(NPU_DMA_RD_SRAM_BASE, act_src_word);   // src = Act scratch (packed)
+    npu_wr(NPU_DMA_WR_SRAM_BASE, act_dst_word);   // dst = Act output region
+    npu_wr(NPU_DMA_RD_LEN, n_out);                // output word count
+    npu_wr(NPU_DMA_EXPAND_TRIG, 1);
+
+    int t = DMA_IRQ_TIMEOUT;
+    while (t-- > 0)
+        if (npu_rd(NPU_DMA_STATUS) & NPU_DMA_STATUS_EXPAND_DONE) break;
+    if (t <= 0) print_str("  EXPAND timeout!\n");
+}
+
+// ================================================================
 // Pack one 16-output-channel tile [oc_start, oc_start+16) of conv weights
 // into the layout wgt_reader expects, then DMA it to Wgt SRAM word
 // `wgt_sram_base`.
@@ -364,7 +409,8 @@ static void npu_conv_pass(
     int pad,           // hardware-pad amount each side (0 = caller pre-padded the input)
     int row_par,       // 1 = 16-row spatial parallelism (task E)
     int act_in,        // Act SRAM word base the NPU reads input from (region ping-pong)
-    int act_dst)       // >=0: copy output to Act SRAM word base act_dst (resident); <0: DMA to out_ddr_addr
+    int act_dst,       // >=0: copy output to Act SRAM word base act_dst (resident); <0: DMA to out_ddr_addr
+    int transpose_npos)// >0: transpose each pass's Out -> Act PONG[pass*npos] (decision L); 0: off
 {
     PROF_T0();
     int oc_passes  = oc / 16;
@@ -436,7 +482,13 @@ static void npu_conv_pass(
         if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_RD_ERR) print_str("  NPU DMA rd err!\n");
         if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_WR_ERR) print_str("  NPU DMA wr err!\n");
 
-        if (act_dst >= 0) {
+        if (transpose_npos > 0) {
+            // DECISION L: transpose this pass's Out (tile-major) -> Act PONG
+            // (channel-major FC1 input) at word base pass*npos. Serial (NPU idle),
+            // so the per-pass Out bank is freed before the next pass reuses it.
+            dma_out_transpose_to_act((uint32_t)(pass * transpose_npos), 0,
+                                     transpose_npos, out_bank);
+        } else if (act_dst >= 0) {
             // RESIDENT: copy this pass's output (Out bank out_bank, word base 0)
             // to Act SRAM act_dst + pass*out_words.  Serial (NPU idle) — no
             // overlap, so the per-pass Out bank is freed before the next pass.
@@ -571,15 +623,18 @@ static void preload_fc_weights(void)
 // (decision D). in_dim <= 1024 (HW ic_group counter width).
 static void npu_gemm_pass(int in_dim, int out_dim, int scale_mul_val,
                           const int32_t *biases, int relu_en,
-                          uint32_t in_ddr, uint32_t out_ddr, int wgt_base)
+                          uint32_t in_ddr, uint32_t out_ddr, int wgt_base,
+                          int in_resident)  // 1: input already in Act PONG (decision L), skip DMA
 {
     int icg        = (in_dim + 15) / 16;
     int oc_passes  = (out_dim + 15) / 16;
     int tile_words = 16 * icg;
 
-    npu_wr(NPU_DMA_PING_SEL, 0x1);             // input vector DMA -> Act PONG
-    dma_ddr_to_act(in_ddr, 0, icg);
-    npu_wr(NPU_DMA_PING_SEL, 0x0);
+    if (!in_resident) {
+        npu_wr(NPU_DMA_PING_SEL, 0x1);         // input vector DMA -> Act PONG
+        dma_ddr_to_act(in_ddr, 0, icg);
+        npu_wr(NPU_DMA_PING_SEL, 0x0);
+    }
 
     for (int pass = 0; pass < oc_passes; pass++) {
         npu_wr(NPU_IN_W, 1);
@@ -674,30 +729,35 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     print_chr('\n');
 #endif
 
-    // ---- Conv1: image(28×28×1) → HW-pad(30×30) → Conv → 28×28×16 → ActBuf_B ----
+    // ---- Conv1 input: HW img_expand (no CPU scatter) ----
+    // (1) contiguous copy image bytes -> DDR ACT_BUF_A (packed words)
     {
         PROF_T0();
-        // Format image into tile-major 16-byte words (ch0 = pixel, ch1..15 = 0).
-        // The 1-pixel border is added by hardware padding, not stored.
-        volatile int32_t *abuf = (volatile int32_t *)ACT_BUF_A;
-        for (int i = 0; i < 28 * 28 * 16 / 4; i++)
-            abuf[i] = 0;
-        for (int i = 0; i < 28 * 28; i++)
-            ((volatile int8_t *)abuf)[i * 16] = input[i];
-        PROF_ADD(prof_pad);   // Conv1 image formatting (no padded scatter)
+        volatile uint32_t *img = (volatile uint32_t *)ACT_BUF_A;   // DDR staging
+        for (int i = 0; i < 28 * 28 / 4; i++) {                   // 196 words
+            uint32_t w = 0;
+            w |= (uint32_t)(uint8_t)input[i*4+0];
+            w |= (uint32_t)(uint8_t)input[i*4+1] << 8;
+            w |= (uint32_t)(uint8_t)input[i*4+2] << 16;
+            w |= (uint32_t)(uint8_t)input[i*4+3] << 24;
+            img[i] = w;
+        }
+        PROF_ADD(prof_pad);
     }
 #ifdef DEBUG_VERBOSE
     {
         int imx = 0;
         for (int i = 0; i < 784; i++) { int v = input[i]; if (v < 0) v = -v; if (v > imx) imx = v; }
         print_str("  input max="); print_dec((uint32_t)imx); print_chr('\n');
-        dbg_layer("PadAct", ACT_BUF_A, 900 * 16);
     }
 #endif
-    dma_ddr_to_act(ACT_BUF_A, 0, 28 * 28 * 1);   // 28x28x16, tiles=1 → 784 words
+    // (2) stage packed image into Act scratch (49 beats = 784 bytes)
+    dma_ddr_to_act(ACT_BUF_A, 2048, 28 * 28 / 16);   // 784/16 = 49 words
+    // (3) expand: Act scratch(2048) packed -> Act R0(0), 784 tile-major words
+    img_expand(0, 2048, 28 * 28);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   1, SCALE_CONV1, conv1_b,
-                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1, 1, 0, ACT_RES_B);   // resident: copy out -> Act ACT_RES_B
+                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0);   // resident: copy out -> Act ACT_RES_B
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv1", ACT_BUF_B, 784 * 16);
     {
@@ -720,7 +780,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // dma_ddr_to_act(ACT_BUF_B, 0, 28 * 28 * 1);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1, ACT_RES_B, 0);   // resident in=R1, out->R0
+                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1, ACT_RES_B, 0, 0);   // resident in=R1, out->R0
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool1", ACT_BUF_B, 196 * 16);
 #endif
@@ -730,7 +790,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // dma_ddr_to_act(ACT_BUF_B, 0, 14 * 14 * 1);
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
                   16, SCALE_CONV3, conv3_b,
-                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1, 0, ACT_RES_B);   // resident in=R0, out->R1
+                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0);   // resident in=R0, out->R1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
     {
@@ -749,7 +809,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv4 + Pool2: 16x16 conv -> 2x2 maxpool -> 8x8.
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
                   32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, ACT_RES_B, 0);   // resident in=R1, out->R0
+                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, ACT_RES_B, 0, 0);   // resident in=R1, out->R0
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool2", ACT_BUF_A, 64 * 32);
 #endif
@@ -759,7 +819,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
                   32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, ACT_RES_B);   // resident in=R0, out->R1
+                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0);   // resident in=R0, out->R1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 #endif
@@ -770,33 +830,15 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv6 + Pool3: 8x8 conv -> 2x2 maxpool -> 4x4.
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
                   64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, ACT_RES_B, -1);   // resident in=R1; out->DDR (reorder)
+                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, ACT_RES_B, -1, 16);   // resident in=R1; HW transpose -> Act PONG (FC1 input)
 
-    // ---- Reorder Pool3 output: position-first → channels-first for affine ----
-    // Pool3 output (ActBuf_B): spatial-first-per-tile layout
-    //   pass 0: pos(0,0)ch0..15, pos(0,1)ch0..15, ..., pos(3,3)ch0..15
-    //   pass 1: pos(0,0)ch16..31, ..., pos(3,3)ch16..31
-    //   pass 2: pos(0,0)ch32..47, ..., pos(3,3)ch32..47
-    //   pass 3: pos(0,0)ch48..63, ..., pos(3,3)ch48..63
-    // Affine expects: ch0: all 16 positions, ch1: all 16 positions, ...
-    {
-        PROF_T0();
-        int8_t *pool_out = (int8_t *)ACT_BUF_B;
-        int n_pos = 16;  // 4×4
-        int n_ch  = 64;
-        for (int ch = 0; ch < n_ch; ch++) {
-            int pass  = ch / 16;
-            int ch_in = ch % 16;
-            for (int pos = 0; pos < n_pos; pos++) {
-                int8_t v = pool_out[(pass * n_pos + pos) * 16 + ch_in];
-                ((volatile int8_t *)AFFINE_SCR)[ch * n_pos + pos] = v; // NPU GEMM input (DDR)
-#if NPU_GEMM_PARITY
-                affine_in[ch * n_pos + pos] = v;                       // CPU oracle (RAM)
-#endif
-            }
-        }
-        PROF_ADD(prof_reorder);
-    }
+    // ---- Pool3 -> FC1 reorder: now done in HARDWARE (decision L) ----
+    // The transpose engine wrote Conv6's tile-major Pool3 output directly into
+    // Act PONG (channel-major), the FC1 GEMM input — no CPU reorder, no DDR
+    // round-trip. (The CPU position-first->channels-first loop is removed.)
+    // NOTE: NPU_GEMM_PARITY's CPU oracle previously sourced affine_in from this
+    // loop's DDR copy; with the HW transpose Conv6 no longer drains to DDR, so
+    // the parity oracle is not wired in this build (deploy-only path).
 
 #if NPU_GEMM_PARITY
     {
@@ -818,8 +860,9 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     {
         PROF_T0();
         // ---- Deploy: NPU FC1 (1024→50, ReLU) → FC1_OUT_DDR ----
+        // Input is resident in Act PONG (HW transpose, decision L) — no DMA.
         npu_gemm_pass(AFFINE1_IN, AFFINE1_OUT, SCALE_AFFINE1, affine1_b, 1,
-                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE);
+                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1);
         // ---- CPU FC2 (50→10, raw int32): reads NPU FC1 output (channel-major,
         //      OCs 50..63 are exact 0 from padded weights). FC2 stays on CPU
         //      because the NPU's INT8 output saturates the final logits. ----
@@ -839,7 +882,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     {
         // NPU FC1 vs CPU affine1 — must be bit-identical (same quant path).
         npu_gemm_pass(AFFINE1_IN, AFFINE1_OUT, SCALE_AFFINE1, affine1_b, 1,
-                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE);
+                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1);
         volatile int8_t *nf = (volatile int8_t *)FC1_OUT_DDR;
         int mism = 0;
         for (int i = 0; i < AFFINE1_OUT; i++)
@@ -852,7 +895,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
         // 50..63 are exact 0 from padded weights). Scores are INT8-clamped; the
         // ship criterion is argmax(NPU int8) == argmax(CPU int32) for every image.
         npu_gemm_pass(AFFINE2_IN, AFFINE2_OUT, SCALE_AFFINE2, affine2_b, 0,
-                      FC1_OUT_DDR, FC2_OUT_DDR, FC2_WGT_BASE);
+                      FC1_OUT_DDR, FC2_OUT_DDR, FC2_WGT_BASE, 0);
         volatile int8_t *ns = (volatile int8_t *)FC2_OUT_DDR;
         int nbest = 0, cbest = 0;
         for (int i = 1; i < AFFINE2_OUT; i++) {
@@ -938,7 +981,6 @@ void usercode7(void)
 
     print_str("\n=== Result: "); print_dec(correct);
     print_str("/10 correct ===\n");
-
     if (correct >= 10)
         print_str("DEPLOY SUCCESS.\n");
     else
