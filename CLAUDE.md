@@ -143,7 +143,7 @@ Argmax: find predicted digit                                          [CPU]
 
 | Offset | Name | Description |
 |--------|------|-------------|
-| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en |
+| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en, `[10]`gemm_reduce |
 | `0x150` | PAD | `[15:8]`pad_h, `[7:0]`pad_w (hardware padding border, with CTRL[8]) |
 | `0x004` | STATUS | `[0]`done_irq, `[1]`busy, `[2]`dma_rd_err, `[3]`dma_wr_err (RO) |
 | `0x008–0x01C` | SRAM addrs | Act/Wgt/Out SRAM base addresses (ping/pong) |
@@ -334,6 +334,45 @@ chip — no CPU reorder, no DDR round-trip.
   **8,041,665 → 7,618,571 (−423K, −5.3%)**, bit-identical (SCORE_CHK match) 10/10.
   `reorder` 429,680 → 7,040 (just the per-pass trigger MMIO); `load` 75,110 →
   50,670 (GEMM-input DDR round-trip gone).
+
+### M: GEMM array utilization — 16-row IC-reduction (`gemm_reduce`, CTRL[10])
+
+Legacy GEMM (decision F) replicated the input IC-tile to all 16 array rows, so
+15/16 rows were redundant — **array utilization 6.25%**. `gemm_reduce` makes the
+16 rows compute **16 distinct IC-tiles** and reduce them **down each column**
+(spatial reduction), so one super-step consumes 256 IC (16 rows × 16) and the
+array runs at **~100% utilization**. Primary goal (like decision I) is **not
+wasting the silicon**, not cycles.
+- **pe_core (`i_reduce`):** during drain, `o_psum_casc = psum_shift + i_psum_casc`
+  forms a combinational adder chain down the column; the bottom PE's output =
+  sum of all 16 rows' latched accumulators. Legacy shift-drain unchanged when
+  `i_reduce=0` (byte-identical).
+- **Weights (16×16 plane):** PE(r,c) needs OC-c's weights for IC-tile r.
+  `wgt_reader` prefetches a **256-word plane** per super-step into `gemm_plane`
+  (`plane[r][c]=Wgt[wgt_base + c*icg + s*16 + r]`, reusing `pack_fc_tile`'s
+  `word(o,g)=o*icg+g` layout — no repack); `systolic_16x16`/`gp_4x4` slice it
+  per-PE and select it under `i_reduce`. New wide `i_wgt_plane` bus; legacy
+  `i_wgt` path untouched.
+- **Activations:** `npu_top` `act_row[0:15]` register holds 16 distinct IC-tile
+  words, loaded from Act SRAM by the FSM super-step sequencer.
+- **FSM (`top_controller_fsm`):** GEMM-reduce states `S_RDC_WLOAD`(plane prefetch)
+  → `S_RDC_ALOAD`(16 act loads) → `S_RDC_VLD`(1 accumulate); `ceil(IC/256)` super-
+  steps (FC1: 4 vs the legacy 64 k-steps), then `S_K_END` → `S_DRAIN`. The reduce
+  drain still runs **16 cycles** (combinational sum stable while `psum_shift`
+  holds) to match the legacy GEMM post-process pipeline-fill timing — a single
+  drain valid mis-times the S_POST write (`pp_start` feeds zeros once `drain_en`
+  drops). Output path reuses the legacy non-pool/non-rowpar write (1 word/pass).
+- **General:** any GEMM/FC layer (`IC≤1024`, OC 16-tiled), runtime dims; FC2 stays
+  CPU (INT8 saturation, decision F). Conv/legacy-GEMM byte-identical (mode-gated).
+- **Firmware:** `npu_gemm_pass(..., reduce)`; FC1 passes `reduce=1`.
+- Result: array util **6.25% → ~100%**, bit-identical `SCORE_CHK=D30179DF` 10/10.
+  Cycle win is **marginal** — FC1 19,638 → 18,966/img (−3.4%); full run
+  7,687,157 → 7,680,437 (−6,720, −0.09%). FC1 is **weight-bandwidth-bound**
+  (single-port Wgt SRAM): the 256-word/super-step plane prefetch reads the same
+  1024 words/pass as the legacy 64-k-step path, so the single-port SRAM floor —
+  not compute — dominates. The redesign fixes utilization, not the bottleneck.
+  (Consistent with Phase 0: FC1 was ~5× the weight floor, overhead/bandwidth-
+  bound, not compute-bound.)
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 

@@ -6,18 +6,28 @@ Current baseline (branch `feat/npu-hw-reorder`, after #2 HW reorder / decision L
 - preload (one-time weight pack+DMA) ~6.25M = ~82% of full run (per-image excludes it)
 
 ## Completed
-- Decisions D–L (GEMM/FC mode, weight reuse, hw-padding, row-parallel, SRAM
-  residency, 128-bit AXI, **#2 HW reorder**). See CLAUDE.md "Architecture Decisions".
+- Decisions D–M (GEMM/FC mode, weight reuse, hw-padding, row-parallel, SRAM
+  residency, 128-bit AXI, **#2 HW reorder**, **GEMM array util**). See CLAUDE.md
+  "Architecture Decisions".
 - Bus/AXI bandwidth utilization: **100%** (128-bit path, not a bottleneck anymore).
+- **GEMM array util (decision M, done 2026-06-14):** array utilization 6.25% →
+  ~100%, bit-identical `SCORE_CHK=D30179DF`. **Phase 0 corrected the spec's
+  premise**: FC1 is **19,638 cyc/img**, NOT the assumed ~55K (that bucket was
+  dominated by CPU FC2's DDR re-reads, since fixed for −11.6K/img). FC1 is only
+  ~5× the weight floor → **weight-bandwidth-bound, not compute-bound**, so the
+  redesign fixed utilization but the cycle win is marginal (FC1 −3.4%, full run
+  −0.09%): the 256-word/super-step plane prefetch reads the same 1024 words/pass
+  as the legacy 64-k-step path (single-port Wgt SRAM is the floor). Real cycle
+  cuts would need reducing weight reads (dual-port Wgt SRAM / weight reuse) —
+  out of scope.
 
 ## Ready-to-implement specs (this folder)
 
-### `2026-06-14-gemm-array-util-design.md` — GEMM array utilization ⭐ biggest
-FC1 GEMM replicates input to 16 rows (15/16 redundant) → array util **6.25%**,
-FC1 ≈ 55K/img (overhead-bound). Redesign: 16 rows reduce 16 IC-tiles down each
-column → 16× fewer steps, util → ~100%, FC1 ~55K → ~5–10K/img (**~45K/img**).
-Deepest/riskiest (changes systolic compute topology + weight feed). Has a
-Phase-0 measurement gate — confirm FC1 is overhead-bound before committing.
+### ~~`2026-06-14-gemm-array-util-design.md`~~ — DONE (decision M, see Completed)
+Implemented behind `gemm_reduce` (CTRL[10]). Note: the spec's "FC1 ≈ 55K/img,
+~45K win" premise was WRONG — Phase 0 found FC1 = 19.6K (weight-bandwidth-bound),
+so the realized win was −0.09% full run. The utilization goal (6.25%→~100%) was
+met. Plan: `docs/superpowers/plans/2026-06-14-gemm-array-util.md`.
 
 ### `2026-06-14-row-block-packing-design.md` — #4 narrow-layer row packing
 Row-parallel idles rows when out_w<16 (Conv5/6 = 50% util). Pack R=⌊16/group_size⌋
@@ -25,8 +35,10 @@ output rows into the array (Conv5/6 R=2). Util 50%→100%, ~6–8K/img. High ris
 (drain/post/pool machinery, where #3's hazard lived).
 
 ## Recommended order
-1. **GEMM array util** — biggest win + biggest utilization gap. Do Phase 0 first.
-2. **#4 row-block packing** — independent; either order works.
+1. ~~GEMM array util~~ — DONE (decision M). Utilization fixed; cycle win marginal.
+2. **#4 row-block packing** — remaining; conv narrow-layer rows (Conv5/6 50%→100%).
+   Note the same lesson: confirm it's not weight/bandwidth-bound before expecting
+   a cycle win.
 
 ## Methodology (do not skip)
 - Branch from `feat/npu-hw-reorder`.
