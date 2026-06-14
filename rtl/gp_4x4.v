@@ -22,8 +22,12 @@ module gp_4x4 #(
     // Activation input: GP_ROWS groups of ACT_GROUP_W bits each
     input  wire [GP_ROWS*ACT_GROUP_W-1:0]          i_act,
 
-    // Weight input: GP_COLS groups of WGT_GROUP_W bits each
+    // Weight input: GP_COLS groups of WGT_GROUP_W bits each (broadcast to rows)
     input  wire [GP_COLS*WGT_GROUP_W-1:0]          i_wgt,
+
+    // Per-PE weight plane (reduce mode): GP_ROWS*GP_COLS distinct groups,
+    // ordered local (lr*GP_COLS+lc). Selected when i_reduce=1.
+    input  wire [GP_ROWS*GP_COLS*WGT_GROUP_W-1:0]  i_wgt_plane,
 
     // Cascaded partial-sum inputs (one per column from GP above)
     input  wire [GP_COLS-1:0][PSUM_WIDTH-1:0]      i_psum_casc,
@@ -34,7 +38,8 @@ module gp_4x4 #(
     // Control — broadcast to all PEs
     input  wire                                    i_vld,
     input  wire                                    i_k_end,
-    input  wire                                    i_drain_en
+    input  wire                                    i_drain_en,
+    input  wire                                    i_reduce
 );
 
     // -------------------------------------------------------------------
@@ -58,6 +63,13 @@ module gp_4x4 #(
                     assign pe_psum_in = psum_casc_link[c][r-1];
                 end
 
+                // Reduce mode: each PE gets a distinct weight from the plane;
+                // legacy: column weight broadcast to all rows (byte-identical).
+                wire [WGT_GROUP_W-1:0] pe_wgt;
+                assign pe_wgt = i_reduce
+                    ? i_wgt_plane[(r*GP_COLS + c)*WGT_GROUP_W +: WGT_GROUP_W]
+                    : i_wgt[c*WGT_GROUP_W +: WGT_GROUP_W];
+
                 pe_core #(
                     .ACT_WIDTH  (ACT_WIDTH),
                     .WGT_WIDTH  (WGT_WIDTH),
@@ -67,12 +79,13 @@ module gp_4x4 #(
                     .clk         (clk),
                     .rst_n       (rst_n),
                     .i_act       (i_act[r*ACT_GROUP_W +: ACT_GROUP_W]),
-                    .i_wgt       (i_wgt[c*WGT_GROUP_W +: WGT_GROUP_W]),
+                    .i_wgt       (pe_wgt),
                     .i_psum_casc (pe_psum_in),
                     .o_psum_casc (psum_casc_link[c][r]),
                     .i_vld       (i_vld),
                     .i_k_end     (i_k_end),
-                    .i_drain_en  (i_drain_en)
+                    .i_drain_en  (i_drain_en),
+                    .i_reduce    (i_reduce)
                 );
 
             end

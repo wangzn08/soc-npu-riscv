@@ -29,7 +29,8 @@ module pe_core #(
     // Control signals
     input  wire                     i_vld,       // Data valid for accumulation
     input  wire                     i_k_end,     // End of accumulation window: latch & clear
-    input  wire                     i_drain_en   // Drain shift register serially
+    input  wire                     i_drain_en,  // Drain shift register serially
+    input  wire                     i_reduce     // GEMM spatial-reduce: combinational column sum
 );
 
     // -----------------------------------------------------------------------
@@ -88,14 +89,20 @@ module pe_core #(
             if (i_k_end) begin
                 psum_shift <= psum_acc;
                 psum_acc   <= {PSUM_WIDTH{1'b0}};
-            end else if (i_drain_en) begin
-                // Drain mode: shift register loads from above
+            end else if (i_drain_en && !i_reduce) begin
+                // Legacy drain: shift register loads from above (byte-identical
+                // when i_reduce=0). In reduce mode psum_shift HOLDS its k_end
+                // value; the column sum is formed combinationally below.
                 psum_shift <= i_psum_casc;
             end
         end
     end
 
-    // During drain, output the shift register value; otherwise output 0
-    assign o_psum_casc = i_drain_en ? psum_shift : {PSUM_WIDTH{1'b0}};
+    // During drain, output the shift register value; otherwise output 0.
+    // Reduce mode: add the incoming cascade so the column forms a combinational
+    // adder chain — the bottom PE's output = sum of all rows' latched psum.
+    assign o_psum_casc = i_drain_en
+                       ? (i_reduce ? (psum_shift + i_psum_casc) : psum_shift)
+                       : {PSUM_WIDTH{1'b0}};
 
 endmodule

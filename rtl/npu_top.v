@@ -693,6 +693,8 @@ module npu_top #(
         // phase-independent. Conv mode: im2col window as before.
         .i_act       (cfg_gemm_en ? {ARRAY_ROWS{act_sram_doa}} : im2col_act_window),
         .i_wgt       (wgt_reader_wgt),
+        .i_wgt_plane ({(ARRAY_ROWS*ARRAY_COLS*128){1'b0}}),  // dormant (Task 6 drives)
+        .i_reduce    (1'b0),                                 // dormant (Task 6 drives)
         .o_psum_col  (array_psum_col),
         .i_vld       (fsm_array_vld),
         .i_k_end     (fsm_array_k_end),

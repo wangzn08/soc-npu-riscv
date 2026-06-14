@@ -40,8 +40,13 @@ module systolic_16x16 #(
     // Activation bus: 16 groups of 128-bit activation data
     input  wire [ACT_BUS_W-1:0]              i_act,
 
-    // Weight bus: 16 groups of 128-bit weight data
+    // Weight bus: 16 groups of 128-bit weight data (broadcast per column)
     input  wire [WGT_BUS_W-1:0]              i_wgt,
+
+    // Per-PE weight plane (GEMM-reduce mode): ARRAY_ROWS*ARRAY_COLS groups,
+    // ordered global (row*ARRAY_COLS + col). Selected when i_reduce=1.
+    input  wire [ARRAY_ROWS*ARRAY_COLS*WGT_GROUP_W-1:0] i_wgt_plane,
+    input  wire                              i_reduce,
 
     // Column partial-sum outputs (bottom of each column)
     output wire [ARRAY_COLS-1:0][PSUM_WIDTH-1:0] o_psum_col,
@@ -90,6 +95,19 @@ module systolic_16x16 #(
                 wire [GP_SIZE*WGT_GROUP_W-1:0] gp_wgt;
                 assign gp_wgt = i_wgt[WGT_HI:WGT_LO];
 
+                // Per-GP weight-plane slice: local (lr*GP_SIZE+lc) ←
+                // global ((gr*GP_SIZE+lr)*ARRAY_COLS + (gc*GP_SIZE+lc)).
+                wire [GP_SIZE*GP_SIZE*WGT_GROUP_W-1:0] gp_wgt_plane;
+                genvar plr, plc;
+                for (plr = 0; plr < GP_SIZE; plr = plr + 1) begin : gen_plane_r
+                    for (plc = 0; plc < GP_SIZE; plc = plc + 1) begin : gen_plane_c
+                        localparam GROW = gr*GP_SIZE + plr;
+                        localparam GCOL = gc*GP_SIZE + plc;
+                        assign gp_wgt_plane[(plr*GP_SIZE + plc)*WGT_GROUP_W +: WGT_GROUP_W]
+                             = i_wgt_plane[(GROW*ARRAY_COLS + GCOL)*WGT_GROUP_W +: WGT_GROUP_W];
+                    end
+                end
+
                 gp_4x4 #(
                     .ACT_WIDTH    (ACT_WIDTH),
                     .WGT_WIDTH    (WGT_WIDTH),
@@ -104,11 +122,13 @@ module systolic_16x16 #(
                     .rst_n        (rst_n),
                     .i_act        (gp_act),
                     .i_wgt        (gp_wgt),
+                    .i_wgt_plane  (gp_wgt_plane),
                     .i_psum_casc  (gp_casc_chain[gc][gr]),
                     .o_psum_casc  (gp_casc_chain[gc][gr+1]),
                     .i_vld        (i_vld),
                     .i_k_end      (i_k_end),
-                    .i_drain_en   (i_drain_en)
+                    .i_drain_en   (i_drain_en),
+                    .i_reduce     (i_reduce)
                 );
 
             end
