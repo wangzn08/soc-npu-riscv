@@ -115,7 +115,7 @@ Pool2:  16×16×32 → 8×8×32                                            [CPU]
 Conv5:  10×10×32 (pad 8→10)  → 8×8×64, 3×3, stride 1, ReLU          [NPU]
 Conv6:  10×10×64 (pad 8→10)  → 8×8×64, 3×3, stride 1, ReLU          [NPU]
 Pool3:  8×8×64 → 4×4×64                                              [CPU]
-Reorder: spatial-first-per-tile → channels-first                      [CPU]
+Reorder: spatial-first-per-tile → channels-first                      [NPU HW transpose, decision L]
 Affine1: 1024 → 50, ReLU                                             [NPU GEMM]
 Affine2: 50 → 10, raw INT32 scores                                   [CPU]
 Argmax: find predicted digit                                          [CPU]
@@ -155,6 +155,7 @@ Argmax: find predicted digit                                          [CPU]
 | `0x120–0x148` | DMA | Read/write triggers, DDR addr, length, SRAM base, status, sel |
 | `0x140` | DMA_STATUS | `[0]`rd_done `[1]`wr_done `[2]`copy_done (RO) |
 | `0x154` | COPY_TRIG | write → start on-chip Out→Act copy (`sram_copy`, decision J); src/dst/len reuse DMA RD_SRAM_BASE/WR_SRAM_BASE/RD_LEN |
+| `0x15C` | TRANSPOSE_TRIG | write → start Conv6→FC1 transpose (`transpose_engine`, decision L); done = DMA_STATUS[4]; src/dst/n_pos reuse RD_SRAM_BASE/WR_SRAM_BASE/RD_LEN |
 
 ### Interrupt Handling
 
@@ -300,6 +301,39 @@ eliminating the round-trip.
   `prof_npu` dropped (the output-DDR-drain it included is gone) and `prof_load` dropped
   (input DDR reads gone, copy folded in). Next bottleneck: `pad` (Conv1 image→DDR
   formatting, ~101K/image).
+
+### L: Hardware reorder — Conv6 → FC1 transpose (`transpose_engine`, 0x15C)
+
+The CPU used to transpose Pool3's output from tile-major (pass×pos×ch) to the
+channel-major layout FC1 (Affine1 GEMM) expects (~43K cycles/image, ~20% of
+inference) via 3 DDR round-trips (Conv6 Out→DDR, CPU DDR→DDR transpose, GEMM
+DDR→Act). Replaced by an on-chip **transpose engine** (`rtl/transpose_engine.v`,
+decision-J-style, time-shares SRAM Port B): Conv6 transposes each OC-pass's Out
+SRAM output **directly into Act PONG** (the GEMM input bank), channel-major, on
+chip — no CPU reorder, no DDR round-trip.
+- **Engine:** per OC-pass, a register transpose buffer `M[16*MAX_NPOS]` —
+  **LOAD** reads `n_pos` Out words (word p = 16 channels at position p) and
+  scatters byte ch_in to `M[ch_in*n_pos + p]` (stride n_pos); **DRAIN** reads M
+  sequentially, packs 16 bytes/word, writes `n_pos` Act words. = a 16×n_pos byte
+  transpose. `MAX_NPOS` is a capacity knob (like ICG_BUF); `n_pos ≤ MAX_NPOS`
+  in one pass (multi-Act-word channels, n_pos>16, handled by the sequential
+  drain). `n_pos > MAX_NPOS` → CPU fallback.
+- **Control:** trigger `NPU_DMA_TRANSPOSE_TRIG` (0x15C) → `o_transpose_trig`;
+  polled via `NPU_DMA_STATUS[4]` (`transpose_done`) — no IRQ. src/dst/n_pos reuse
+  `RD_SRAM_BASE`/`WR_SRAM_BASE`/`RD_LEN`; Out read bank = `dma_out_ping_sel`, Act
+  write bank = `dma_act_ping_sel` (= PONG). **Serial per-pass** (decision-J
+  pattern): Conv6's alternating Out banks (`pass&1`) don't coexist, so transpose
+  each pass right after it computes, before the next overwrites the bank.
+- **Firmware:** `dma_out_transpose_to_act(act_dst, out_src, n_pos, out_bank)`;
+  `npu_conv_pass(... , transpose_npos)` (>0 ⇒ per-pass transpose to Act PONG);
+  `npu_gemm_pass(... , in_resident)` (1 ⇒ input already in Act PONG, skip DMA).
+  The CPU reorder loop is removed.
+- **General:** any conv→FC boundary; `n_pos`/`n_ch` runtime. (NPU_GEMM_PARITY's
+  CPU oracle is not wired in this build since Conv6 no longer drains to DDR.)
+- Result: per-image inference **195,823 → 150,471 (−23%)**; full run
+  **8,041,665 → 7,618,571 (−423K, −5.3%)**, bit-identical (SCORE_CHK match) 10/10.
+  `reorder` 429,680 → 7,040 (just the per-pass trigger MMIO); `load` 75,110 →
+  50,670 (GEMM-input DDR round-trip gone).
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 
