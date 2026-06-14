@@ -43,6 +43,7 @@ static inline uint32_t rdcycle32(void) {
 // Per-phase accumulators (summed over all 10 images).
 static uint32_t prof_pad, prof_load, prof_npu, prof_reorder,
                 prof_affine, prof_argmax, prof_infer, prof_preload;
+static uint32_t prof_fc1;   // Phase 0: FC1 GEMM alone (excl. CPU FC2)
 static uint32_t prof_npu_layer[6];   // per-conv NPU time
 static int      prof_conv_idx;       // reset to 0 at each image
 #define PROF_T0()       uint32_t _pt = rdcycle32()
@@ -861,17 +862,29 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
         PROF_T0();
         // ---- Deploy: NPU FC1 (1024→50, ReLU) → FC1_OUT_DDR ----
         // Input is resident in Act PONG (HW transpose, decision L) — no DMA.
+#if NPU_PROFILE
+        { uint32_t _fc1 = rdcycle32();
+#endif
         npu_gemm_pass(AFFINE1_IN, AFFINE1_OUT, SCALE_AFFINE1, affine1_b, 1,
                       AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1);
+#if NPU_PROFILE
+          prof_fc1 += rdcycle32() - _fc1; }
+#endif
         // ---- CPU FC2 (50→10, raw int32): reads NPU FC1 output (channel-major,
         //      OCs 50..63 are exact 0 from padded weights). FC2 stays on CPU
         //      because the NPU's INT8 output saturates the final logits. ----
         volatile int8_t *f1 = (volatile int8_t *)FC1_OUT_DDR;
         const int8_t *w2 = &affine2_W[0][0];
+        // Read FC1's output from DDR once into fast private RAM; the FC2 loop
+        // otherwise re-reads each f1[ic] AFFINE2_OUT times (each a ~70-cyc
+        // single-beat AXI DDR read). Phase-0 measurement: this DDR re-read,
+        // not FC1 GEMM, dominates the affine bucket.
+        int8_t f1_loc[AFFINE2_IN];
+        for (int ic = 0; ic < AFFINE2_IN; ic++) f1_loc[ic] = f1[ic];
         for (int oc = 0; oc < AFFINE2_OUT; oc++) {
             int32_t acc = affine2_b[oc];
             for (int ic = 0; ic < AFFINE2_IN; ic++)
-                acc += (int32_t)f1[ic] * (int32_t)w2[oc * AFFINE2_IN + ic];
+                acc += (int32_t)f1_loc[ic] * (int32_t)w2[oc * AFFINE2_IN + ic];
             scores[oc] = (int32_t)(((int64_t)acc * SCALE_AFFINE2) >> SCALE_SHIFT);
         }
         PROF_ADD(prof_affine);
@@ -942,6 +955,7 @@ void usercode7(void)
     volatile int32_t *scr = (volatile int32_t *)SCORES;
 
     int correct = 0;
+    uint32_t score_chk = 0;   // bit-identical gate over all 10 images' int32 scores
     for (int d = 0; d < 10; d++) {
 #if VERBOSE_OUTPUT
         print_str("Digit "); print_dec(d); print_str(": ");
@@ -964,6 +978,12 @@ void usercode7(void)
 
         if (best == d)
             correct++;
+
+        // SCORE_CHK: fold all 10 int32 scores + prediction into a checksum that
+        // must stay bit-identical across every GEMM-reduce bring-up step.
+        for (int i = 0; i < 10; i++)
+            score_chk = (score_chk * 31u) + (uint32_t)scr[i]
+                      + (uint32_t)(best * 10 + i);
 #if VERBOSE_OUTPUT
         print_str("pred="); print_dec(best);
         if (best == d) {
@@ -981,6 +1001,7 @@ void usercode7(void)
 
     print_str("\n=== Result: "); print_dec(correct);
     print_str("/10 correct ===\n");
+    print_str("SCORE_CHK="); print_hex(score_chk, 8); print_chr('\n');
     if (correct >= 10)
         print_str("DEPLOY SUCCESS.\n");
     else
@@ -997,6 +1018,8 @@ void usercode7(void)
     print_str("  load     : "); print_dec(prof_load);    print_chr('\n');
     print_str("  reorder  : "); print_dec(prof_reorder); print_chr('\n');
     print_str("  affine   : "); print_dec(prof_affine);  print_chr('\n');
+    print_str("    fc1(gemm): "); print_dec(prof_fc1);
+    print_str(" total /img "); print_dec(prof_fc1 / 10); print_chr('\n');
     print_str("argmax     : "); print_dec(prof_argmax);  print_chr('\n');
     print_str("npu_per_layer (Conv1..Conv6):\n");
     for (int i = 0; i < 6; i++) {
