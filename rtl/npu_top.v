@@ -130,6 +130,14 @@ module npu_top #(
     wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
+    wire                            cfg_transpose_trig; // 0x15C: Conv6->FC transpose trigger pulse
+    wire                            transpose_done;
+    wire                            transpose_busy;
+    wire [SRAM_ADDR_W-1:0]          transpose_out_rd_addr;
+    wire                            transpose_out_rd_en;
+    wire [SRAM_ADDR_W-1:0]          transpose_act_wr_addr;
+    wire                            transpose_act_wr_en;
+    wire [ACT_DATA_W-1:0]           transpose_act_wr_data;
     wire                            expand_done;
     wire                            expand_busy;
     wire [SRAM_ADDR_W-1:0]          expand_addr;
@@ -294,7 +302,9 @@ module npu_top #(
         .o_copy_trig       (cfg_copy_trig),
         .i_copy_done       (copy_done),
         .o_expand_trig     (cfg_expand_trig),
-        .i_expand_done     (expand_done)
+        .i_expand_done     (expand_done),
+        .o_transpose_trig  (cfg_transpose_trig),
+        .i_transpose_done  (transpose_done)
     );
 
     // ===================================================================
@@ -921,17 +931,21 @@ module npu_top #(
     wire act_dma_wr_active = dma_sram_wr_en & ~cfg_dma_sram_sel;
     wire act_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd1);
 
-    // Copy engine takes Act Port B while busy (writes); else the DMA muxes.
+    // Copy/transpose engines take Act Port B while busy (writes); else DMA muxes.
     assign act_sram_addrb = expand_busy ? expand_addr
                           : copy_busy ? copy_act_wr_addr
+                          : transpose_busy ? transpose_act_wr_addr
                           : act_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
     assign act_sram_enb   = expand_busy ? expand_en
                           : copy_busy ? copy_act_wr_en
+                          : transpose_busy ? transpose_act_wr_en
                           : (act_dma_wr_active | act_dma_rd_active);
     assign act_sram_dib   = expand_busy ? expand_wdata
-                          : copy_busy ? copy_act_wr_data : dma_sram_wr_data;
+                          : copy_busy ? copy_act_wr_data
+                          : transpose_busy ? transpose_act_wr_data : dma_sram_wr_data;
     assign act_sram_web   = expand_busy ? expand_we
-                          : copy_busy ? copy_act_wr_en : act_dma_wr_active;
+                          : copy_busy ? copy_act_wr_en
+                          : transpose_busy ? transpose_act_wr_en : act_dma_wr_active;
 
     // Wgt SRAM Port B: DMA writes (sel=1) or DMA reads (rd_sram_sel=2)
     wire wgt_dma_wr_active = dma_sram_wr_en & cfg_dma_sram_sel;
@@ -955,8 +969,10 @@ module npu_top #(
     assign out_sram_enb_mux   = cfg_dma_out_rd_sel ? out_sram_enb_dma   : skip_rd_en;
 
     // Copy engine takes Out Port B while busy (reads); else the skip/DMA mux.
-    assign out_sram_addrb = copy_busy ? copy_out_rd_addr : out_sram_addrb_mux;
-    assign out_sram_enb   = copy_busy ? copy_out_rd_en   : out_sram_enb_mux;
+    assign out_sram_addrb = copy_busy ? copy_out_rd_addr
+                          : transpose_busy ? transpose_out_rd_addr : out_sram_addrb_mux;
+    assign out_sram_enb   = copy_busy ? copy_out_rd_en
+                          : transpose_busy ? transpose_out_rd_en : out_sram_enb_mux;
     assign out_sram_web   = 1'b0;
     assign out_sram_dib   = {ACT_DATA_W{1'b0}};
 
@@ -1001,6 +1017,35 @@ module npu_top #(
         .o_act_wr_data (copy_act_wr_data),
         .o_busy        (copy_busy),
         .o_done        (copy_done)
+    );
+
+    // ===================================================================
+    // Conv6 -> FC1 transpose engine (hardware reorder, decision L). Reads a
+    // pass's tile-major Out SRAM output (Port B), transposes to channel-major,
+    // writes Act SRAM (Port B). Banks follow cfg_dma_out_ping_sel (Out read) /
+    // cfg_dma_act_ping_sel (Act write, = PONG for the GEMM input). src/dst reuse
+    // the DMA SRAM-base regs; i_npos = cfg_dma_rd_len (positions this pass).
+    // Time-shares Port B with copy/dma (mutually exclusive in firmware).
+    // ===================================================================
+    transpose_engine #(
+        .ADDR_W   (SRAM_ADDR_W),
+        .DATA_W   (ACT_DATA_W),
+        .MAX_NPOS (16)
+    ) u_transpose (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .i_trig        (cfg_transpose_trig),
+        .i_src_base    (cfg_dma_rd_sram_base),
+        .i_dst_base    (cfg_dma_wr_sram_base),
+        .i_npos        (cfg_dma_rd_len),
+        .o_out_rd_addr (transpose_out_rd_addr),
+        .o_out_rd_en   (transpose_out_rd_en),
+        .i_out_rd_data (out_sram_dob),
+        .o_act_wr_addr (transpose_act_wr_addr),
+        .o_act_wr_en   (transpose_act_wr_en),
+        .o_act_wr_data (transpose_act_wr_data),
+        .o_busy        (transpose_busy),
+        .o_done        (transpose_done)
     );
 
     // ===================================================================

@@ -77,6 +77,8 @@ void usercode7(void);
 #define NPU_DMA_STATUS_COPY_DONE (1 << 2)        // NPU_DMA_STATUS bit2: on-chip copy complete
 #define NPU_DMA_EXPAND_TRIG  (NPU_BASE + 0x158)  // write any value: trigger img_expand (byte->word)
 #define NPU_DMA_STATUS_EXPAND_DONE (1 << 3)      // NPU_DMA_STATUS bit3: img_expand complete
+#define NPU_DMA_TRANSPOSE_TRIG (NPU_BASE + 0x15C) // write any value: trigger Conv6->FC transpose
+#define NPU_DMA_STATUS_TRANSPOSE_DONE (1 << 4)   // NPU_DMA_STATUS bit4: transpose complete
 
 // CTRL bits
 #define NPU_CTRL_START      (1 << 0)
