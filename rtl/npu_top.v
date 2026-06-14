@@ -449,6 +449,15 @@ module npu_top #(
     wire                        fsm_array_k_end;
     wire                        fsm_array_drain_en;
 
+    // GEMM-reduce (decision M)
+    wire [ARRAY_ROWS*ARRAY_COLS*128-1:0] wgt_reader_plane;
+    wire                        wgt_reader_plane_done;
+    wire                        fsm_wgt_plane_trig;
+    wire [3:0]                  fsm_superstep;
+    wire                        fsm_rdc_act_we;     // capture act_sram_doa → act_row
+    wire [3:0]                  fsm_rdc_act_idx;    // which row (0..15)
+    wire                        fsm_rdc_act_clear;  // clear act_row at super-step start
+
     wire                        fsm_pp_start;
     wire [15:0]                 fsm_group_size;
     wire [15:0]                 fsm_group_base;
@@ -518,6 +527,7 @@ module npu_top #(
         .o_im2col_pixel_vld   (fsm_im2col_pixel_vld),
         .o_border             (fsm_border),
         .i_row_par_en         (cfg_row_par_en),
+        .i_gemm_reduce        (cfg_gemm_reduce),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
         .o_im2col_group_base  (fsm_im2col_group_base),
         .o_group_size         (fsm_group_size),
@@ -529,6 +539,12 @@ module npu_top #(
         .o_array_vld          (fsm_array_vld),
         .o_array_k_end        (fsm_array_k_end),
         .o_array_drain_en     (fsm_array_drain_en),
+        .o_wgt_plane_trig     (fsm_wgt_plane_trig),
+        .o_superstep          (fsm_superstep),
+        .i_plane_done         (wgt_reader_plane_done),
+        .o_rdc_act_we         (fsm_rdc_act_we),
+        .o_rdc_act_idx        (fsm_rdc_act_idx),
+        .o_rdc_act_clear      (fsm_rdc_act_clear),
         .o_in_drain           (fsm_in_drain),
         .o_in_post            (fsm_in_post),
 
@@ -588,7 +604,12 @@ module npu_top #(
         .o_prefetch_done   (fsm_wgt_prefetch_done),
         .i_wgt_offset      (fsm_im2col_offset_sel),
         .o_wgt             (wgt_reader_wgt),
-        .o_wgt_vld         (wgt_reader_wgt_vld)
+        .o_wgt_vld         (wgt_reader_wgt_vld),
+        .i_gemm_reduce     (cfg_gemm_reduce),
+        .i_plane_trig      (fsm_wgt_plane_trig),
+        .i_superstep       (fsm_superstep),
+        .o_wgt_plane       (wgt_reader_plane),
+        .o_plane_done      (wgt_reader_plane_done)
     );
 
     // Connect wgt_reader to Wgt SRAM Port A
@@ -677,6 +698,33 @@ module npu_top #(
     assign fsm_im2col_win_y   = im2col_win_y;
 
     // ===================================================================
+    // GEMM-reduce activation row register (decision M): 16 distinct IC-tile
+    // words, one per array row, loaded from Act SRAM by the FSM super-step
+    // sequencer. Cleared at super-step start so out-of-range rows feed 0.
+    // ===================================================================
+    reg [127:0] act_row [0:ARRAY_ROWS-1];
+    integer ar_i;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (ar_i = 0; ar_i < ARRAY_ROWS; ar_i = ar_i + 1)
+                act_row[ar_i] <= 128'd0;
+        end else begin
+            if (fsm_rdc_act_clear)
+                for (ar_i = 0; ar_i < ARRAY_ROWS; ar_i = ar_i + 1)
+                    act_row[ar_i] <= 128'd0;
+            else if (fsm_rdc_act_we)
+                act_row[fsm_rdc_act_idx] <= act_sram_doa[127:0];
+        end
+    end
+    wire [ARRAY_ROWS*128-1:0] act_row_bus;
+    genvar arg;
+    generate
+        for (arg = 0; arg < ARRAY_ROWS; arg = arg + 1) begin : gen_act_row_bus
+            assign act_row_bus[arg*128 +: 128] = act_row[arg];
+        end
+    endgenerate
+
+    // ===================================================================
     // Systolic 16×16 Array
     // ===================================================================
     wire [ARRAY_COLS-1:0][PSUM_WIDTH-1:0] array_psum_col;
@@ -691,10 +739,12 @@ module npu_top #(
         // rows (same replication im2col does for conv) — every PE in a column
         // computes the identical dot product, so drain/POST capture is
         // phase-independent. Conv mode: im2col window as before.
-        .i_act       (cfg_gemm_en ? {ARRAY_ROWS{act_sram_doa}} : im2col_act_window),
+        .i_act       (cfg_gemm_reduce ? act_row_bus
+                    : cfg_gemm_en     ? {ARRAY_ROWS{act_sram_doa}}
+                    :                   im2col_act_window),
         .i_wgt       (wgt_reader_wgt),
-        .i_wgt_plane ({(ARRAY_ROWS*ARRAY_COLS*128){1'b0}}),  // dormant (Task 6 drives)
-        .i_reduce    (1'b0),                                 // dormant (Task 6 drives)
+        .i_wgt_plane (wgt_reader_plane),
+        .i_reduce    (cfg_gemm_reduce),
         .o_psum_col  (array_psum_col),
         .i_vld       (fsm_array_vld),
         .i_k_end     (fsm_array_k_end),

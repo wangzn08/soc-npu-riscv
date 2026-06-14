@@ -56,7 +56,14 @@ module wgt_reader #(
 
     // === Weight output to systolic array ===
     output wire [WGT_BUS_W-1:0]         o_wgt,
-    output wire                         o_wgt_vld
+    output wire                         o_wgt_vld,
+
+    // === GEMM-reduce 16×16 weight plane (decision M) ===
+    input  wire                         i_gemm_reduce,     // 1 = reduce mode (plane prefetch owns SRAM port)
+    input  wire                         i_plane_trig,      // pulse: prefetch one super-step's 256-word plane
+    input  wire [3:0]                   i_superstep,       // super-step index s (IC-tile base = s*16)
+    output wire [NUM_OC*NUM_OC*WGT_GROUP_W-1:0] o_wgt_plane, // plane[row r][col c] = word(oc=c, icg=s*16+r)
+    output wire                         o_plane_done
 );
 
     // -------------------------------------------------------------------
@@ -105,8 +112,80 @@ module wgt_reader #(
                         + {{(SRAM_ADDR_W-4){1'b0}}, pf_ko}
                         + pf_oc * oc_stride;
 
-    assign o_sram_addr = sram_rd_addr;
-    assign o_sram_en   = (pf_state == PF_READING);
+    // -------------------------------------------------------------------
+    // GEMM-reduce plane prefetch (decision M): read 256 words/super-step into
+    // gemm_plane[r*16+c] = Wgt[i_wgt_base + c*icg + s*16 + r]. Owns the SRAM
+    // port when i_gemm_reduce (legacy pf_state stays idle in reduce mode).
+    // -------------------------------------------------------------------
+    localparam PLANE_N = NUM_OC * NUM_OC;   // 256
+    reg [WGT_GROUP_W-1:0] gemm_plane [0:PLANE_N-1];
+
+    localparam PL_IDLE = 2'd0, PL_READ = 2'd1, PL_DONE = 2'd2;
+    reg [1:0] pl_state;
+    reg [8:0] pl_cnt;       // 0..256
+    reg [8:0] pl_cnt_d;     // delayed (SRAM 1-cycle latency)
+    reg       pl_rd_d;      // delayed read-enable gate
+    reg       pl_done_r;
+
+    wire [3:0] pl_r = pl_cnt[3:0];
+    wire [3:0] pl_c = pl_cnt[7:4];
+    wire [SRAM_ADDR_W-1:0] super_off =
+        {{(SRAM_ADDR_W-8){1'b0}}, i_superstep, 4'd0};   // s*16
+    wire [SRAM_ADDR_W-1:0] plane_addr =
+          i_wgt_base
+        + {{(SRAM_ADDR_W-4){1'b0}}, pl_c} * i_ic_groups_total[SRAM_ADDR_W-1:0]
+        + super_off
+        + {{(SRAM_ADDR_W-4){1'b0}}, pl_r};
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pl_state  <= PL_IDLE;
+            pl_cnt    <= 9'd0;
+            pl_cnt_d  <= 9'd0;
+            pl_rd_d   <= 1'b0;
+            pl_done_r <= 1'b0;
+        end else begin
+            pl_cnt_d <= pl_cnt;
+            pl_rd_d  <= (pl_state == PL_READ) && (pl_cnt < 9'd256);
+            pl_done_r <= 1'b0;
+
+            // Capture the word read 1 cycle ago
+            if (pl_rd_d)
+                gemm_plane[{pl_cnt_d[3:0], 4'd0} + pl_cnt_d[7:4]] <= i_sram_data;
+                // index = r_d*16 + c_d  (r_d=pl_cnt_d[3:0], c_d=pl_cnt_d[7:4])
+
+            case (pl_state)
+                PL_IDLE: if (i_gemm_reduce && i_plane_trig) begin
+                    pl_state <= PL_READ;
+                    pl_cnt   <= 9'd0;
+                end
+                PL_READ: begin
+                    if (pl_cnt == 9'd256) begin
+                        pl_state  <= PL_DONE;
+                        pl_done_r <= 1'b1;
+                    end else begin
+                        pl_cnt <= pl_cnt + 9'd1;
+                    end
+                end
+                PL_DONE: pl_state <= PL_IDLE;
+                default: pl_state <= PL_IDLE;
+            endcase
+        end
+    end
+
+    assign o_plane_done = pl_done_r;
+
+    genvar pgi;
+    generate
+        for (pgi = 0; pgi < PLANE_N; pgi = pgi + 1) begin : gen_plane_out
+            assign o_wgt_plane[pgi*WGT_GROUP_W +: WGT_GROUP_W] = gemm_plane[pgi];
+        end
+    endgenerate
+
+    // SRAM port: plane prefetch owns it in reduce mode; legacy prefetch otherwise.
+    assign o_sram_addr = i_gemm_reduce ? plane_addr : sram_rd_addr;
+    assign o_sram_en   = i_gemm_reduce ? ((pl_state == PL_READ) && (pl_cnt < 9'd256))
+                                       : (pf_state == PF_READING);
 
     // -------------------------------------------------------------------
     // Pre-fetch FSM

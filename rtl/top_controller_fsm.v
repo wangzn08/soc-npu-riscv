@@ -30,6 +30,7 @@ module top_controller_fsm #(
     input  wire                     i_gemm_en,      // GEMM/FC mode: bypass im2col, act = vector
     input  wire                     i_hw_pad,       // hardware padding: read tile-major, inject border zeros
     input  wire                     i_row_par_en,   // 16-row spatial parallelism (task E)
+    input  wire                     i_gemm_reduce,  // GEMM 16-row IC-reduction (decision M)
     input  wire [7:0]               i_pad_w,        // zero-pad columns each side
     input  wire [7:0]               i_pad_h,        // zero-pad rows each side
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_ping,
@@ -83,6 +84,14 @@ module top_controller_fsm #(
     output wire                     o_array_k_end,
     output wire                     o_array_drain_en,
 
+    // === GEMM-reduce sequencer (decision M) ===
+    output wire                     o_wgt_plane_trig,  // pulse: prefetch a super-step's weight plane
+    output wire [3:0]               o_superstep,       // super-step index s
+    input  wire                     i_plane_done,      // wgt_reader plane prefetch complete
+    output wire                     o_rdc_act_we,      // capture Act SRAM data → act_row[idx]
+    output wire [3:0]               o_rdc_act_idx,     // act_row write index (0..15)
+    output wire                     o_rdc_act_clear,   // clear act_row at super-step start
+
     // === Post-process / Out SRAM write ===
     output wire                     o_pp_start,
     output wire [SRAM_ADDR_W-1:0]   o_out_wr_addr,
@@ -119,6 +128,9 @@ module top_controller_fsm #(
     localparam S_POST         = 4'd7;
     localparam S_NEXT_TILE    = 4'd8;
     localparam S_DONE         = 4'd9;
+    localparam S_RDC_WLOAD    = 4'd10;   // GEMM-reduce: prefetch weight plane
+    localparam S_RDC_ALOAD    = 4'd11;   // GEMM-reduce: load 16 act words
+    localparam S_RDC_VLD      = 4'd12;   // GEMM-reduce: 1 accumulate cycle
 
     reg [3:0] state, state_next;
 
@@ -149,9 +161,18 @@ module top_controller_fsm #(
     reg [3:0]  load_tile;     // Current IC tile being streamed within a column (0..ic_groups-1)
     reg        wgt_loaded;    // 1 = this OC tile's weights are resident in wgt_buf (reuse mode)
 
+    // GEMM-reduce (decision M)
+    reg [3:0]  super_step;    // current super-step (each = 16 IC-tiles across 16 rows)
+    reg [4:0]  aload_cnt;     // act-load counter (0..16)
+    reg        plane_trig_r;  // 1-cycle weight-plane prefetch pulse
+
     // Derived
     wire [15:0] ic_groups;
     assign ic_groups = (i_dim_in_c + 16'd15) >> 4;  // ceil(IC/16)
+
+    // GEMM-reduce derived (decision M)
+    wire        reduce = i_gemm_en && i_gemm_reduce;
+    wire [15:0] super_total = (ic_groups + 16'd15) >> 4;  // ceil(ic_groups/16)
 
     // Runtime kernel offsets (conv 3x3 -> 9, GEMM 1x1 -> 1); replaces KERNEL_OFFSETS
     wire [7:0] ko_total;
@@ -210,13 +231,20 @@ module top_controller_fsm #(
          + (cur_in_col - {8'd0, i_pad_w});
     assign o_border = at_border;
 
-    assign o_act_sram_addr = i_gemm_en ? gemm_act_addr
+    // GEMM-reduce: row r of super-step s reads input-vector word (s*16 + r).
+    wire [SRAM_ADDR_W-1:0] rdc_act_addr = act_base_addr
+                         + {{(SRAM_ADDR_W-8){1'b0}}, super_step, 4'd0}   // s*16
+                         + {{(SRAM_ADDR_W-5){1'b0}}, aload_cnt};
+    assign o_act_sram_addr = reduce    ? rdc_act_addr
+                           : i_gemm_en ? gemm_act_addr
                            : i_hw_pad  ? tilemaj_addr
                            :             act_rd_addr;
     // GEMM reads the IC-tile word during PREFETCH (1-cycle SRAM latency; the
     // sdp_bram holds doa until the next read, so the word stays stable through
     // CALC where it is replicated to all 16 array rows).
-    assign o_act_sram_en   = i_gemm_en
+    assign o_act_sram_en   = reduce
+                           ? ((state == S_RDC_ALOAD) && (aload_cnt < 5'd16))
+                           : i_gemm_en
                            ? ((state == S_PREFETCH_WGT) && (pf_wait_cnt == 16'd0))
                            : ((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && (load_col_cnt > 16'd0)
                               && (!i_hw_pad || !at_border));   // skip SRAM read on border
@@ -240,9 +268,18 @@ module top_controller_fsm #(
     assign o_wgt_ic_sel          = ic_tile[7:4];   // current ic_group (reuse output mux)
 
     // Array control
-    assign o_array_vld     = (state == S_CALC_KERNEL);
+    assign o_array_vld     = (state == S_CALC_KERNEL) || (state == S_RDC_VLD);
     assign o_array_k_end   = (state == S_K_END);
     assign o_array_drain_en = (state == S_DRAIN);
+
+    // GEMM-reduce sequencer outputs
+    assign o_wgt_plane_trig = plane_trig_r;
+    assign o_superstep      = super_step;
+    assign o_rdc_act_clear  = (state == S_RDC_WLOAD);
+    // ALOAD issues read at aload_cnt (0..15); data returns 1 cycle later, so
+    // capture row (aload_cnt-1) when aload_cnt in 1..16.
+    assign o_rdc_act_we     = (state == S_RDC_ALOAD) && (aload_cnt >= 5'd1) && (aload_cnt <= 5'd16);
+    assign o_rdc_act_idx    = aload_cnt[4:0] - 5'd1;
 
     // State indicators for pooling control
     assign o_in_drain = (state == S_DRAIN);
@@ -310,6 +347,9 @@ module top_controller_fsm #(
             row_base_in_row <= 16'd0;
             load_tile    <= 4'd0;
             wgt_loaded   <= 1'b0;
+            super_step   <= 4'd0;
+            aload_cnt    <= 5'd0;
+            plane_trig_r <= 1'b0;
             act_base_addr<= {SRAM_ADDR_W{1'b0}};
             wgt_base_addr<= {SRAM_ADDR_W{1'b0}};
             out_base_addr<= {SRAM_ADDR_W{1'b0}};
@@ -343,8 +383,16 @@ module top_controller_fsm #(
                         row_base_in_row <= 16'd0;
                         load_tile  <= 4'd0;
                         wgt_loaded <= 1'b0;   // force first prefetch of this layer
-                        // GEMM mode bypasses im2col line-load (S_LOAD_ROW/S_WAIT_WIN)
-                        state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
+                        super_step <= 4'd0;
+                        aload_cnt  <= 5'd0;
+                        // GEMM-reduce bypasses im2col AND the per-k-step GEMM loop;
+                        // GEMM bypasses im2col line-load (S_LOAD_ROW/S_WAIT_WIN)
+                        if (i_gemm_en && i_gemm_reduce) begin
+                            plane_trig_r <= 1'b1;        // kick first super-step's plane prefetch
+                            state <= S_RDC_WLOAD;
+                        end else begin
+                            state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
+                        end
                     end
                 end
 
@@ -455,7 +503,9 @@ module top_controller_fsm #(
                 // DRAIN: Shift partial sums out (16 cycles)
                 // -------------------------------------------------------
                 S_DRAIN: begin
-                    if (drain_cnt == 5'd15) begin
+                    if (reduce || drain_cnt == 5'd15) begin
+                        // Reduce: the combinational column sum is valid this single
+                        // drain cycle (one pp_input_vld) → straight to POST.
                         drain_cnt <= 5'd0;
                         state <= S_POST;
                     end else begin
@@ -509,6 +559,37 @@ module top_controller_fsm #(
                         end else begin
                             state <= S_DONE;
                         end
+                    end
+                end
+
+                // -------------------------------------------------------
+                // GEMM-reduce super-step sequence (decision M)
+                // -------------------------------------------------------
+                S_RDC_WLOAD: begin
+                    plane_trig_r <= 1'b0;          // 1-cycle pulse, then wait
+                    if (i_plane_done) begin
+                        aload_cnt <= 5'd0;
+                        state     <= S_RDC_ALOAD;
+                    end
+                end
+
+                S_RDC_ALOAD: begin
+                    // Issue 16 act reads (cnt 0..15); capture completes at cnt 16.
+                    if (aload_cnt == 5'd16) begin
+                        state <= S_RDC_VLD;
+                    end else begin
+                        aload_cnt <= aload_cnt + 5'd1;
+                    end
+                end
+
+                S_RDC_VLD: begin
+                    // One accumulate cycle for this super-step.
+                    if (super_step + 4'd1 < super_total[3:0]) begin
+                        super_step   <= super_step + 4'd1;
+                        plane_trig_r <= 1'b1;       // prefetch next super-step's plane
+                        state        <= S_RDC_WLOAD;
+                    end else begin
+                        state <= S_K_END;           // all super-steps done → latch
                     end
                 end
 
