@@ -85,6 +85,7 @@ module param_regfile #(
     output wire                         o_hw_pad,        // CTRL[8]: hardware padding (FSM border zero-inject)
     output wire                         o_row_par_en,    // CTRL[9]: 16-row spatial parallelism (task E)
     output wire                         o_gemm_reduce,   // CTRL[10]: GEMM 16-row IC-reduction (decision M)
+    output wire                         o_row_block_en,  // CTRL[11]: row-block packing for narrow layers (#4)
     output wire [7:0]                   o_pad_w,         // NPU_PAD[7:0]: zero-pad columns each side
     output wire [7:0]                   o_pad_h,         // NPU_PAD[15:8]: zero-pad rows each side
 
@@ -180,6 +181,7 @@ module param_regfile #(
     reg        ctrl_hw_pad;     // CTRL[8]: hardware padding
     reg        ctrl_row_par;   // CTRL[9]: 16-row spatial parallelism
     reg        ctrl_gemm_reduce; // CTRL[10]: GEMM 16-row IC-reduction
+    reg        ctrl_row_block;   // CTRL[11]: row-block packing (#4)
     reg [15:0] pad_cfg;         // NPU_PAD: {pad_h[15:8], pad_w[7:0]}
 
     // Status
@@ -294,6 +296,7 @@ module param_regfile #(
             ctrl_hw_pad     <= 1'b0;    // hardware padding off by default
             ctrl_row_par    <= 1'b0;    // row-parallel off by default
             ctrl_gemm_reduce <= 1'b0;   // GEMM-reduce off by default
+            ctrl_row_block   <= 1'b0;   // row-block packing off by default
             pad_cfg         <= 16'd0;
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
             act_addr_pong   <= {SRAM_ADDR_W{1'b0}};
@@ -371,6 +374,7 @@ module param_regfile #(
                         ctrl_hw_pad     <= s_axi_wdata[8];
                         ctrl_row_par    <= s_axi_wdata[9];
                         ctrl_gemm_reduce <= s_axi_wdata[10];
+                        ctrl_row_block   <= s_axi_wdata[11];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -478,7 +482,7 @@ module param_regfile #(
             if (s_axi_arvalid && s_axi_arready && !rvalid) begin
                 rvalid <= 1'b1;
                 case (s_axi_araddr[ADDR_W-1:0])
-                    10'h00: rdata <= {21'd0, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
+                    10'h00: rdata <= {20'd0, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
                     10'h04: rdata <= {28'd0, i_dma_wr_err, i_dma_rd_err, i_busy, done_irq_latched};
                     10'h08: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_ping};
                     10'h0C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_pong};
@@ -563,6 +567,7 @@ module param_regfile #(
     assign o_hw_pad       = ctrl_hw_pad;
     assign o_row_par_en   = ctrl_row_par;
     assign o_gemm_reduce  = ctrl_gemm_reduce;
+    assign o_row_block_en = ctrl_row_block;
     assign o_pad_w        = pad_cfg[7:0];
     assign o_pad_h        = pad_cfg[15:8];
     assign o_clear_done   = ctrl_clear_done;

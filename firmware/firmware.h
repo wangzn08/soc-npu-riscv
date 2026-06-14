@@ -92,6 +92,7 @@ void usercode7(void);
 #define NPU_CTRL_HW_PAD     (1 << 8)   // hardware padding: FSM injects border zeros, reads tile-major
 #define NPU_CTRL_ROW_PAR    (1 << 9)   // 16-row spatial parallelism (task E): 16 output pixels/group
 #define NPU_CTRL_GEMM_REDUCE (1 << 10) // GEMM 16-row IC-reduction (decision M): util 6.25%->~100%
+#define NPU_CTRL_ROW_BLOCK   (1 << 11) // row-block packing (#4): pack R output rows, narrow layers 50%->100%
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)
