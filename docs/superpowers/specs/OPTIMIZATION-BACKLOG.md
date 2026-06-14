@@ -47,12 +47,12 @@ Pack R=2 output rows into the array for out_w==8 layers (Conv5/6). Util **50%→
 ## Recommended order
 1. ~~GEMM array util~~ — DONE (decision M). Util 6.25%→100%; cycle win marginal.
 2. ~~#4 row-block packing~~ — DONE (decision N). Util 50%→100%; **−3.3% full run**.
-3. **Open (if pursuing more conv cycles): reduce per-OC-pass start/IRQ overhead**
-   (~1,683 cyc/start × 4 OC-passes/layer). OC-tiling-in-one-start (big, bumps
-   decision D) or firmware MMIO trims (broadcast scale/shift). Phase 0 first — but
-   per the #4 lesson, prefer a mode-gated A/B over a proxy extrapolation.
-4. **Open (capability generality, not cycles): output bit-width (let final FC run
-   on NPU) / depthwise conv.** Not bandwidth-trap-prone; payoff more certain.
+3. **Open — reduce per-OC-pass start/IRQ overhead.** Spec:
+   `2026-06-14-per-oc-pass-overhead-design.md`. Level 1 = firmware MMIO hoist
+   (zero HW risk, DO FIRST); Level 2 = OC-tiling-in-one-start (bumps decision D).
+4. **Open — capability generality (not cycles).** Spec:
+   `2026-06-14-capability-generality-design.md`. Feature A = output bit-width
+   (run final FC on NPU); Feature B = depthwise conv (MobileNet-class nets).
 
 ## Methodology (do not skip)
 - Branch from `feat/npu-hw-reorder`.
