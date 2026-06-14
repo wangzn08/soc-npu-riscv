@@ -128,6 +128,7 @@ module npu_top #(
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
     wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
+    wire                            cfg_gemm_reduce;    // CTRL[10]: GEMM 16-row IC-reduction
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
     wire                            cfg_transpose_trig; // 0x15C: Conv6->FC transpose trigger pulse
@@ -250,6 +251,7 @@ module npu_top #(
         .o_gemm_en        (cfg_gemm_en),
         .o_hw_pad         (cfg_hw_pad),
         .o_row_par_en     (cfg_row_par_en),
+        .o_gemm_reduce    (cfg_gemm_reduce),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
         .i_done_irq       (status_done_irq),
