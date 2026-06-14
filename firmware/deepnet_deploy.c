@@ -461,11 +461,16 @@ static void npu_conv_pass(
         // Start NPU: relu_en=1, Out write bank = out_bank (CTRL[6]).
         // The CTRL write also clears any stale NPU-done latch from a prior pass.
         npu_irq_flag = 0;
+        // #4 row-block packing: auto-engage on narrow non-pool layers (out_w==8 →
+        // R=2). Conv5 qualifies; Conv6 (pool) excluded until the pool path lands.
+        int rb_out_w  = (in_w - kw) / sx + 1;
+        int row_block = row_par && (rb_out_w == 8) && !pool_en;
         npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_RELU_EN |
                          (pool_en ? NPU_CTRL_POOL_EN : 0) |
                          (out_bank ? NPU_CTRL_OUT_PING : 0) |
                          (pad ? NPU_CTRL_HW_PAD : 0) |
-                         (row_par ? NPU_CTRL_ROW_PAR : 0));
+                         (row_par ? NPU_CTRL_ROW_PAR : 0) |
+                         (row_block ? NPU_CTRL_ROW_BLOCK : 0));
 
 #if NPU_OC_OVERLAP
         // OVERLAP (DDR path only): while the NPU computes this pass, drain the

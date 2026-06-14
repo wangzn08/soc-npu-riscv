@@ -207,6 +207,9 @@ module top_controller_fsm #(
     // Any other layer keeps R=1 (byte-identical to decision I).
     wire [3:0] rows_per_grp = (i_row_block_en && group_size == 16'd8) ? 4'd2 : 4'd1;
     assign o_rows_per_grp = rows_per_grp;
+    wire rb_active = (rows_per_grp > 4'd1);
+    // Last input row to load for the current row-block: rows oy..oy+R+kh-2.
+    wire [15:0] lr_target = cur_oy + {12'd0, rows_per_grp} + {8'd0, i_kernel_kh} - 16'd2;
 
     // -------------------------------------------------------------------
     // Output assignments
@@ -434,7 +437,10 @@ module top_controller_fsm #(
                         // NEXT_TILE will add stride when starting the next
                         // output row.  Incrementing here would double-count
                         // and push the SRAM address out of bounds.
-                        if (cur_in_row >= {8'd0, i_kernel_kh} - 16'd1) begin
+                        // #4 row-block: load R+2 rows (up to lr_target) before a
+                        // block's window; legacy loads kh rows (cur_in_row>=kh-1).
+                        if (rb_active ? (cur_in_row >= lr_target)
+                                      : (cur_in_row >= {8'd0, i_kernel_kh} - 16'd1)) begin
                             state <= S_WAIT_WIN;
                         end else if (cur_in_row < i_dim_in_h - 16'd1) begin
                             cur_in_row <= cur_in_row + 16'd1;
@@ -546,10 +552,12 @@ module top_controller_fsm #(
                         // Pre-fetch weights for IC tile 0 at new position
                         state <= S_PREFETCH_WGT;
                         pf_wait_cnt <= 16'd0;
-                    end else if (cur_oy + 16'd1 < out_h) begin
-                        // Next row
+                    end else if (cur_oy + {12'd0, rows_per_grp} < out_h) begin
+                        // Next row-block: advance cur_oy by R (=1 legacy).  The
+                        // line buffer slides by loading R new rows in LOAD_ROW
+                        // (cur_in_row += stride here; LOAD_ROW loads up to lr_target).
                         cur_ox <= 16'd0;
-                        cur_oy <= cur_oy + 16'd1;
+                        cur_oy <= cur_oy + {12'd0, rows_per_grp};
                         cur_in_col <= 16'd0;
                         cur_in_row <= cur_in_row + {8'd0, i_stride_sy};
                         state <= S_LOAD_ROW; // Need new row data

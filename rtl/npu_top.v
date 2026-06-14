@@ -923,15 +923,23 @@ module npu_top #(
             end
         end
     end
-    wire [15:0] rp_col = fsm_group_base + (16'd15 - {11'd0, rp_vld_cnt});
+    // Drained array row r = 15 - rp_vld_cnt. #4 row-block: r → block b=r/gs
+    // (output row cur_oy+b), col c=r%gs; legacy (R=1): b=0, c=r.
+    wire [4:0]  rb_arr_row = 5'd15 - rp_vld_cnt;
+    wire        rb_b = cfg_row_block_en && ({11'd0, rb_arr_row} >= fsm_group_size);
+    wire [15:0] rb_c = {11'd0, rb_arr_row} - (rb_b ? fsm_group_size : 16'd0);
+    wire [15:0] rp_col = fsm_group_base
+                       + (cfg_row_block_en ? rb_c : {11'd0, rb_arr_row});
     wire        rp_col_valid = rp_active && pp_feat_vld
                              && (rp_col >= fsm_group_base)
                              && (rp_col <  fsm_group_base + fsm_group_size);
     // fsm_out_wr_addr = out_base + oc_off + cur_oy*stride + cur_ox(=group_base).
-    // Strip group_base, add the per-pixel rp_col.
+    // Strip group_base, add the per-pixel rp_col; row-block adds b*out_row_stride
+    // for the block's output row (cur_oy+b).
     wire [SRAM_ADDR_W-1:0] rp_wr_addr = fsm_out_wr_addr
                              - fsm_group_base[SRAM_ADDR_W-1:0]
-                             + rp_col[SRAM_ADDR_W-1:0];
+                             + rp_col[SRAM_ADDR_W-1:0]
+                             + (rb_b ? conv_out_w[SRAM_ADDR_W-1:0] : {SRAM_ADDR_W{1'b0}});
     wire rp_wr_en = cfg_row_par_en & ~cfg_pool_en & rp_col_valid;
     wire rp_done  = rp_active && (rp_vld_cnt == 5'd15) && pp_feat_vld;
 
