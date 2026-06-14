@@ -130,6 +130,7 @@ module npu_top #(
     wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
     wire                            cfg_gemm_reduce;    // CTRL[10]: GEMM 16-row IC-reduction
     wire                            cfg_row_block_en;   // CTRL[11]: row-block packing (#4)
+    wire [3:0]                       fsm_rows_per_grp;   // #4: R output rows packed
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
     wire                            cfg_transpose_trig; // 0x15C: Conv6->FC transpose trigger pulse
@@ -530,6 +531,8 @@ module npu_top #(
         .o_border             (fsm_border),
         .i_row_par_en         (cfg_row_par_en),
         .i_gemm_reduce        (cfg_gemm_reduce),
+        .i_row_block_en       (cfg_row_block_en),
+        .o_rows_per_grp       (fsm_rows_per_grp),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
         .o_im2col_group_base  (fsm_im2col_group_base),
         .o_group_size         (fsm_group_size),
@@ -684,6 +687,9 @@ module npu_top #(
         .i_offset_sel    (fsm_im2col_offset_sel),
         .i_row_par_en    (cfg_row_par_en),
         .i_group_base    (fsm_im2col_group_base),
+        .i_row_block_en  (cfg_row_block_en),
+        .i_group_size    (fsm_group_size),
+        .i_rows_per_grp  (fsm_rows_per_grp),
         .o_act_window    (im2col_act_window),
         .o_win_vld       (im2col_win_vld),
         .o_win_x         (im2col_win_x),

@@ -31,6 +31,7 @@ module top_controller_fsm #(
     input  wire                     i_hw_pad,       // hardware padding: read tile-major, inject border zeros
     input  wire                     i_row_par_en,   // 16-row spatial parallelism (task E)
     input  wire                     i_gemm_reduce,  // GEMM 16-row IC-reduction (decision M)
+    input  wire                     i_row_block_en, // #4: row-block packing for narrow layers
     input  wire [7:0]               i_pad_w,        // zero-pad columns each side
     input  wire [7:0]               i_pad_h,        // zero-pad rows each side
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_ping,
@@ -74,6 +75,7 @@ module top_controller_fsm #(
     output wire [3:0]               o_im2col_load_tile,   // IC tile being streamed during LOAD_ROW
     output wire [15:0]              o_im2col_group_base,  // first output column of the current 16-wide group
     output wire [15:0]              o_group_size,
+    output wire [3:0]               o_rows_per_grp,   // #4: R output rows packed (1 = byte-identical)
     output wire [15:0]              o_group_base,   // = cur_ox during the write window
     input  wire                     i_im2col_win_vld,
     input  wire [15:0]              i_im2col_win_x,
@@ -198,6 +200,13 @@ module top_controller_fsm #(
     wire [15:0] group_size   = (i_row_par_en && rp_remaining > 16'd16) ? 16'd16
                              : (i_row_par_en)                          ? rp_remaining
                              :                                          16'd1;
+
+    // #4 row-block packing: R output rows packed into the 16 array rows.
+    // MAX_R=2; the gi→(block,col) mapping (im2col) is exact only when
+    // 2*group_size==16, i.e. group_size==8 — so engage R=2 only there.
+    // Any other layer keeps R=1 (byte-identical to decision I).
+    wire [3:0] rows_per_grp = (i_row_block_en && group_size == 16'd8) ? 4'd2 : 4'd1;
+    assign o_rows_per_grp = rows_per_grp;
 
     // -------------------------------------------------------------------
     // Output assignments

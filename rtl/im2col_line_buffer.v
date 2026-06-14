@@ -51,6 +51,9 @@ module im2col_line_buffer #(
     input  wire [3:0]                   i_offset_sel,   // 0..8 kernel offset position
     input  wire                         i_row_par_en,   // task E: 16-wide slice mode
     input  wire [15:0]                  i_group_base,   // first output column of the 16-wide group
+    input  wire                         i_row_block_en, // #4: pack R output rows into the array
+    input  wire [15:0]                  i_group_size,   // columns per output row in the group
+    input  wire [3:0]                   i_rows_per_grp, // R: output rows packed (1 = byte-identical)
 
     // Output: one kernel-offset activation vector, replicated 16×
     output wire [ACT_BUS_W-1:0]         o_act_window,
@@ -72,11 +75,12 @@ module im2col_line_buffer #(
     reg [ACT_GROUP_W-1:0] lb_bank0 [0:MAX_WIDTH-1][0:ICG_MAX-1];
     reg [ACT_GROUP_W-1:0] lb_bank1 [0:MAX_WIDTH-1][0:ICG_MAX-1];
     reg [ACT_GROUP_W-1:0] lb_bank2 [0:MAX_WIDTH-1][0:ICG_MAX-1];
+    reg [ACT_GROUP_W-1:0] lb_bank3 [0:MAX_WIDTH-1][0:ICG_MAX-1];  // #4: 4th bank for R+2 rows
 
     reg [1:0] row_sel;
     reg [ADDR_W-1:0] wr_ptr;
     reg [ADDR_W-1:0] rd_ptr;
-    reg [1:0] valid_rows;
+    reg [2:0] valid_rows;   // #4: up to 4 (was 2 bits / max 3)
 
     // 3×3 window register matrix, one set per IC tile
     reg [ACT_GROUP_W-1:0] win [0:ICG_MAX-1][0:2][0:2];
@@ -102,6 +106,7 @@ module im2col_line_buffer #(
                     lb_bank0[init_i][init_g] <= {ACT_GROUP_W{1'b0}};
                     lb_bank1[init_i][init_g] <= {ACT_GROUP_W{1'b0}};
                     lb_bank2[init_i][init_g] <= {ACT_GROUP_W{1'b0}};
+                    lb_bank3[init_i][init_g] <= {ACT_GROUP_W{1'b0}};
                 end
         end
     end
@@ -116,6 +121,7 @@ module im2col_line_buffer #(
                 2'd0: lb_bank0[wr_ptr][i_pixel_tile] <= i_pixel_data;
                 2'd1: lb_bank1[wr_ptr][i_pixel_tile] <= i_pixel_data;
                 2'd2: lb_bank2[wr_ptr][i_pixel_tile] <= i_pixel_data;
+                2'd3: lb_bank3[wr_ptr][i_pixel_tile] <= i_pixel_data;
             endcase
         end
     end
@@ -143,9 +149,13 @@ module im2col_line_buffer #(
 
             // ---- Row start: rotate buffers, reset column ----
             if (i_row_start) begin
-                row_sel <= (row_sel == 2'd2) ? 2'd0 : row_sel + 2'd1;
-                if (valid_rows < 2'd3)
-                    valid_rows <= valid_rows + 2'd1;
+                // #4: rotate over 4 banks (R+2) when packing; else 3 (byte-identical).
+                if (i_row_block_en)
+                    row_sel <= (row_sel == 2'd3) ? 2'd0 : row_sel + 2'd1;
+                else
+                    row_sel <= (row_sel == 2'd2) ? 2'd0 : row_sel + 2'd1;
+                if (valid_rows < (i_row_block_en ? 3'd4 : 3'd3))
+                    valid_rows <= valid_rows + 3'd1;
                 wr_ptr   <= {ADDR_W{1'b0}};
                 rd_ptr   <= {ADDR_W{1'b0}};
                 cur_x    <= 16'd0;
@@ -220,7 +230,9 @@ module im2col_line_buffer #(
             // leaving a gap before the next column's advance).
             if (i_row_start)
                 win_valid <= 1'b0;
-            else if (col_complete && valid_rows >= 2'd3 && cur_x >= 16'd2)
+            // #4: row-block needs R+2 rows resident before a block's window is valid.
+            else if (col_complete && cur_x >= 16'd2 &&
+                     valid_rows >= (i_row_block_en ? 3'd4 : 3'd3))
                 win_valid <= 1'b1;
         end
     end
@@ -258,18 +270,29 @@ module im2col_line_buffer #(
     genvar gi;
     generate
         for (gi = 0; gi < ARRAY_ROWS; gi = gi + 1) begin : gen_window
+            // #4 row-block: array row gi → block b = gi/group_size (output row
+            // cur_oy+b), column-in-group c = gi%group_size. For MAX_R=2, b∈{0,1}.
+            // Block b's 3-row window is the base window shifted DOWN by b input
+            // rows, so its bank = (row_sel + b + off_row + 1) mod 4 (4-bank slide).
+            wire        rb_b = i_row_block_en && (gi[15:0] >= i_group_size);
+            wire [15:0] rb_c = rb_b ? (gi[15:0] - i_group_size) : gi[15:0];
+            wire [1:0]  rb_bank = (row_sel + {1'b0, rb_b} + off_row_dec + 2'd1); // mod-4 (2-bit wrap)
+
             // Row-par: array row gi reads input column (group_base + off_col + gi).
-            wire [15:0] rp_col = i_group_base + {14'd0, off_col_dec} + gi[15:0];
+            // Row-block overrides column to (group_base + off_col + c).
+            wire [15:0] rp_col = i_group_base + {14'd0, off_col_dec}
+                               + (i_row_block_en ? rb_c : gi[15:0]);
+            wire [1:0]  rd_bank = i_row_block_en ? rb_bank : rp_bank;
             reg  [ACT_GROUP_W-1:0] rp_val;
             always @(*) begin
                 if (rp_col >= i_width) begin
                     rp_val = {ACT_GROUP_W{1'b0}};
                 end else begin
-                    case (rp_bank)
+                    case (rd_bank)
                         2'd0: rp_val = lb_bank0[rp_col[ADDR_W-1:0]][i_win_tile];
                         2'd1: rp_val = lb_bank1[rp_col[ADDR_W-1:0]][i_win_tile];
                         2'd2: rp_val = lb_bank2[rp_col[ADDR_W-1:0]][i_win_tile];
-                        default: rp_val = {ACT_GROUP_W{1'b0}};
+                        2'd3: rp_val = lb_bank3[rp_col[ADDR_W-1:0]][i_win_tile];
                     endcase
                 end
             end
