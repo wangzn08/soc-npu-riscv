@@ -1196,4 +1196,34 @@ module npu_top #(
         .m_axi_bresp     (m_axi_bresp)
     );
 
+    // synthesis translate_off
+    // ---- #4-followup Phase 0: FSM-state cycle decomposition ----
+    // Counts where Conv5/6 (in_w==10, non-GEMM) busy goes: LOAD (im2col line-load)
+    // vs CALC (array sweep) vs DRAIN vs other. Decides if cross-OC-pass im2col
+    // reuse (cutting LOAD) actually pays off before committing.
+    integer c56_busy = 0, c56_load = 0, c56_calc = 0, c56_drain = 0;
+    integer all_busy = 0, all_load = 0, all_calc = 0, all_drain = 0;
+    wire dbg_is_c56 = (cfg_dim_in_w == 16'd10) && !cfg_gemm_en;
+    always @(posedge clk) begin
+        if (fsm_busy) begin
+            all_busy = all_busy + 1;
+            if (fsm_im2col_pixel_vld) all_load  = all_load  + 1;
+            if (fsm_array_vld)        all_calc  = all_calc  + 1;
+            if (fsm_in_drain)         all_drain = all_drain + 1;
+            if (dbg_is_c56) begin
+                c56_busy = c56_busy + 1;
+                if (fsm_im2col_pixel_vld) c56_load  = c56_load  + 1;
+                if (fsm_array_vld)        c56_calc  = c56_calc  + 1;
+                if (fsm_in_drain)         c56_drain = c56_drain + 1;
+            end
+        end
+    end
+    final begin
+        $display("FSMDBG all  : busy=%0d load=%0d calc=%0d drain=%0d",
+                 all_busy, all_load, all_calc, all_drain);
+        $display("FSMDBG c5/6 : busy=%0d load=%0d calc=%0d drain=%0d",
+                 c56_busy, c56_load, c56_calc, c56_drain);
+    end
+    // synthesis translate_on
+
 endmodule

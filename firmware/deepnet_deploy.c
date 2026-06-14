@@ -44,7 +44,8 @@ static inline uint32_t rdcycle32(void) {
 static uint32_t prof_pad, prof_load, prof_npu, prof_reorder,
                 prof_affine, prof_argmax, prof_infer, prof_preload;
 static uint32_t prof_fc1;   // Phase 0: FC1 GEMM alone (excl. CPU FC2)
-static uint32_t prof_npu_layer[6];   // per-conv NPU time
+static uint32_t prof_npu_layer[6];   // per-conv NPU time (incl MMIO config + copy/DMA)
+static uint32_t prof_busy_layer[6];  // #4 Phase 0: per-conv NPU-busy (IRQ-wait) only
 static int      prof_conv_idx;       // reset to 0 at each image
 #define PROF_T0()       uint32_t _pt = rdcycle32()
 #define PROF_ADD(acc)   do { (acc) += rdcycle32() - _pt; } while (0)
@@ -476,9 +477,15 @@ static void npu_conv_pass(
 #endif
 
         // Wait for this pass's NPU compute to finish (irq.c sets npu_irq_flag).
+#if NPU_PROFILE
+        uint32_t _busy0 = rdcycle32();
+#endif
         int t = NPU_IRQ_TIMEOUT;
         while (t-- > 0)
             if (npu_irq_flag) break;
+#if NPU_PROFILE
+        if (prof_conv_idx < 6) prof_busy_layer[prof_conv_idx] += rdcycle32() - _busy0;
+#endif
         if (t <= 0) print_str("  NPU IRQ timeout!\n");
         if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_RD_ERR) print_str("  NPU DMA rd err!\n");
         if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_WR_ERR) print_str("  NPU DMA wr err!\n");
@@ -1023,10 +1030,11 @@ void usercode7(void)
     print_str("    fc1(gemm): "); print_dec(prof_fc1);
     print_str(" total /img "); print_dec(prof_fc1 / 10); print_chr('\n');
     print_str("argmax     : "); print_dec(prof_argmax);  print_chr('\n');
-    print_str("npu_per_layer (Conv1..Conv6):\n");
+    print_str("npu_per_layer (total / busy=IRQ-wait):\n");
     for (int i = 0; i < 6; i++) {
         print_str("  Conv"); print_dec((uint32_t)(i + 1));
-        print_str(": "); print_dec(prof_npu_layer[i]); print_chr('\n');
+        print_str(": "); print_dec(prof_npu_layer[i]);
+        print_str(" busy "); print_dec(prof_busy_layer[i]); print_chr('\n');
     }
     print_str("=======================================\n");
 #endif
