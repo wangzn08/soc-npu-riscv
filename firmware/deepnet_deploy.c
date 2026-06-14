@@ -625,7 +625,8 @@ static void preload_fc_weights(void)
 static void npu_gemm_pass(int in_dim, int out_dim, int scale_mul_val,
                           const int32_t *biases, int relu_en,
                           uint32_t in_ddr, uint32_t out_ddr, int wgt_base,
-                          int in_resident)  // 1: input already in Act PONG (decision L), skip DMA
+                          int in_resident,  // 1: input already in Act PONG (decision L), skip DMA
+                          int reduce)       // 1: GEMM 16-row IC-reduction (decision M)
 {
     int icg        = (in_dim + 15) / 16;
     int oc_passes  = (out_dim + 15) / 16;
@@ -658,7 +659,8 @@ static void npu_gemm_pass(int in_dim, int out_dim, int scale_mul_val,
 
         npu_irq_flag = 0;
         npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_PING_PONG | NPU_CTRL_GEMM_EN |
-                         (relu_en ? NPU_CTRL_RELU_EN : 0));
+                         (relu_en ? NPU_CTRL_RELU_EN : 0) |
+                         (reduce  ? NPU_CTRL_GEMM_REDUCE : 0));
         int t = NPU_IRQ_TIMEOUT;
         while (t-- > 0)
             if (npu_irq_flag) break;
@@ -866,7 +868,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
         { uint32_t _fc1 = rdcycle32();
 #endif
         npu_gemm_pass(AFFINE1_IN, AFFINE1_OUT, SCALE_AFFINE1, affine1_b, 1,
-                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1);
+                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1, 1);
 #if NPU_PROFILE
           prof_fc1 += rdcycle32() - _fc1; }
 #endif
@@ -895,7 +897,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     {
         // NPU FC1 vs CPU affine1 — must be bit-identical (same quant path).
         npu_gemm_pass(AFFINE1_IN, AFFINE1_OUT, SCALE_AFFINE1, affine1_b, 1,
-                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1);
+                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1, 1);
         volatile int8_t *nf = (volatile int8_t *)FC1_OUT_DDR;
         int mism = 0;
         for (int i = 0; i < AFFINE1_OUT; i++)
@@ -908,7 +910,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
         // 50..63 are exact 0 from padded weights). Scores are INT8-clamped; the
         // ship criterion is argmax(NPU int8) == argmax(CPU int32) for every image.
         npu_gemm_pass(AFFINE2_IN, AFFINE2_OUT, SCALE_AFFINE2, affine2_b, 0,
-                      FC1_OUT_DDR, FC2_OUT_DDR, FC2_WGT_BASE, 0);
+                      FC1_OUT_DDR, FC2_OUT_DDR, FC2_WGT_BASE, 0, 0);
         volatile int8_t *ns = (volatile int8_t *)FC2_OUT_DDR;
         int nbest = 0, cbest = 0;
         for (int i = 1; i < AFFINE2_OUT; i++) {

@@ -503,9 +503,11 @@ module top_controller_fsm #(
                 // DRAIN: Shift partial sums out (16 cycles)
                 // -------------------------------------------------------
                 S_DRAIN: begin
-                    if (reduce || drain_cnt == 5'd15) begin
-                        // Reduce: the combinational column sum is valid this single
-                        // drain cycle (one pp_input_vld) → straight to POST.
+                    // Reduce drains 16 cycles too: the combinational column sum is
+                    // stable while psum_shift holds, so post_process sees 16 identical
+                    // valids — same pipeline-fill timing as legacy GEMM (which the
+                    // S_POST write path relies on; a single valid mis-times the write).
+                    if (drain_cnt == 5'd15) begin
                         drain_cnt <= 5'd0;
                         state <= S_POST;
                     end else begin
