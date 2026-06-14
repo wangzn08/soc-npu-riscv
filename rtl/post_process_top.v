@@ -45,6 +45,7 @@ module post_process_top #(
     // row-major and replay group_size pixels into the pooler.
     input  wire                             i_row_par_en,
     input  wire [15:0]                      i_group_size,
+    input  wire [3:0]                       i_rows_per_grp,   // #4: R rows packed (1 = byte-identical)
     output wire                             o_rp_pool_done,   // replay complete (FSM advance)
 
     // Output feature data
@@ -198,6 +199,7 @@ module post_process_top #(
     reg              rp_in_drain_d;
     reg [4:0]        rp_play_cnt;
     reg              rp_play_active;
+    wire [19:0]      rp_play_total = i_group_size * {16'd0, i_rows_per_grp}; // R*group_size pixels
     reg [DATA_W-1:0] rp_play_data;
     reg              rp_play_vld;
     reg              rp_play_done_r;
@@ -235,7 +237,9 @@ module post_process_top #(
             end else if (rp_play_active) begin
                 rp_play_data <= rp_buf[rp_play_cnt];
                 rp_play_vld  <= 1'b1;
-                if (rp_play_cnt == i_group_size[4:0] - 5'd1) begin
+                // #4 row-block: replay R*group_size pixels (R rows row-major:
+                // rp_buf[r] index = b*group_size+c = r). R=1 → group_size (legacy).
+                if (rp_play_cnt == rp_play_total[4:0] - 5'd1) begin
                     rp_play_active <= 1'b0;
                     rp_play_done_r <= 1'b1;
                 end

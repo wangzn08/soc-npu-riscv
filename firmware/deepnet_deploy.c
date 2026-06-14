@@ -461,10 +461,11 @@ static void npu_conv_pass(
         // Start NPU: relu_en=1, Out write bank = out_bank (CTRL[6]).
         // The CTRL write also clears any stale NPU-done latch from a prior pass.
         npu_irq_flag = 0;
-        // #4 row-block packing: auto-engage on narrow non-pool layers (out_w==8 →
-        // R=2). Conv5 qualifies; Conv6 (pool) excluded until the pool path lands.
+        // #4 row-block packing: auto-engage on narrow layers (out_w==8 → R=2).
+        // Conv5 (non-pool) and Conv6 (pool) both qualify; R=2 aligns with the 2×2
+        // pool row-pair so the pooler replays both rows in one drain.
         int rb_out_w  = (in_w - kw) / sx + 1;
-        int row_block = row_par && (rb_out_w == 8) && !pool_en;
+        int row_block = row_par && (rb_out_w == 8);
         npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_RELU_EN |
                          (pool_en ? NPU_CTRL_POOL_EN : 0) |
                          (out_bank ? NPU_CTRL_OUT_PING : 0) |
