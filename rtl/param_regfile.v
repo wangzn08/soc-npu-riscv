@@ -91,6 +91,7 @@ module param_regfile #(
     output wire                         o_int32_out,     // CTRL[13]: raw INT32 output (decision Q, final FC)
     output wire [7:0]                   o_pad_w,         // NPU_PAD[7:0]: zero-pad columns each side
     output wire [7:0]                   o_pad_h,         // NPU_PAD[15:8]: zero-pad rows each side
+    output wire [7:0]                   o_clip_max,      // NPU_CLIP_MAX (0x118): post-process upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
 
     // Status
     input  wire                         i_done_irq,
@@ -198,6 +199,7 @@ module param_regfile #(
     reg        ctrl_oc_single;   // CTRL[12]: all-OC-tiles in one start (decision O)
     reg        ctrl_int32_out;   // CTRL[13]: raw INT32 output (decision Q)
     reg [15:0] pad_cfg;         // NPU_PAD: {pad_h[15:8], pad_w[7:0]}
+    reg [7:0]  clip_max;        // NPU_CLIP_MAX: post-process upper clamp value
 
     // Status
     wire       status_done;
@@ -315,6 +317,7 @@ module param_regfile #(
             ctrl_oc_single   <= 1'b0;   // oc-single off by default
             ctrl_int32_out   <= 1'b0;   // int32 raw output off by default
             pad_cfg         <= 16'd0;
+            clip_max        <= 8'd127;   // default = legacy ReLU clamp [0,127]
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
             act_addr_pong   <= {SRAM_ADDR_W{1'b0}};
             wgt_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -452,6 +455,7 @@ module param_regfile #(
                     10'h10C: out_y_base  <= s_axi_wdata[15:0];
                     10'h110: total_ops_h <= s_axi_wdata[15:0];
                     10'h114: total_ops_w <= s_axi_wdata[15:0];
+                    10'h118: clip_max    <= s_axi_wdata[7:0];   // NPU_CLIP_MAX
 
                     // DMA control registers (0x120-0x13C)
                     10'h120: dma_rd_req_d     <= 1'b1;  // Write triggers DMA read pulse
@@ -585,6 +589,7 @@ module param_regfile #(
                     10'h10C: rdata <= {16'd0, out_y_base};
                     10'h110: rdata <= {16'd0, total_ops_h};
                     10'h114: rdata <= {16'd0, total_ops_w};
+                    10'h118: rdata <= {24'd0, clip_max};
 
                     // DMA status (0x140, read-only)
                     10'h140: rdata <= {28'd0, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
@@ -646,6 +651,7 @@ module param_regfile #(
     assign o_int32_out    = ctrl_int32_out;
     assign o_pad_w        = pad_cfg[7:0];
     assign o_pad_h        = pad_cfg[15:8];
+    assign o_clip_max     = clip_max;
     assign o_clear_done   = ctrl_clear_done;
 
     assign o_act_addr_ping = act_addr_ping;

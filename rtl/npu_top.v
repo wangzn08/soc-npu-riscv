@@ -124,6 +124,7 @@ module npu_top #(
     wire                            cfg_eltwise_en;
     wire                            cfg_clear_done;
     wire                            cfg_relu_en;
+    wire [7:0]                      cfg_clip_max;
     wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
@@ -289,6 +290,7 @@ module npu_top #(
         .o_int32_out      (cfg_int32_out),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
+        .o_clip_max       (cfg_clip_max),
         .i_done_irq       (status_done_irq),
         .i_busy           (status_busy),
         .i_dma_rd_err     (dma_rd_err),
@@ -898,6 +900,7 @@ module npu_top #(
         .i_width       (conv_out_w),
         .i_pool_en     (cfg_pool_en),
         .i_relu_en     (cfg_relu_en),
+        .i_clip_max    (cfg_clip_max),
         .i_in_drain    (fsm_in_drain),
         .i_in_post     (fsm_in_post),
         .i_row_par_en  (cfg_row_par_en),
