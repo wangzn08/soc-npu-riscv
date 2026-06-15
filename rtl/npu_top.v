@@ -125,6 +125,7 @@ module npu_top #(
     wire                            cfg_clear_done;
     wire                            cfg_relu_en;
     wire [7:0]                      cfg_clip_max;
+    wire                            cfg_pool_avg;
     wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
@@ -288,6 +289,7 @@ module npu_top #(
         .o_row_block_en   (cfg_row_block_en),
         .o_oc_single      (cfg_oc_single),
         .o_int32_out      (cfg_int32_out),
+        .o_pool_avg       (cfg_pool_avg),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
         .o_clip_max       (cfg_clip_max),
@@ -899,6 +901,7 @@ module npu_top #(
         .i_scale_shift (cfg_scale_shift),
         .i_width       (conv_out_w),
         .i_pool_en     (cfg_pool_en),
+        .i_pool_avg    (cfg_pool_avg),
         .i_relu_en     (cfg_relu_en),
         .i_clip_max    (cfg_clip_max),
         .i_in_drain    (fsm_in_drain),

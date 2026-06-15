@@ -89,6 +89,7 @@ module param_regfile #(
     output wire                         o_row_block_en,  // CTRL[11]: row-block packing for narrow layers (#4)
     output wire                         o_oc_single,     // CTRL[12]: all-OC-tiles in one start (decision O / Level 2)
     output wire                         o_int32_out,     // CTRL[13]: raw INT32 output (decision Q, final FC)
+    output wire                         o_pool_avg,      // CTRL[16]: 2x2 average pooling (vs max)
     output wire [7:0]                   o_pad_w,         // NPU_PAD[7:0]: zero-pad columns each side
     output wire [7:0]                   o_pad_h,         // NPU_PAD[15:8]: zero-pad rows each side
     output wire [7:0]                   o_clip_max,      // NPU_CLIP_MAX (0x118): post-process upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
@@ -198,6 +199,7 @@ module param_regfile #(
     reg        ctrl_row_block;   // CTRL[11]: row-block packing (#4)
     reg        ctrl_oc_single;   // CTRL[12]: all-OC-tiles in one start (decision O)
     reg        ctrl_int32_out;   // CTRL[13]: raw INT32 output (decision Q)
+    reg        ctrl_pool_avg;    // CTRL[16]: 2x2 average pooling (vs max)
     reg [15:0] pad_cfg;         // NPU_PAD: {pad_h[15:8], pad_w[7:0]}
     reg [7:0]  clip_max;        // NPU_CLIP_MAX: post-process upper clamp value
 
@@ -316,6 +318,7 @@ module param_regfile #(
             ctrl_row_block   <= 1'b0;   // row-block packing off by default
             ctrl_oc_single   <= 1'b0;   // oc-single off by default
             ctrl_int32_out   <= 1'b0;   // int32 raw output off by default
+            ctrl_pool_avg    <= 1'b0;   // average pooling off by default (max)
             pad_cfg         <= 16'd0;
             clip_max        <= 8'd127;   // default = legacy ReLU clamp [0,127]
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -395,6 +398,7 @@ module param_regfile #(
                         ctrl_row_block   <= s_axi_wdata[11];
                         ctrl_oc_single   <= s_axi_wdata[12];
                         ctrl_int32_out   <= s_axi_wdata[13];
+                        ctrl_pool_avg    <= s_axi_wdata[16];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -544,7 +548,7 @@ module param_regfile #(
             if (s_axi_arvalid && s_axi_arready && !rvalid) begin
                 rvalid <= 1'b1;
                 case (s_axi_araddr[ADDR_W-1:0])
-                    10'h00: rdata <= {18'd0, ctrl_int32_out, ctrl_oc_single, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
+                    10'h00: rdata <= {15'd0, ctrl_pool_avg, 2'd0, ctrl_int32_out, ctrl_oc_single, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
                     10'h04: rdata <= {28'd0, i_dma_wr_err, i_dma_rd_err, i_busy, done_irq_latched};
                     10'h08: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_ping};
                     10'h0C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_pong};
@@ -649,6 +653,7 @@ module param_regfile #(
     assign o_row_block_en = ctrl_row_block;
     assign o_oc_single    = ctrl_oc_single;
     assign o_int32_out    = ctrl_int32_out;
+    assign o_pool_avg     = ctrl_pool_avg;
     assign o_pad_w        = pad_cfg[7:0];
     assign o_pad_h        = pad_cfg[15:8];
     assign o_clip_max     = clip_max;

@@ -33,6 +33,7 @@ module post_process_top #(
     // Feature map geometry (for pooling)
     input  wire [15:0]                      i_width,
     input  wire                             i_pool_en,
+    input  wire                             i_pool_avg,   // 0=max pool (legacy), 1=2x2 average pool
     input  wire                             i_relu_en,
     input  wire [7:0]                       i_clip_max,   // upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
 
@@ -283,6 +284,7 @@ module post_process_top #(
         .i_feat      (pool_feat_in),
         .i_feat_vld  (pool_feat_vld_in),
         .i_width     (i_width),
+        .i_avg       (i_pool_avg),  // CTRL[16]: 2x2 average vs max
         .i_tile      (i_oc_tile),   // decision P: active OC-tile (oc_single OC-inner loop)
         .o_pool      (pool_out),
         .o_pool_vld  (pool_vld),
