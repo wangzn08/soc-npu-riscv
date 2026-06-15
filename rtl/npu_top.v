@@ -132,8 +132,8 @@ module npu_top #(
     wire                            cfg_row_block_en;   // CTRL[11]: row-block packing (#4)
     wire                            cfg_oc_single;      // CTRL[12]: all-OC in one start (decision O)
     wire [2:0]                      cfg_oc_tiles_total; // #16-OC tiles (1..4), assigned below
-    wire [2:0]                      fsm_wgt_oc_tile_sel; // active OC-tile during CALC (oc_single)
-    assign fsm_wgt_oc_tile_sel = 3'd0;  // step 3: dormant; FSM drives this in step 4
+    wire [2:0]                      fsm_oc_tile_sel;     // active OC-tile from FSM (oc_single OC-inner loop)
+    wire [2:0]                      fsm_wgt_oc_tile_sel = fsm_oc_tile_sel;
     wire [3:0]                       fsm_rows_per_grp;   // #4: R output rows packed
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
@@ -284,6 +284,7 @@ module npu_top #(
         .o_stride_sy      (cfg_sy),
         .o_bias_addr      (cfg_bias_addr),
         .o_scale_addr     (cfg_scale_addr),
+        .i_oc_tile_sel    (fsm_oc_tile_sel),
         .o_bias_val       (cfg_bias_val),
         .o_scale_mul      (cfg_scale_mul),
         .o_scale_shift    (cfg_scale_shift),
@@ -538,6 +539,8 @@ module npu_top #(
         .i_row_par_en         (cfg_row_par_en),
         .i_gemm_reduce        (cfg_gemm_reduce),
         .i_row_block_en       (cfg_row_block_en),
+        .i_oc_single          (cfg_oc_single),
+        .o_oc_tile_sel        (fsm_oc_tile_sel),
         .o_rows_per_grp       (fsm_rows_per_grp),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
         .o_im2col_group_base  (fsm_im2col_group_base),

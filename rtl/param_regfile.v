@@ -120,7 +120,11 @@ module param_regfile #(
     output wire [31:0]                  o_bias_addr,
     output wire [31:0]                  o_scale_addr,
 
-    // Per-OC bias / scale (immediate values)
+    // Active OC-tile selector (decision O): selects which 16-OC window of the
+    // resident 64-entry bias/scale/shift is presented. 0 ⇒ legacy low-16 window.
+    input  wire [2:0]                        i_oc_tile_sel,
+
+    // Per-OC bias / scale (immediate values, the active OC-tile's 16 channels)
     output wire [NUM_OC-1:0][PSUM_WIDTH-1:0] o_bias_val,
     output wire [NUM_OC-1:0][31:0]           o_scale_mul,
     output wire [NUM_OC-1:0][5:0]            o_scale_shift,
@@ -617,11 +621,12 @@ module param_regfile #(
     assign o_bias_addr  = bias_addr;
     assign o_scale_addr = scale_addr;
 
-    // Dormant (decision O step 2): output the low NUM_OC window; the active-OC-tile
-    // mux is added with the FSM oc_single loop (step 4).
-    assign o_bias_val    = bias_val[NUM_OC-1:0];
-    assign o_scale_mul   = scale_mul[NUM_OC-1:0];
-    assign o_scale_shift = scale_shift[NUM_OC-1:0];
+    // Decision O: present the active OC-tile's NUM_OC-wide window (base = tile*16).
+    // i_oc_tile_sel==0 ⇒ low-16 window ⇒ byte-identical to legacy.
+    wire [6:0] oc_win_base = {i_oc_tile_sel, 4'd0};
+    assign o_bias_val    = bias_val[oc_win_base +: NUM_OC];
+    assign o_scale_mul   = scale_mul[oc_win_base +: NUM_OC];
+    assign o_scale_shift = scale_shift[oc_win_base +: NUM_OC];
 
     assign o_act_ic_tile = act_ic_tile;
     assign o_act_oc_tile = act_oc_tile;

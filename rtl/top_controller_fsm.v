@@ -32,6 +32,7 @@ module top_controller_fsm #(
     input  wire                     i_row_par_en,   // 16-row spatial parallelism (task E)
     input  wire                     i_gemm_reduce,  // GEMM 16-row IC-reduction (decision M)
     input  wire                     i_row_block_en, // #4: row-block packing for narrow layers
+    input  wire                     i_oc_single,    // decision O: all OC-tiles in one start (OC-inner loop)
     input  wire [7:0]               i_pad_w,        // zero-pad columns each side
     input  wire [7:0]               i_pad_h,        // zero-pad rows each side
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_ping,
@@ -114,7 +115,10 @@ module top_controller_fsm #(
     output wire [9:0]               o_cur_ic_tile,
     output wire [9:0]               o_cur_oc_tile,
     output wire [15:0]              o_cur_ox,
-    output wire [15:0]              o_cur_oy
+    output wire [15:0]              o_cur_oy,
+
+    // === Decision O: active OC-tile selector (oc_single OC-inner loop) ===
+    output wire [2:0]               o_oc_tile_sel   // 0 when oc_single off (byte-identical)
 );
 
     // -------------------------------------------------------------------
@@ -162,6 +166,7 @@ module top_controller_fsm #(
     reg [15:0] row_base_in_row; // Starting cur_in_row for current output row
     reg [3:0]  load_tile;     // Current IC tile being streamed within a column (0..ic_groups-1)
     reg        wgt_loaded;    // 1 = this OC tile's weights are resident in wgt_buf (reuse mode)
+    reg [2:0]  oc_t;          // decision O: active OC-tile in the oc_single OC-inner loop
 
     // GEMM-reduce (decision M)
     reg [3:0]  super_step;    // current super-step (each = 16 IC-tiles across 16 rows)
@@ -317,10 +322,15 @@ module top_controller_fsm #(
     assign o_group_size = group_size;
     assign o_group_base = cur_ox;
 
+    // Active OC-tile index: oc_single uses the inner loop counter oc_t; otherwise
+    // the outer oc_tile (0,16,32→idx 0,1,2). 0 when oc_single off ⇒ byte-identical.
+    wire [5:0] active_oc_idx = i_oc_single ? {3'd0, oc_t} : oc_tile[9:4];
+    assign o_oc_tile_sel = active_oc_idx[2:0];
+
     // Out SRAM write — include OC tile offset so tiles don't overwrite each other
     wire [SRAM_ADDR_W-1:0] out_wr_addr_calc;
     assign out_wr_addr_calc = out_base_addr
-                            + oc_tile[9:4] * out_spatial_size
+                            + active_oc_idx * out_spatial_size
                             + cur_oy * out_row_stride
                             + cur_ox;
     assign o_out_wr_addr = out_wr_addr_calc;
@@ -359,6 +369,7 @@ module top_controller_fsm #(
             row_base_in_row <= 16'd0;
             load_tile    <= 4'd0;
             wgt_loaded   <= 1'b0;
+            oc_t         <= 3'd0;
             super_step   <= 4'd0;
             aload_cnt    <= 5'd0;
             plane_trig_r <= 1'b0;
@@ -395,6 +406,7 @@ module top_controller_fsm #(
                         row_base_in_row <= 16'd0;
                         load_tile  <= 4'd0;
                         wgt_loaded <= 1'b0;   // force first prefetch of this layer
+                        oc_t       <= 3'd0;   // decision O: start OC-inner loop at tile 0
                         super_step <= 4'd0;
                         aload_cnt  <= 5'd0;
                         // GEMM-reduce bypasses im2col AND the per-k-step GEMM loop;
@@ -537,7 +549,19 @@ module top_controller_fsm #(
                     if (i_pp_done) begin
                         // All IC tiles already accumulated in CALC_KERNEL
                         ic_tile <= 16'd0;
-                        state   <= S_NEXT_TILE;
+                        // Decision O: OC-inner loop. If more OC tiles remain for this
+                        // spatial group, advance oc_t and re-run CALC against the SAME
+                        // (frozen) im2col window with the next tile's resident weights —
+                        // no spatial advance, no window advance, no re-prefetch. Reuse
+                        // the proven PREFETCH_WGT settle path (reuse_mode+wgt_loaded).
+                        if (i_oc_single && ({13'd0, oc_t} + 16'd1 < oc_tiles_total)) begin
+                            oc_t        <= oc_t + 3'd1;
+                            pf_wait_cnt <= 16'd0;
+                            state       <= S_PREFETCH_WGT;
+                        end else begin
+                            oc_t    <= 3'd0;   // restart OC-inner loop for the next group
+                            state   <= S_NEXT_TILE;
+                        end
                     end
                 end
 
@@ -568,8 +592,10 @@ module top_controller_fsm #(
                         cur_oy <= 16'd0;
                         cur_in_col <= 16'd0;
                         cur_in_row <= 16'd0;
-                        if (oc_tile + 16'd16 < i_dim_out_c) begin
-                            // Next OC tile
+                        // Decision O: in oc_single ALL OC tiles are computed per group
+                        // (OC-inner), so spatial exhaustion means the layer is done.
+                        if (!i_oc_single && oc_tile + 16'd16 < i_dim_out_c) begin
+                            // Next OC tile (legacy multi-start path)
                             oc_tile <= oc_tile + 16'd16;
                             wgt_loaded <= 1'b0;   // new OC tile → re-prefetch its weights
                             state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
