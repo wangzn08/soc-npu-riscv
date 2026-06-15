@@ -70,10 +70,4 @@ module sram_copy #(
     assign o_act_wr_data = i_out_rd_data;   // combinational Out read -> Act write (same cycle)
     assign o_busy        = busy;
 
-    // synthesis translate_off
-    always @(posedge clk) begin
-        if (active && dst_q == 14'd1024 && i_out_rd_data != {DATA_W{1'b0}} && cnt < 16'd400)
-            $display("CPY1_NZ cnt=%0d rd_addr=%0d wr_addr=%0d data_lo=%08h", cnt, o_out_rd_addr, o_act_wr_addr, i_out_rd_data[31:0]);
-    end
-    // synthesis translate_on
 endmodule

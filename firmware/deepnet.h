@@ -71,6 +71,6 @@
 // Main inference function
 // Input: 784 int8 values (28x28 image)
 // Output: 10 int32 values (raw scores)
-void deepnet_inference(const int8_t *input, int32_t *output);
+void deepnet_inference(const int8_t *input, int32_t *output, int img_idx);
 
 #endif

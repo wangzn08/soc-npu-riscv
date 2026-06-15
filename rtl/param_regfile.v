@@ -169,8 +169,14 @@ module param_regfile #(
     input  wire                         i_copy_done,        // copy engine: completion (level), exposed in STATUS[2]
     output wire                         o_expand_trig,      // 0x158 write: pulse to start img_expand
     input  wire                         i_expand_done,      // img_expand: completion (level), exposed in STATUS[3]
-    output wire                         o_transpose_trig,   // 0x15C write: pulse to start Conv6->FC transpose
-    input  wire                         i_transpose_done    // transpose engine: completion (level), STATUS[4]
+
+    // Performance counter event strobes (asserted for 1 cycle per event)
+    input  wire                         i_perf_busy,        // NPU FSM busy
+    input  wire                         i_perf_arr_active,  // systolic array accumulating (MAC cycle)
+    input  wire                         i_perf_rd_beat,     // AXI read data beat
+    input  wire                         i_perf_wr_beat,     // AXI write data beat
+    input  wire                         i_perf_rd_busy,     // AXI read burst outstanding
+    input  wire                         i_perf_wr_busy      // AXI read/write burst outstanding
 );
 
     // -------------------------------------------------------------------
@@ -248,7 +254,6 @@ module param_regfile #(
     reg        dma_wr_req_d;   // 1-cycle delayed pulse for DMA write request
     reg        copy_trig_d;    // 1-cycle delayed pulse for on-chip Out->Act copy trigger
     reg        expand_trig_d;  // 1-cycle delayed pulse for img_expand trigger
-    reg        transpose_trig_d; // 1-cycle delayed pulse for Conv6->FC transpose trigger
     reg        dma_sram_sel;   // 0=Act SRAM, 1=Wgt SRAM for DMA write target
     reg        dma_out_rd_sel; // 0=skip path owns Out SRAM Port B, 1=DMA owns it
     reg [1:0]  dma_rd_sram_sel; // 0=Out SRAM, 1=Act SRAM, 2=Wgt SRAM for DMA read source
@@ -342,7 +347,6 @@ module param_regfile #(
             dma_wr_req_d     <= 1'b0;
             copy_trig_d      <= 1'b0;
             expand_trig_d    <= 1'b0;
-            transpose_trig_d <= 1'b0;
             dma_sram_sel     <= 1'b0;
             dma_out_rd_sel   <= 1'b0;
             dma_rd_sram_sel  <= 2'd0;
@@ -364,7 +368,6 @@ module param_regfile #(
             dma_wr_req_d <= 1'b0;
             copy_trig_d  <= 1'b0;
             expand_trig_d <= 1'b0;
-            transpose_trig_d <= 1'b0;
 
             if (wr_en) begin
                 // synthesis translate_off
@@ -472,7 +475,6 @@ module param_regfile #(
                     10'h150: pad_cfg <= s_axi_wdata[15:0];  // {pad_h, pad_w}
                     10'h154: copy_trig_d <= 1'b1;            // trigger on-chip Out->Act copy
                     10'h158: expand_trig_d <= 1'b1;          // trigger img_expand
-                    10'h15C: transpose_trig_d <= 1'b1;       // trigger Conv6->FC transpose
 
                     default: ; // Ignore unmapped addresses
                 endcase
@@ -488,6 +490,37 @@ module param_regfile #(
                 else if (word_addr >= 10'h2E0 && word_addr <= 10'h39C)
                     scale_shift[((word_addr - 10'h2E0) >> 2) + 6'd16] <= s_axi_wdata[5:0];
             end
+        end
+    end
+
+    // -------------------------------------------------------------------
+    // Performance counters — read at 0x3A4+, cleared by a write to 0x3A0.
+    // (Relocated above the resident bias/scale/shift region 0x160..0x39C that
+    //  decision O added; the old 0x200 location now overlaps resident bias.)
+    //   cyc_total : free-running time base since clear
+    //   cyc_busy  : NPU FSM busy cycles
+    //   cyc_arr   : systolic-array MAC cycles      -> array util & effective TOPS
+    //   rd/wr_beats: AXI data beats                -> data volume
+    //   rd/wr_busy : cycles a burst is outstanding -> bandwidth util = beats/busy
+    // -------------------------------------------------------------------
+    wire perf_clr = wr_en && (word_addr == 10'h3A0);
+
+    reg [31:0] perf_cyc_total, perf_cyc_busy, perf_cyc_arr;
+    reg [31:0] perf_rd_beats, perf_wr_beats, perf_rd_busy, perf_wr_busy;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n || perf_clr) begin
+            perf_cyc_total <= 32'd0; perf_cyc_busy <= 32'd0; perf_cyc_arr <= 32'd0;
+            perf_rd_beats  <= 32'd0; perf_wr_beats <= 32'd0;
+            perf_rd_busy   <= 32'd0; perf_wr_busy  <= 32'd0;
+        end else begin
+            perf_cyc_total <= perf_cyc_total + 32'd1;
+            if (i_perf_busy)       perf_cyc_busy <= perf_cyc_busy + 32'd1;
+            if (i_perf_arr_active) perf_cyc_arr  <= perf_cyc_arr  + 32'd1;
+            if (i_perf_rd_beat)    perf_rd_beats <= perf_rd_beats + 32'd1;
+            if (i_perf_wr_beat)    perf_wr_beats <= perf_wr_beats + 32'd1;
+            if (i_perf_rd_busy)    perf_rd_busy  <= perf_rd_busy  + 32'd1;
+            if (i_perf_wr_busy)    perf_wr_busy  <= perf_wr_busy  + 32'd1;
         end
     end
 
@@ -554,7 +587,7 @@ module param_regfile #(
                     10'h114: rdata <= {16'd0, total_ops_w};
 
                     // DMA status (0x140, read-only)
-                    10'h140: rdata <= {27'd0, i_transpose_done, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
+                    10'h140: rdata <= {28'd0, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
 
                     // DMA register readback (0x124-0x13C)
                     10'h124: rdata <= dma_rd_ddr_addr;
@@ -577,6 +610,14 @@ module param_regfile #(
                     rdata <= scale_mul[((s_axi_araddr[ADDR_W-1:0] - 10'h220) >> 2) + 6'd16];
                 else if (s_axi_araddr[ADDR_W-1:0] >= 10'h2E0 && s_axi_araddr[ADDR_W-1:0] <= 10'h39C)
                     rdata <= {26'd0, scale_shift[((s_axi_araddr[ADDR_W-1:0] - 10'h2E0) >> 2) + 6'd16]};
+                // Performance counters (relocated to 0x3A4..0x3BC, above resident params)
+                else if (s_axi_araddr[ADDR_W-1:0] == 10'h3A4) rdata <= perf_cyc_total;
+                else if (s_axi_araddr[ADDR_W-1:0] == 10'h3A8) rdata <= perf_cyc_busy;
+                else if (s_axi_araddr[ADDR_W-1:0] == 10'h3AC) rdata <= perf_cyc_arr;
+                else if (s_axi_araddr[ADDR_W-1:0] == 10'h3B0) rdata <= perf_rd_beats;
+                else if (s_axi_araddr[ADDR_W-1:0] == 10'h3B4) rdata <= perf_wr_beats;
+                else if (s_axi_araddr[ADDR_W-1:0] == 10'h3B8) rdata <= perf_rd_busy;
+                else if (s_axi_araddr[ADDR_W-1:0] == 10'h3BC) rdata <= perf_wr_busy;
             end else if (s_axi_rready && rvalid) begin
                 rvalid <= 1'b0;
             end
@@ -658,6 +699,5 @@ module param_regfile #(
     assign o_dma_out_ping_sel = dma_out_ping_sel;
     assign o_copy_trig        = copy_trig_d;
     assign o_expand_trig      = expand_trig_d;
-    assign o_transpose_trig   = transpose_trig_d;
 
 endmodule

@@ -519,10 +519,27 @@
 
 	        // Initialize shared memory to 0 to prevent x propagation
 	        integer bram_init_i;
-	        initial begin
-	            for (bram_init_i = 0; bram_init_i <= (1<<(OPT_MEM_ADDR_BITS+1))-1; bram_init_i = bram_init_i + 1)
-	                byte_ram[bram_init_i] = 8'h0;
-	        end
+        // One-time weight preload: model flash/DDR-resident packed weights so the
+        // CPU does not pack them byte-by-byte. 8768 128-bit words at DDR word base
+        // 0x10000 (CPU addr 0x4010_0000); lane k of each word -> this byte lane.
+        reg [127:0] wgt_pre [0:8767];
+        integer wpi;
+        // RAW byte-packed input images (camera model): 10 x 49 = 490 128-bit words
+        // at DDR word base 0x14000 (CPU addr 0x4014_0000); lane k -> this byte lane.
+        // HW img_expand expands them into the tile-major Conv1 input in SRAM at
+        // runtime (see deepnet_deploy.c / gen_act_hex.py).
+        reg [127:0] act_pre [0:489];
+        integer api;
+        initial begin
+            for (bram_init_i = 0; bram_init_i <= (1<<(OPT_MEM_ADDR_BITS+1))-1; bram_init_i = bram_init_i + 1)
+                byte_ram[bram_init_i] = 8'h0;
+            $readmemh("firmware/weights_ddr.hex", wgt_pre);
+            for (wpi = 0; wpi < 8768; wpi = wpi + 1)
+                byte_ram[65536 + wpi] = wgt_pre[wpi][mem_byte_index*8 +: 8];
+            $readmemh("firmware/act_ddr.hex", act_pre);
+            for (api = 0; api < 490; api = api + 1)
+                byte_ram[81920 + api] = act_pre[api][mem_byte_index*8 +: 8];
+        end
 	     
 	        assign data_in  = S_AXI_WDATA[(mem_byte_index*8+7) -: 8];
 	        // 🌟 读端口：独立使用 mem_rd_address
