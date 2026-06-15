@@ -274,6 +274,7 @@ module post_process_top #(
         .i_feat      (pool_feat_in),
         .i_feat_vld  (pool_feat_vld_in),
         .i_width     (i_width),
+        .i_tile      (2'd0),     // P1: dormant; routed to oc_t in P2
         .o_pool      (pool_out),
         .o_pool_vld  (pool_vld)
     );
