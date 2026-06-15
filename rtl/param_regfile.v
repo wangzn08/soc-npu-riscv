@@ -37,6 +37,7 @@
 
 module param_regfile #(
     parameter NUM_OC        = 16,
+    parameter MAX_OC_RESIDENT = 64,   // decision O: all-OC-resident bias/scale/shift capacity
     parameter ADDR_W        = 10,
     parameter DATA_W        = 32,
     parameter PSUM_WIDTH    = 32,
@@ -214,10 +215,11 @@ module param_regfile #(
     reg [31:0] bias_addr;
     reg [31:0] scale_addr;
 
-    // Per-OC parameters
-    reg [NUM_OC-1:0][PSUM_WIDTH-1:0] bias_val;
-    reg [NUM_OC-1:0][31:0]           scale_mul;
-    reg [NUM_OC-1:0][5:0]            scale_shift;
+    // Per-OC parameters — sized to MAX_OC_RESIDENT (decision O); FSM/output uses
+    // a NUM_OC-wide window (active OC-tile selected in oc_single mode).
+    reg [MAX_OC_RESIDENT-1:0][PSUM_WIDTH-1:0] bias_val;
+    reg [MAX_OC_RESIDENT-1:0][31:0]           scale_mul;
+    reg [MAX_OC_RESIDENT-1:0][5:0]            scale_shift;
 
     // Tile tracking
     reg [9:0]  act_ic_tile;
@@ -340,7 +342,7 @@ module param_regfile #(
             dma_act_ping_sel <= 1'b0;  // Default: DMA writes to Ping (same as NPU default)
             dma_wgt_ping_sel <= 1'b0;
             dma_out_ping_sel <= 1'b0;  // Default: DMA reads Out SRAM Ping bank
-            for (wi = 0; wi < NUM_OC; wi = wi + 1) begin
+            for (wi = 0; wi < MAX_OC_RESIDENT; wi = wi + 1) begin
                 bias_val[wi]    <= 32'd0;
                 scale_mul[wi]   <= 32'd0;
                 scale_shift[wi] <= 6'd0;
@@ -466,6 +468,17 @@ module param_regfile #(
 
                     default: ; // Ignore unmapped addresses
                 endcase
+
+                // ---- Decision O: extended per-OC params, indices 16..63 ----
+                // bias[16..63]        @ 0x160..0x21C
+                // scale_mul[16..63]   @ 0x220..0x2DC
+                // scale_shift[16..63] @ 0x2E0..0x39C
+                if (word_addr >= 10'h160 && word_addr <= 10'h21C)
+                    bias_val[((word_addr - 10'h160) >> 2) + 6'd16]    <= s_axi_wdata;
+                else if (word_addr >= 10'h220 && word_addr <= 10'h2DC)
+                    scale_mul[((word_addr - 10'h220) >> 2) + 6'd16]   <= s_axi_wdata;
+                else if (word_addr >= 10'h2E0 && word_addr <= 10'h39C)
+                    scale_shift[((word_addr - 10'h2E0) >> 2) + 6'd16] <= s_axi_wdata[5:0];
             end
         end
     end
@@ -548,6 +561,14 @@ module param_regfile #(
 
                     default: rdata <= 32'd0;
                 endcase
+
+                // ---- Decision O: extended per-OC param readback (indices 16..63) ----
+                if (s_axi_araddr[ADDR_W-1:0] >= 10'h160 && s_axi_araddr[ADDR_W-1:0] <= 10'h21C)
+                    rdata <= bias_val[((s_axi_araddr[ADDR_W-1:0] - 10'h160) >> 2) + 6'd16];
+                else if (s_axi_araddr[ADDR_W-1:0] >= 10'h220 && s_axi_araddr[ADDR_W-1:0] <= 10'h2DC)
+                    rdata <= scale_mul[((s_axi_araddr[ADDR_W-1:0] - 10'h220) >> 2) + 6'd16];
+                else if (s_axi_araddr[ADDR_W-1:0] >= 10'h2E0 && s_axi_araddr[ADDR_W-1:0] <= 10'h39C)
+                    rdata <= {26'd0, scale_shift[((s_axi_araddr[ADDR_W-1:0] - 10'h2E0) >> 2) + 6'd16]};
             end else if (s_axi_rready && rvalid) begin
                 rvalid <= 1'b0;
             end
@@ -596,9 +617,11 @@ module param_regfile #(
     assign o_bias_addr  = bias_addr;
     assign o_scale_addr = scale_addr;
 
-    assign o_bias_val    = bias_val;
-    assign o_scale_mul   = scale_mul;
-    assign o_scale_shift = scale_shift;
+    // Dormant (decision O step 2): output the low NUM_OC window; the active-OC-tile
+    // mux is added with the FSM oc_single loop (step 4).
+    assign o_bias_val    = bias_val[NUM_OC-1:0];
+    assign o_scale_mul   = scale_mul[NUM_OC-1:0];
+    assign o_scale_shift = scale_shift[NUM_OC-1:0];
 
     assign o_act_ic_tile = act_ic_tile;
     assign o_act_oc_tile = act_oc_tile;

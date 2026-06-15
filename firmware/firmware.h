@@ -57,9 +57,11 @@ void usercode7(void);
 #define NPU_PAD        (NPU_BASE + 0x150)  // [15:8]pad_h [7:0]pad_w (hardware padding, CTRL[8])
 #define NPU_BIAS_ADDR  (NPU_BASE + 0x038)
 #define NPU_SCALE_ADDR (NPU_BASE + 0x03C)
-#define NPU_BIAS(ch)   (NPU_BASE + 0x040 + ((ch) * 4))
-#define NPU_SCALE(ch)  (NPU_BASE + 0x080 + ((ch) * 4))
-#define NPU_SHIFT(ch)  (NPU_BASE + 0x0C0 + ((ch) * 4))
+// Per-OC bias/scale/shift. ch 0..15 use the legacy 0x040/0x080/0x0C0 blocks;
+// ch 16..63 use the decision-O extended region (0x160 / 0x220 / 0x2E0).
+#define NPU_BIAS(ch)   (NPU_BASE + ((ch) < 16 ? 0x040 + ((ch) * 4) : 0x160 + (((ch) - 16) * 4)))
+#define NPU_SCALE(ch)  (NPU_BASE + ((ch) < 16 ? 0x080 + ((ch) * 4) : 0x220 + (((ch) - 16) * 4)))
+#define NPU_SHIFT(ch)  (NPU_BASE + ((ch) < 16 ? 0x0C0 + ((ch) * 4) : 0x2E0 + (((ch) - 16) * 4)))
 // DMA control registers (byte offsets matching param_regfile.v case values)
 #define NPU_DMA_RD_TRIG      (NPU_BASE + 0x120)  // write any value to trigger DMA read
 #define NPU_DMA_RD_DDR_ADDR  (NPU_BASE + 0x124)
