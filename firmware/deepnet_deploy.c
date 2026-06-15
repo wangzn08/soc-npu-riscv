@@ -44,6 +44,7 @@ static inline uint32_t rdcycle32(void) {
 static uint32_t prof_pad, prof_load, prof_npu, prof_reorder,
                 prof_affine, prof_argmax, prof_infer, prof_preload;
 static uint32_t prof_fc1;   // Phase 0: FC1 GEMM alone (excl. CPU FC2)
+static uint32_t prof_fc2;   // Phase 0: CPU FC2 (50->10) alone
 static uint32_t prof_npu_layer[6];   // per-conv NPU time (incl MMIO config + copy/DMA)
 static uint32_t prof_busy_layer[6];  // #4 Phase 0: per-conv NPU-busy (IRQ-wait) only
 static int      prof_conv_idx;       // reset to 0 at each image
@@ -937,6 +938,9 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
         // ---- CPU FC2 (50→10, raw int32): reads NPU FC1 output (channel-major,
         //      OCs 50..63 are exact 0 from padded weights). FC2 stays on CPU
         //      because the NPU's INT8 output saturates the final logits. ----
+#if NPU_PROFILE
+        { uint32_t _fc2 = rdcycle32();
+#endif
         volatile int8_t *f1 = (volatile int8_t *)FC1_OUT_DDR;
         const int8_t *w2 = &affine2_W[0][0];
         // Read FC1's output from DDR once into fast private RAM; the FC2 loop
@@ -951,6 +955,9 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
                 acc += (int32_t)f1_loc[ic] * (int32_t)w2[oc * AFFINE2_IN + ic];
             scores[oc] = (int32_t)(((int64_t)acc * SCALE_AFFINE2) >> SCALE_SHIFT);
         }
+#if NPU_PROFILE
+          prof_fc2 += rdcycle32() - _fc2; }
+#endif
         PROF_ADD(prof_affine);
     }
 #endif
@@ -1084,6 +1091,8 @@ void usercode7(void)
     print_str("  affine   : "); print_dec(prof_affine);  print_chr('\n');
     print_str("    fc1(gemm): "); print_dec(prof_fc1);
     print_str(" total /img "); print_dec(prof_fc1 / 10); print_chr('\n');
+    print_str("    fc2(cpu) : "); print_dec(prof_fc2);
+    print_str(" total /img "); print_dec(prof_fc2 / 10); print_chr('\n');
     print_str("argmax     : "); print_dec(prof_argmax);  print_chr('\n');
     print_str("npu_per_layer (total / busy=IRQ-wait):\n");
     for (int i = 0; i < 6; i++) {
