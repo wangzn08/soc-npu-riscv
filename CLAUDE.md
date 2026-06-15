@@ -1,544 +1,578 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with this repository.
+Handoff note for the SoC/NPU MNIST deployment. Read before changing code.
 
-## Project Overview
+## Project Snapshot
 
-PicoRV32 RISC-V CPU + 16×16 systolic-array NPU SoC, verified in ModelSim/Questa.
-Firmware (C + asm, rv32imc) runs on the simulated CPU, drives the NPU through MMIO registers.
-Target workload: DeepConvNet (15-layer MNIST CNN) inference offloaded to the NPU.
+Workspace: `D:\cpu+npu\soc\soc`
 
-## Build & Simulation
+This is a small RTL CPU+NPU SoC for the Phytium enterprise problem 3 track:
 
-All commands run from an MSYS/Git Bash shell on Windows (not PowerShell/cmd).
-
-```bash
-bash run_all.sh              # full flow: fw + RTL compile + simulation
-bash run_all.sh fw           # firmware only
-bash run_all.sh compile      # RTL compile only (vlib + vlog)
-bash run_all.sh sim          # full flow, headless
-bash run_all.sh waves        # full flow + GUI waveform
-bash run_all.sh clean        # remove sim artifacts
-bash run_all.sh distclean    # also remove firmware/build
+```text
+Intelligent core fusion, low-power strong compute:
+heterogeneous processor design based on CPU and NPU.
 ```
 
-The Makefile is deprecated; use `run_all.sh` instead.
+Current architecture:
 
-Tool paths (override via environment variables):
-- `RISCV_PREFIX` — RISC-V GCC toolchain (default: `E:/Riscv_Tools/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-`)
-- `MGC_LICENSE_FILE` — ModelSim license (default: `E:/modelsim/LICENSE.TXT`)
-- `PYTHON` — Python interpreter (default: `python`)
+- PicoRV32 RISC-V AXI CPU with private firmware RAM at `0x0000_0000`.
+- UART MMIO `0x1000_0000`, TEST MMIO `0x2000_0000`.
+- NPU register MMIO `0x3000_0000..0x3000_0FFF`.
+- Shared DDR/memory model `0x4000_0000+`, now exposed as a 128-bit AXI4 data
+  path behind the arbiter.
+- NPU = AXI DMA + Act/Wgt/Out SRAM ping-pong banks + im2col + weight reader +
+  16x16 systolic array + post-process (bias/quant/ReLU/maxpool) + vector ALU.
+- Current accelerators/features include resident conv weights, weight-prefetch
+  reuse, Conv+Pool fusion, hardware padding, GEMM/FC mode, DMA/NPU IRQs,
+  OC-pass Out-SRAM overlap, 128-bit AXI DMA/shared memory, CPU 32->128 upsizer,
+  RTL performance counters, and two on-chip data-movement engines: `img_expand`
+  (camera raw bytes -> tile-major Conv1 input, in SRAM) and `sram_copy`
+  (Out SRAM -> Act SRAM inter-layer residency, no DDR round-trip).
+- NPU compute-core optimizations (opt-in CTRL bits, ported 2026-06-15): `row_par`
+  CTRL[9] = 16-row spatial parallelism (task E); `gemm_reduce` CTRL[10] = GEMM
+  16-row IC-reduction (decision M); `row_block` CTRL[11] = row-block packing for
+  narrow layers (#4); `oc_single` CTRL[12] = compute ALL OC tiles in ONE NPU
+  start with one shared im2col load (decision O); `int32_out` CTRL[13] = raw
+  un-clamped INT32 output (decision Q), used to run FC2 on the NPU. Each is OFF
+  by default and the FSM is byte-identical when off. Together they cut `npu_busy`
+  by ~82% and put the whole MLP (FC1+FC2) on the NPU.
 
-### How testing works
+Simulator flow is ModelSim/Questa, not VCS. Use `run_flow.ps1` for normal
+verification. `modelsim/run_modelsim.bat batch` logs all signals through
+`run.do` and is much slower; prefer `run_flow.ps1 -Mode batch` for regression.
 
-There is no unit-test framework. "The test" is one simulation run:
-- The testbench (`rtl/axi_sys_tb.v`) prints `ALL TESTS PASSED.` when firmware writes `123456789` to MMIO `0x2000_0000`, or `ERROR!`/`TIMEOUT` otherwise.
-- Firmware `print_*` output appears on the simulator console via UART MMIO.
-- The current firmware (`deepnet_deploy.c`) runs 10 MNIST images and prints per-image predictions and an overall accuracy count.
-- `vsim` must run from the repo root — firmware hex path is resolved by `$readmemh` relative to the simulation working directory.
-- After editing RTL, run `bash run_all.sh clean` before recompiling (or vlog the changed file manually).
+## Competition Requirements And Assessment
 
-## Architecture
+Important contest requirements and the current project status:
 
-### Memory Map (`rtl/axi_sys.v`)
+- CPU choice: Cortex-M0 or RISC-V. This project uses PicoRV32, so it matches the
+  RISC-V option.
+- NPU integration: at least a 4x4 systolic array integrated into the CPU SoC.
+  This project uses a 16x16 array with 16 INT8 lanes per PE.
+- AXI communication: support AXI-Lite single-beat control and AXI Burst data
+  movement. This project has MMIO register control and DMA burst movement.
+- Functional verification: must prove AXI Burst increment transfers, CPU/NPU
+  cooperation, and NPU compute correctness. The current 10-image MNIST run is
+  good system evidence, and directed AXI read/upsizer tests now exist; coverage
+  and more NPU/DMA directed tests are still needed.
+- Performance target: evaluated at 200 MHz. The design advertises a theoretical
+  peak of about 1.64 TOPS at INT8. Effective utilization is now measurable by
+  RTL counters, but current end-to-end utilization is still low.
+- Bus target: AXI Burst bandwidth utilization should be at least 60%, with 80%
+  as a stronger target. Measured NPU DMA read utilization is 100%. Write
+  utilization now reads 66% only because on-chip residency cut DDR writes to 40
+  beats total (10 tiny FC1-output bursts), so per-burst startup dominates the
+  ratio -- the design barely writes DDR. If the report needs a high write-burst
+  number, measure it on a write-heavy micro-benchmark rather than the residency
+  deploy run.
+- Low-power target: the report should show idle clock gating or better:
+  array/operand gating, SRAM bank enable gating, and counters showing idle time.
+  Current RTL has enables and counters, but not a strong low-power architecture
+  story yet.
+- Deliverables: design document, RTL source, RTL simulation report or FPGA
+  validation report. FPGA validation can add points.
 
-```
-picorv32_axi (AXI-Lite master)
-  ├─ 0x0000_0000–0x00FF_FFFF → axi_lite_ram (private mem, firmware loaded via $readmemh)
-  ├─ 0x1000_0000             → UART tx (write char → simulator $write)
-  ├─ 0x2000_0000             → test-pass register (write 123456789 → tests_passed)
-  ├─ 0x3000_0000–0x3000_0FFF → NPU registers (pulse interface to npu_axi_wrapper)
-  └─ 0x4000_0000–...         → shared memory ("DDR", 128-bit AXI4 data path):
-        axi_lite_to_axi_full bridge (32b) → axi_upsizer_32_128 ┐
-                                                               ├→ axi_arbiter_2to1 (128b) → axi_full_slave_v1_0_S00_AXI (128b)
-        npu_top native 128-bit DMA master ─────────────────────┘
-```
+Current architectural assessment:
 
-### 128-bit AXI shared-memory path (AXI utilization)
+- The architecture is now a credible competition prototype, not only a functional
+  demo. It has a complete CPU+NPU flow, IRQ-driven cooperation, conv/pool/FC
+  acceleration, and hardware counters.
+- The biggest remaining gap is not correctness. The 10-image deployment passes.
+  AXI bandwidth now has strong counter evidence. The remaining proof gap is
+  array utilization, setup/preload accounting, low-power evidence, and coverage.
+- The former 32-bit shared-memory bottleneck has been removed. The NPU DMA,
+  arbiter, and shared memory model are now 128-bit. The CPU remains a 32-bit
+  single-beat master and reaches the 128-bit fabric through `axi_upsizer_32_128`.
+- The current AXI path is good enough that bus bandwidth is no longer the main
+  bottleneck. Remaining cycle cost is now dominated by one-time setup/weight
+  preload and per-layer CPU MMIO scheduling. The CPU no longer does image
+  scatter/pad, Pool3->FC1 reorder, or FC arithmetic in the default deploy path.
+- `docs/superpowers` contains implementation plans/specs for GEMM/FC,
+  hardware padding, and weight reuse. The code has already implemented most of
+  those plans, but the plan checkboxes are stale and should be treated as design
+  history unless re-audited.
 
-The shared-memory data path is **128-bit end to end** so the NPU's native 128-bit
-DMA drives the bus directly — the old 128→32 width converter inside
-`npu_axi_wrapper` is removed (NPU writes/reads full beats, no 4× down-conversion,
-so bus utilization is no longer the bottleneck). The low-traffic 32-bit CPU reaches
-the 128-bit fabric through `axi_upsizer_32_128` (single-beat 32→128 adapter:
-partial writes via WSTRB on the lane selected by `addr[3:2]`; reads mux that lane
-back out). `axi_arbiter_2to1` and `axi_full_slave_v1_0_S00_AXI` are parameterized
-to `DATA_WIDTH=128` (wstrb = `DATA_WIDTH/8`); `npu_axi_wrapper`'s `SOC_AXI_DATA_W`
-is 128. NPU DMA writes tie WSTRB all-ones (full-beat). Directed testbenches:
-`tests/tb_axi_upsizer.v`, `tests/tb_axi_read_backpressure.v`.
+If redesigning from scratch for a higher-scoring submission, the target would be:
 
-### NPU Register Interface
-
-NPU registers at `0x3000_0000` are special-cased in `axi_sys.v`: MMIO writes/reads are converted to `reg_wr_en/reg_rd_en` pulses into `npu_axi_wrapper` (byte addr → word addr via `addr[11:2]`), with handshake stretching until `reg_wr_done`/`rd_data_valid`.
-
-Register definitions: `rtl/param_regfile.v` (hardware) ↔ `firmware/firmware.h` (firmware `NPU_*` defines). Changes must touch both files.
-
-### NPU Dataflow
-
-```
-axi_dma (DDR ↔ SRAM)
-  → ping-pong Act/Wgt SRAMs (sram_models.v, 128-bit wide)
-  → im2col_line_buffer + wgt_reader
-  → systolic_16x16 (gp_4x4 → pe_core, INT8 MAC, output-stationary)
-  → post_process_top: bias → quantization (INT32→INT8) → ReLU → max_pooling_2x2 / vector_alu (eltwise add)
-  → output SRAM → DMA back to DDR
-```
-
-`top_controller_fsm.v` sequences the computation; `param_regfile.v` holds config/status.
-
-### Firmware Architecture
-
-**Entry point:** `usercode7()` in `deepnet_deploy.c`, called from `start7.S`.
-
-**Linked objects** (fixed in `run_all.sh`):
-- `start7.S` — reset vector, stack setup, calls `usercode7()`
-- `irq.c` — interrupt handler, sets `npu_irq_flag` on NPU IRQ (bit 3)
-- `print.c` — UART console output (`print_str`, `print_dec`, `print_hex`)
-- `libgcc_stub.c` — GCC runtime helpers (freestanding)
-- `deepnet_deploy.c` — main firmware (15-layer CNN inference)
-
-**Build flags:** `-march=rv32imc -O2 -ffreestanding -nostdlib -Werror -Wall -Wextra -pedantic` (strict warning-clean)
-
-**Memory layout** (`sections.lds`): code/data at 0x0 in private RAM, stack grows down from top.
-
-### DeepConvNet (15-layer MNIST CNN)
-
-```
-Input: 28×28×1 (INT8, 10 test images from mnist_test_images.h)
-
-Conv1:  30×30×16 (pad 28→30) → 28×28×16, 3×3, stride 1, ReLU        [NPU]
-Conv2:  30×30×16 (pad 28→30) → 28×28×16, 3×3, stride 1, ReLU        [NPU]
-Pool1:  28×28×16 → 14×14×16, 2×2 max, stride 2                      [CPU]
-Conv3:  16×16×16 (pad 14→16) → 14×14×32, 3×3, stride 1, ReLU        [NPU]
-Conv4:  18×18×32 (pad 14→18) → 16×16×32, 3×3, stride 1, ReLU        [NPU]
-Pool2:  16×16×32 → 8×8×32                                            [CPU]
-Conv5:  10×10×32 (pad 8→10)  → 8×8×64, 3×3, stride 1, ReLU          [NPU]
-Conv6:  10×10×64 (pad 8→10)  → 8×8×64, 3×3, stride 1, ReLU          [NPU]
-Pool3:  8×8×64 → 4×4×64                                              [CPU]
-Reorder: spatial-first-per-tile → channels-first                      [NPU HW transpose, decision L]
-Affine1: 1024 → 50, ReLU                                             [NPU GEMM]
-Affine2: 50 → 10, raw INT32 scores                                   [NPU GEMM, int32_out — decision Q]
-Argmax: find predicted digit                                          [CPU]
+```text
+32-bit RISC-V CPU
++ AXI-Lite control bus
++ 128-bit AXI4 data crossbar / shared memory path
++ descriptor-based DMA
++ Act/Wgt/Psum/Out scratchpads
++ 16x16x16 INT8 systolic array
++ Conv/GEMM dual mode
++ hardware performance counters
++ clock gating, operand gating, and SRAM bank gating
 ```
 
-**NPU operations:** 6 conv layers (all 3×3 INT8 with ReLU) via `npu_conv_pass()`, plus **Affine1 (1024→50) via `npu_gemm_pass()`** (GEMM/FC mode, decision F). Conv weights are preloaded into the Wgt SRAM **PING** bank once (`preload_conv_weights`); FC weights into the **PONG** bank once (`preload_fc_weights`); both stay resident across all images. Each NPU op configures registers, starts the NPU, waits for IRQ (`npu_irq_flag`), then DMA-reads results back to DDR.
+The key principle is: CPU schedules, NPU covers Conv/Pool/FC, the data path stays
+wide enough to feed the array, and performance/power claims are backed by
+counters rather than architecture diagrams alone.
 
-**CPU operations:** Conv1 image formatting (image → tile-major DDR words), data reorder, and **argmax** (reads the 10 INT32 logits). All in `deepnet_deploy.c`. (Max-pool is fused into the NPU conv pass via `pool_en`; **activation padding is now done in hardware** — decision H — so `pad_activation` and `cpu_max_pool_2x2` are both unused. **Affine2 now runs on the NPU** via `int32_out` — decision Q.)
+## Environment
 
-**Note:** NPU pooling (`pool_en`) IS used — Conv2/Conv4/Conv6 fuse 2×2 max-pool into the same NPU pass. **Affine2 (50→10) now runs on the NPU** via the `int32_out` raw-INT32 output mode (decision Q) — it previously stayed on CPU because the INT8 post-process saturates the final logits, which `int32_out` fixes. (On MNIST this regresses ~57K because FC2 is too small to amortize NPU overhead; kept for the general "all FC on NPU" capability.)
-
-### DDR Buffer Layout (firmware/deepnet_deploy.c)
-
-```
-0x4000_1000  ACT_BUF_A    48 KB   activation buffer A
-0x4000_4000  ACT_BUF_B    48 KB   activation buffer B
-0x4000_7000  WGT_BUF      64 KB   weight staging buffer
-0x4001_0000  NPU_OUT_BUF  16 KB   NPU output staging
-0x4001_2000  PAD_BUF      12 KB   padded activation buffer
-0x4001_5000  SCORES       40 B    10× INT32 classification scores
-0x4001_6000  AFFINE_SCR   16 KB   affine layer scratch / data reorder
+```text
+ModelSim:   D:\Soft\modeltech64_10.4\win64
+License:    D:\Soft\modeltech64_10.4\win64\LICENSE.TXT
+RISC-V GCC: D:\cpu+npu\soc\tools\riscv-none-elf-gcc\xpack-riscv-none-elf-gcc-15.2.0-1\bin
 ```
 
-### NPU Register Map (`firmware/firmware.h`, `rtl/param_regfile.v`)
+Use the root-level `run_flow.ps1`. Do not use `make`. Both `run_flow.ps1` and
+`modelsim/run_modelsim.bat` self-locate their root.
 
-| Offset | Name | Description |
-|--------|------|-------------|
-| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en, `[10]`gemm_reduce, `[11]`row_block_en, `[12]`oc_single, `[13]`int32_out |
-| `0x150` | PAD | `[15:8]`pad_h, `[7:0]`pad_w (hardware padding border, with CTRL[8]) |
-| `0x004` | STATUS | `[0]`done_irq, `[1]`busy, `[2]`dma_rd_err, `[3]`dma_wr_err (RO) |
-| `0x008–0x01C` | SRAM addrs | Act/Wgt/Out SRAM base addresses (ping/pong) |
-| `0x020–0x02C` | Dimensions | IN_W, IN_H, IC, OC |
-| `0x030–0x034` | Kernel/Stride | `[15:8]=KH/SX, [7:0]=KW/SY` |
-| `0x040–0x07C` | BIAS | per-OC 32-bit bias, channels 0..15 (decision O: ch 16..63 at `0x160–0x21C`) |
-| `0x080–0x0BC` | SCALE_MUL | per-OC 32-bit scale mul, ch 0..15 (ch 16..63 at `0x220–0x2DC`) |
-| `0x0C0–0x0FC` | SCALE_SHIFT | per-OC 6-bit shift, ch 0..15 (ch 16..63 at `0x2E0–0x39C`) |
-| `0x120–0x148` | DMA | Read/write triggers, DDR addr, length, SRAM base, status, sel |
-| `0x140` | DMA_STATUS | `[0]`rd_done `[1]`wr_done `[2]`copy_done (RO) |
-| `0x154` | COPY_TRIG | write → start on-chip Out→Act copy (`sram_copy`, decision J); src/dst/len reuse DMA RD_SRAM_BASE/WR_SRAM_BASE/RD_LEN |
-| `0x15C` | TRANSPOSE_TRIG | write → start Conv6→FC1 transpose (`transpose_engine`, decision L); done = DMA_STATUS[4]; src/dst/n_pos reuse RD_SRAM_BASE/WR_SRAM_BASE/RD_LEN |
+## Commands
 
-### Interrupt Handling
+```powershell
+# Compile RTL only
+cmd /c modelsim\run_modelsim.bat compile
 
-NPU `irq_done` → latched in `axi_sys.v` → PicoRV32 IRQ bit 3 → `irq.c` sets `npu_irq_flag`.
-Firmware polls `npu_irq_flag` (RAM flag, fast) rather than reading MMIO `NPU_STATUS`.
+# Smoke: builds firmware + RTL, runs 1 us to check boot/elaboration
+powershell -ExecutionPolicy Bypass -File .\run_flow.ps1 -Mode smoke -App deepnet_deploy.c
 
-## Architecture Decisions (explicit, do not change without understanding)
+# Full 10-image MNIST batch, normal regression path
+powershell -ExecutionPolicy Bypass -File .\run_flow.ps1 -Mode batch -App deepnet_deploy.c
 
-### D: Multi-OC-tile — firmware-driven 16-OC-per-pass
+# GUI / VCD only when waveform inspection is needed
+powershell -ExecutionPolicy Bypass -File .\run_flow.ps1 -Mode gui -App deepnet_deploy.c
+```
 
-Hardware `param_regfile.v` has exactly 16 bias/scale/shift registers (indices 0..15). One NPU start always processes exactly 16 output channels. For layers with OC > 16, firmware calls `npu_conv_pass()` in a loop, one pass per 16-OC tile, each reconfiguring bias/scale registers and triggering a separate NPU start. This is the intended architecture — do **not** try to issue a single start for OC=32/64.
+`run_flow.ps1` builds `firmware/build/firmware7.hex`, compiles RTL, then runs
+ModelSim. Batch log: `sim/modelsim/direct_batch.log`. Firmware build uses
+`-Werror -Wall -Wextra -Wshadow ...`; keep firmware warning-clean.
 
-### E: CPU-side padding — intentional, SRAM residency not feasible
+PowerShell gotcha: avoid piping native exe stderr through `2>&1` in PS 5.1 when
+you need exit-code behavior. The linker emits a harmless RWX LOAD segment
+warning that can be wrapped as `NativeCommandError`.
 
-Activation-padding (`pad_activation`) runs on the CPU, reading/writing DDR. This is a deliberate architectural choice:
-- CPU cannot access the NPU's internal SRAMs (Act/Wgt/Out) — only the NPU DMA engine can.
-- Every inter-layer transfer therefore requires Out SRAM → DDR (DMA write), then CPU reads DDR, then DDR → Act SRAM (DMA read).
-- "SRAM residency" (skipping the DDR round-trip) would require either adding a CPU-accessible SRAM port or removing CPU-side padding — not in scope.
-- **Pooling is NPU-fused** (not CPU-side): Conv2/Conv4/Conv6 set `pool_en=1` so the 2×2 max-pool happens in the same NPU pass. (`cpu_max_pool_2x2` exists but is unused.)
+## Current Result
 
-### F: General GEMM / fully-connected mode (`gemm_en`, CTRL[7])
+Latest normal regression verified on 2026-06-15 (NPU compute-core port:
+row_par + oc_single + gemm_reduce + FC2-on-NPU INT32):
 
-Fully-connected layers run on the systolic array as a degenerate 1×1 conv. `gemm_en` bypasses the im2col line buffer: the FSM feeds the input vector's IC-tile word straight from Act SRAM, **replicated to all 16 array rows** (identical to how im2col replicates a conv window), so every PE in a column computes the same dot product and the existing drain/post-process/write path is reused unchanged. The reduction streams `ceil(IC/16)` IC-tiles as k-steps; OC is firmware-tiled by 16 (decision D); `out_w=out_h=1`. `wgt_reader`'s kernel-offset count is the runtime `kh*kw` (9 for conv, 1 for GEMM).
-- **General-purpose:** any `IC ≤ 1024` (HW `ic_group` counter width) and any `OC` (16-tiled), configured via registers — not hardcoded to the MNIST model.
-- **Bank convention:** GEMM runs with `ping_pong=1` → input vector in Act **PONG**, FC weights resident in Wgt **PONG** (packed by `pack_fc_tile`, layout `word(o,g)=o*icg+g`); conv keeps PING. Output to Out PING (`CTRL[6]=0`).
-- **Firmware:** `npu_gemm_pass(in_dim,out_dim,scale,bias,relu,in_ddr,out_ddr,wgt_base)`.
-- **Limitation (lifted by decision Q):** the NPU post-process clamps output to INT8, which saturates final-classifier logits → Affine2 (50→10) used to stay on CPU. **Decision Q's `int32_out` mode removes this — Affine2 now runs on the NPU.** Affine1 (the bottleneck) moved from ~22.3M to ~0.6M cycles; full 10-image run 40.87M → 22.62M.
+```text
+Command: powershell -ExecutionPolicy Bypass -File .\run_flow.ps1 -Mode batch -App deepnet_deploy.c
+Result:  10/10 correct, DEPLOY SUCCESS
+TRAP:    941,155 clock cycles  (~4.7 ms for 10 images @ 200 MHz, ~0.47 ms/image)
+Sim:     Errors: 0, Warnings: 18
+Log:     sim/modelsim/direct_batch.log
+```
 
-### G: Weight-prefetch reuse — per-OC-tile, general (`ICG_BUF`)
+Latency journey: 10,778,593 (original) -> 2,378,377 (img_expand + sram_copy +
+weight preload + FC1 fold) -> 941,155 (compute-core port). -91% vs original,
+-60% vs the data-movement merge.
 
-Conv weights are position-invariant, but the FSM used to re-prefetch an OC-tile's
-weights from Wgt SRAM **once per output pixel** (≈144 SRAM reads vs ~9 compute
-cycles — the array wants 16 OC-words/cycle, the single-port SRAM gives 1/cycle).
-Fix: prefetch each OC-tile's weights **once** and reuse across the whole spatial
-sweep. `wgt_reader`'s buffer is `wgt_buf[ko][oc][ICG_BUF]` (`ICG_BUF=4`); the FSM
-`reuse_mode = !gemm_en && ic_groups ≤ ICG_BUF` prefetches all IC-groups once
-(`o_prefetch_all`), then loops IC-tiles in CALC selecting from the buffer
-(`o_wgt_ic_sel`) with no re-prefetch; `wgt_loaded` tracks residency, cleared on
-layer start / OC-tile change.
-- **General, not model-specific:** any layer with `ic_groups ≤ ICG_BUF` benefits
-  (all current conv layers do); `ic_groups > ICG_BUF` and GEMM fall back to the
-  per-IC-tile prefetch — correct, just unaccelerated. `ICG_BUF` is a hardware
-  capacity knob (like the 16×16 array / 16-OC tiling), not a model dimension.
-- Result: conv (NPU) 8.64M → 2.15M cycles (all 6 layers −64..83%); full 10-image
-  run **22.62M → 16.14M**, still bit-identical 10/10. Output is byte-for-byte
-  unchanged (same weights, only their timing/source moves).
+Current-version changes to highlight:
 
-### H: Hardware padding (`hw_pad`, CTRL[8] + `NPU_PAD`)
+- **FC2 hardwareization:** FC2 now runs as an NPU GEMM pass. `int32_out`
+  (CTRL[13]) writes raw scaled INT32 logits, so the final layer no longer needs
+  the old CPU dot-product and also avoids INT8 logit saturation.
+- **NPU core update:** `row_par` (CTRL[9]) computes up to 16 output positions per
+  sweep, `oc_single` (CTRL[12]) lets one start cover all OC tiles with a shared
+  im2col load, `row_block` (CTRL[11]) improves narrow layers, and
+  `gemm_reduce` (CTRL[10]) accelerates FC/GEMM IC reduction.
+- **Image preload moved toward hardware:** `gen_act_hex.py` now stores raw
+  byte-packed images in DDR. Runtime only DMAs 49 words/image into Act SRAM;
+  `img_expand` builds the 16-lane Conv1 activation in SRAM, and spatial conv
+  padding is injected by the NPU FSM through `NPU_CTRL_HW_PAD`.
+- **Layer residency:** Conv outputs use `sram_copy` to move Out SRAM -> Act SRAM
+  and ping-pong between Act regions. Conv1..Conv6 no longer round-trip through
+  DDR.
+- **FC1 input reorder removed:** Pool3->FC1 runtime transpose is gone. FC1
+  weights are packed in Conv-output order by `gen_weights_hex.py`.
+- **Done/IRQ semantics fixed for INT32 output:** in `int32_out` mode, the visible
+  NPU done/IRQ waits until all 4 INT32 Out-SRAM words have been written.
 
-CPU `pad_activation` used to transpose (tile-major→position-major) AND zero-pad the
-previous layer's output in DDR (~6.4M cycles, memory-bound). Replaced by hardware
-padding: the FSM reads the previous output **tile-major directly from Act SRAM**
-and **injects border zeros** so im2col sees the same padded stream — no CPU pad,
-no transpose, no PAD_BUF round-trip. `NPU_IN_W/H` stay the padded dims (geometry
-unchanged); `NPU_PAD = {pad_h, pad_w}` (0x150) gives the per-side zero border;
-`CTRL[8] hw_pad` enables it. The border flag is delayed one cycle in `npu_top`
-(`fsm_border_d`) to match the SRAM read, muxing a zero into `im2col.i_pixel_data`.
-im2col/systolic/post are **unchanged**.
-- **General:** any pad (Conv4 uses pad=2, others pad=1), any dims/tiles — driven by
-  `NPU_PAD`. Firmware DMAs the previous layer's unpadded output straight in.
-- Result: `pad` 6.4M → ~1.0M (residual = Conv1 image-to-DDR formatting); inference
-  10.1M → 4.6M; full run **16.14M → 10.91M**, bit-identical 10/10. `pad_activation`
-  is removed (unused). When task E rewrites the im2col front-end, padding can
-  migrate fully into im2col.
-- Next bottleneck: the ~6M of sim UART prints / one-time preload (outside the
-  per-image inference path).
+Current RTL hardware counters printed by firmware:
 
-### I: 16-row spatial parallelism (`row_par_en`, CTRL[9])
+```text
+cyc_total = 818,640
+npu_busy  = 225,360
+arr_active=  27,170
+rd_beats  =     530
+wr_beats  =      80
+rd_busy   =     530
+wr_busy   =     120
 
-The 16×16 array ran conv at **1/16 utilization**: im2col replicated **one** window
-to all 16 rows, so 15 rows computed the same thing (256 useful MAC/cycle of 4096).
-`row_par_en` makes the 16 rows compute **16 different output pixels** (a horizontal
-group of ≤16 adjacent output columns): one K_END now produces 16 pixels × 16 OC.
-Primary goal is **not wasting the silicon**; cycles are a secondary win.
-- **im2col (`im2col_line_buffer.v`):** in row-par mode `o_act_window[r]` is a
-  **16-wide combinational slice** of the line buffer — array row `r` reads input
-  column `group_base + off_col + r` from the bank selected by `bank_for_offrow`
-  (mirrors the legacy `win[]`-fill mapping). Legacy replicate path kept under the
-  `i_row_par_en` mux (byte-identical when off). No new storage (fan-out of `lb_bankX`).
-- **FSM (`top_controller_fsm.v`):** the sweep advances `cur_ox` by
-  `group_size = min(16, out_w - cur_ox)` per step (=1 when row-par off ⇒ identical).
-- **Drain is REVERSE:** `pe_core` drains row 15 first → row 0 last, so drain valid
-  `k` (0..15) = output column `group_base + 15 - k`.
-- **Non-pool write (`npu_top.v`):** a sequencer **armed at DRAIN start** (not S_POST —
-  the post-process pipeline emits most valids during S_DRAIN) counts `pp_feat_vld`
-  and writes each to column `group_base + 15 - rp_vld_cnt`, guarded to
-  `[group_base, group_base+group_size)`; `fsm_pp_done = rp_done` holds S_POST until
-  all 16 captured.
-- **Pool path (`post_process_top.v`):** the drain's reverse order breaks the pooler's
-  row-major 2×2 windowing, so a **16-deep reorder buffer** captures the drained
-  pixels by column-within-group (`rp_buf[15-k]`) then **replays `group_size`
-  row-major** into `max_pooling_2x2` (group boundaries fall on even columns, so no
-  2×2 pair is split). `fsm_pp_done = o_rp_pool_done` holds S_POST until replay done.
-- **General:** `group_size` is runtime from `out_w` (28→16+12, 16, 14, 8 all handled);
-  partial groups use ≤16 rows. Like the 16×16 array and 16-OC tiling, "16 pixels/group"
-  is a hardware width, not a model dimension. `systolic/gp/pe/wgt_reader/dma/sram`
-  unchanged (weights are shared across the 16 pixels).
-- Result: full run **10.91M → 10.05M**, bit-identical 10/10 (per-layer spot checks
-  byte-match: Conv1(7,10), Conv3(7,7), Pool1/Pool2 nz). Brought up incrementally
-  behind the mode bit: Conv1 → Conv3/5 (non-pool) → Conv2/4/6 (pool). PAD migration
-  into im2col (decision H follow-on) remains future work — currently row-par still
-  consumes the FSM's border-zero-injected stream.
+array_util(arr/total)  = 3%
+array_eff(arr/busy)    = 12%
+npu_active(busy/total) = 27%
+rd_bw_util             = 100%
+wr_bw_util             = 66%
+```
 
-### J: On-chip SRAM residency for conv→conv (`sram_copy`, 0x154)
+IMPORTANT - reading `array_util`/`arr_active` after the compute-core port:
+`arr_active` collapsed 409,360 -> 27,170 NOT because the array does less work,
+but because `row_par` (task E) packs 16 output pixels per array sweep and
+`oc_single` (decision O) reuses one im2col load across all OC tiles, so the SAME
+conv MACs finish in ~15x fewer array-active cycles. The honest headline metric is
+`npu_busy`: 1,227,360 -> 225,360 (-82%). `array_util = arr_active/cyc_total` now
+under-reads because `arr_active` is tiny; per active cycle the array does far more
+work, so effective TOPS during compute is much higher than the 3% figure implies.
+For the report, quote `npu_busy` reduction (or a per-conv MAC/cycle figure), not
+`array_util`, for the compute-core story.
 
-Every conv layer used to round-trip its result through DDR: layer N drains Out SRAM
-→ DDR, then layer N+1 loads DDR → Act SRAM. After hardware padding (decision H) the
-CPU does nothing between conv layers, so this DDR bounce was pure transport overhead.
-A small `sram_copy` engine (`rtl/sram_copy.v`) copies Out SRAM → Act SRAM **on-chip**,
-eliminating the round-trip.
-- **Engine:** time-shares the SRAM **Port B** paths (Out Port B read → Act Port B
-  write), isolated from `axi_dma` (DDR path untouched). Out Port B read is
-  **combinational** (`out_sram_wrapper COMB_B=1`), so it reads `Out[src+cnt]` and
-  writes `Act[dst+cnt]` in the **same cycle** (one word/cycle, no pipeline — a 1-cycle
-  read-latency version copies off-by-one). `copy_busy` gives the engine Port-B priority
-  over the DMA muxes in `npu_top`.
-- **Registers:** trigger `NPU_DMA_COPY_TRIG` (0x154) → regfile `o_copy_trig`; completion
-  polled via `NPU_DMA_STATUS[2]` (`copy_done`) — **no IRQ** (avoids start7.S mask
-  plumbing). src/dst/len **reuse** the DMA `RD_SRAM_BASE`/`WR_SRAM_BASE`/`RD_LEN`
-  registers; banks reuse `dma_out_ping_sel`/`dma_act_ping_sel`. `i_len` = full word count.
-- **Two Act regions (firmware), NOT Act ping-pong:** the global `ping_pong_sel` couples
-  the Act and Wgt read banks (conv weights are resident in Wgt PING), so it can't be
-  flipped to alternate Act banks. Instead two **address regions** in the PING bank
-  ping-pong via `NPU_ACT_ADDR_A`: R0=word 0, R1=word 1024 (`ACT_RES_B`). A conv reads
-  region A while its copy writes region B; the next conv reads B. Different addresses ⇒
-  no input corruption even though the copy is serial.
-- **Serial per-pass copy:** resident layers copy each OC-pass's output right after that
-  pass (NPU idle), `act_dst + pass*out_words`, reading that pass's Out bank. This frees
-  the per-pass Out bank before the next pass reuses it (works for >2-pass layers,
-  Conv5/6) and sidesteps any same-bank dual-port concern. The DDR path keeps the
-  OC-pass overlap; resident layers don't use it (the copy is on the critical path but
-  far cheaper than the DDR round-trip).
-- **Firmware:** `dma_out_to_act(act_dst_word, out_src_word, nwords, out_bank)`;
-  `npu_conv_pass(... , act_in, act_dst)` (`act_dst>=0` ⇒ resident copy; `<0` ⇒ DDR).
-- **Scope:** the 5 conv→conv boundaries (Conv1→…→Conv6). Conv6→reorder→FC stays DDR
-  (CPU channels-first reorder + FC2/argmax need DDR). Conv1's input (the image) loads
-  from DDR.
-- **General:** the copy is a layout-agnostic word copy (Out tile-major == next-layer Act
-  tile-major); works for any dims/IC/OC/tiles, pooled or not. With `act_dst<0` the
-  behavior is byte-identical to the DDR path.
-- Result: per-image inference **374K → 289K (−23%)**; full run **9.86M → 8.83M**
-  (−1.03M), bit-identical 10/10 (Pool1 nz 711/379/784/838, Pool2 618/458/673 byte-match).
-  `prof_npu` dropped (the output-DDR-drain it included is gone) and `prof_load` dropped
-  (input DDR reads gone, copy folded in). Next bottleneck: `pad` (Conv1 image→DDR
-  formatting, ~101K/image).
+`TRAP - cyc_total ~= 0.12M` cycles is still just the one-time conv/FC weight
+preload DMA. On-chip residency keeps inter-layer DDR traffic tiny (`rd_beats`
+530, `wr_beats` 80: raw image in + FC1 staging for FC2 + final FC2 INT32 logits
+out). `wr_bw_util` reads 66% only because there are so few write beats that
+per-burst startup dominates -- not an efficiency regression. Do not confuse AXI
+bandwidth utilization with cycle share.
 
-### L: Hardware reorder — Conv6 → FC1 transpose (`transpose_engine`, 0x15C)
+Historical `NPU_PROFILE=1` measurement on 2026-06-13, summed over 10 images.
+This is useful only as pre-compute-core / pre-current-dataflow history; do not
+use it as the current bottleneck breakdown:
 
-The CPU used to transpose Pool3's output from tile-major (pass×pos×ch) to the
-channel-major layout FC1 (Affine1 GEMM) expects (~43K cycles/image, ~20% of
-inference) via 3 DDR round-trips (Conv6 Out→DDR, CPU DDR→DDR transpose, GEMM
-DDR→Act). Replaced by an on-chip **transpose engine** (`rtl/transpose_engine.v`,
-decision-J-style, time-shares SRAM Port B): Conv6 transposes each OC-pass's Out
-SRAM output **directly into Act PONG** (the GEMM input bank), channel-major, on
-chip — no CPU reorder, no DDR round-trip.
-- **Engine:** per OC-pass, a register transpose buffer `M[16*MAX_NPOS]` —
-  **LOAD** reads `n_pos` Out words (word p = 16 channels at position p) and
-  scatters byte ch_in to `M[ch_in*n_pos + p]` (stride n_pos); **DRAIN** reads M
-  sequentially, packs 16 bytes/word, writes `n_pos` Act words. = a 16×n_pos byte
-  transpose. `MAX_NPOS` is a capacity knob (like ICG_BUF); `n_pos ≤ MAX_NPOS`
-  in one pass (multi-Act-word channels, n_pos>16, handled by the sequential
-  drain). `n_pos > MAX_NPOS` → CPU fallback.
-- **Control:** trigger `NPU_DMA_TRANSPOSE_TRIG` (0x15C) → `o_transpose_trig`;
-  polled via `NPU_DMA_STATUS[4]` (`transpose_done`) — no IRQ. src/dst/n_pos reuse
-  `RD_SRAM_BASE`/`WR_SRAM_BASE`/`RD_LEN`; Out read bank = `dma_out_ping_sel`, Act
-  write bank = `dma_act_ping_sel` (= PONG). **Serial per-pass** (decision-J
-  pattern): Conv6's alternating Out banks (`pass&1`) don't coexist, so transpose
-  each pass right after it computes, before the next overwrites the bank.
-- **Firmware:** `dma_out_transpose_to_act(act_dst, out_src, n_pos, out_bank)`;
-  `npu_conv_pass(... , transpose_npos)` (>0 ⇒ per-pass transpose to Act PONG);
-  `npu_gemm_pass(... , in_resident)` (1 ⇒ input already in Act PONG, skip DMA).
-  The CPU reorder loop is removed.
-- **General:** any conv→FC boundary; `n_pos`/`n_ch` runtime. (NPU_GEMM_PARITY's
-  CPU oracle is not wired in this build since Conv6 no longer drains to DDR.)
-- Result: per-image inference **195,823 → 150,471 (−23%)**; full run
-  **8,041,665 → 7,618,571 (−423K, −5.3%)**, bit-identical (SCORE_CHK match) 10/10.
-  `reorder` 429,680 → 7,040 (just the per-pass trigger MMIO); `load` 75,110 →
-  50,670 (GEMM-input DDR round-trip gone).
+```text
+infer_total: 4,405,440
+  npu      : 2,075,310   (207,531/image)
+  pad      : 1,050,840   (105,084/image)
+  load     :   299,600   ( 29,960/image)
+  reorder  :   389,330   ( 38,933/image)
+  affine   :   577,150   ( 57,715/image)
+argmax     :     5,118   (    512/image)
 
-### M: GEMM array utilization — 16-row IC-reduction (`gemm_reduce`, CTRL[10])
+npu_per_layer (Conv1..Conv6):
+  Conv1: 532,930
+  Conv2: 364,030
+  Conv3: 274,050
+  Conv4: 307,850
+  Conv5: 265,660
+  Conv6: 330,790
+```
 
-Legacy GEMM (decision F) replicated the input IC-tile to all 16 array rows, so
-15/16 rows were redundant — **array utilization 6.25%**. `gemm_reduce` makes the
-16 rows compute **16 distinct IC-tiles** and reduce them **down each column**
-(spatial reduction), so one super-step consumes 256 IC (16 rows × 16) and the
-array runs at **~100% utilization**. Primary goal (like decision I) is **not
-wasting the silicon**, not cycles.
-- **pe_core (`i_reduce`):** during drain, `o_psum_casc = psum_shift + i_psum_casc`
-  forms a combinational adder chain down the column; the bottom PE's output =
-  sum of all 16 rows' latched accumulators. Legacy shift-drain unchanged when
-  `i_reduce=0` (byte-identical).
-- **Weights (16×16 plane):** PE(r,c) needs OC-c's weights for IC-tile r.
-  `wgt_reader` prefetches a **256-word plane** per super-step into `gemm_plane`
-  (`plane[r][c]=Wgt[wgt_base + c*icg + s*16 + r]`, reusing `pack_fc_tile`'s
-  `word(o,g)=o*icg+g` layout — no repack); `systolic_16x16`/`gp_4x4` slice it
-  per-PE and select it under `i_reduce`. New wide `i_wgt_plane` bus; legacy
-  `i_wgt` path untouched.
-- **Activations:** `npu_top` `act_row[0:15]` register holds 16 distinct IC-tile
-  words, loaded from Act SRAM by the FSM super-step sequencer.
-- **FSM (`top_controller_fsm`):** GEMM-reduce states `S_RDC_WLOAD`(plane prefetch)
-  → `S_RDC_ALOAD`(16 act loads) → `S_RDC_VLD`(1 accumulate); `ceil(IC/256)` super-
-  steps (FC1: 4 vs the legacy 64 k-steps), then `S_K_END` → `S_DRAIN`. The reduce
-  drain still runs **16 cycles** (combinational sum stable while `psum_shift`
-  holds) to match the legacy GEMM post-process pipeline-fill timing — a single
-  drain valid mis-times the S_POST write (`pp_start` feeds zeros once `drain_en`
-  drops). Output path reuses the legacy non-pool/non-rowpar write (1 word/pass).
-- **General:** any GEMM/FC layer (`IC≤1024`, OC 16-tiled), runtime dims; FC2 stays
-  CPU (INT8 saturation, decision F). Conv/legacy-GEMM byte-identical (mode-gated).
-- **Firmware:** `npu_gemm_pass(..., reduce)`; FC1 passes `reduce=1`.
-- Result: array util **6.25% → ~100%**, bit-identical `SCORE_CHK=D30179DF` 10/10.
-  Cycle win is **marginal** — FC1 19,638 → 18,966/img (−3.4%); full run
-  7,687,157 → 7,680,437 (−6,720, −0.09%). FC1 is **weight-bandwidth-bound**
-  (single-port Wgt SRAM): the 256-word/super-step plane prefetch reads the same
-  1024 words/pass as the legacy 64-k-step path, so the single-port SRAM floor —
-  not compute — dominates. The redesign fixes utilization, not the bottleneck.
-  (Consistent with Phase 0: FC1 was ~5× the weight floor, overhead/bandwidth-
-  bound, not compute-bound.)
+Old profile meanings:
 
-### N: Row-block packing — fill idle array rows for narrow layers (`row_block_en`, CTRL[11])
+- `npu` is software time around `npu_conv_pass()` and includes NPU register
+  setup, wait-for-IRQ, and output DMA drain/overlap. It is not the same as RTL
+  `npu_busy`.
+- `load` is input DDR -> Act SRAM DMA in `dma_ddr_to_act()`, not conv weight
+  preload.
+- `affine` in that old build was NPU FC1 plus CPU FC2. In the current default
+  deploy build, FC1 and FC2 both run on the NPU.
+- `pad` in that old build was mainly Conv1 input formatting into tile-major
+  16-byte words. In the current build, raw image expansion is handled by
+  `img_expand`, and spatial conv border padding is handled by the NPU FSM.
 
-Row-parallel (decision I) makes the 16 rows compute 16 columns of ONE output row;
-when `out_w < 16` the rest idle (Conv5/6 out_w=8 → **50% utilization**). `row_block_en`
-packs **R output rows** into the array (R = ⌊16/group_size⌋, capped MAX_R=2):
-array row `gi` → block `b=gi/group_size` (output row `cur_oy+b`), col `c=gi%group_size`.
-Conv5/6 (group_size=8) → R=2 → 100% utilization. Like decisions I/M, the goal is
-**not wasting the silicon**; cycles are a secondary (here large) win.
-- **im2col (`im2col_line_buffer.v`):** a **4th line-buffer bank** (R+2 rows), mod-4
-  `row_sel` rotation, and a `(block,col)` window read — block b's 3-row window is
-  the base window slid down b input rows: `bank = (row_sel + b + off_row + 1) mod 4`.
-  All gated by `i_row_block_en`; **byte-identical when off** (R=1 = decision I).
-  Exact only when `2*group_size==16` (group_size==8), so R=2 engages only there.
-- **FSM (`top_controller_fsm.v`):** loads R+2 rows/block (`lr_target = cur_oy+R+kh-2`),
-  sweeps `cur_oy += R`. `rows_per_grp` (=2 iff `row_block_en && group_size==8`).
-- **Drain/Out-SRAM (`npu_top.v` rp sequencer):** drained array row r → `(b,c)`,
-  writes `out_base + oc_off + (cur_oy+b)*out_row_stride + group_base + c`.
-- **Pool path (`post_process_top.v`):** R=2 **aligns with the 2×2 pool row-pair**
-  (oy even). `rp_buf[r]` is already row-major (`b*group_size+c = r`), so the pool
-  replay just streams `R*group_size` pixels (both rows) into `max_pooling_2x2`
-  in one drain; the pooler pairs rows oy/oy+1. Contiguous `pool_out_addr_cnt`
-  still yields row-major 4×4.
-- **Firmware:** auto-engages on `row_par && out_w==8` (Conv5 non-pool + Conv6 pool).
-- **General:** any narrow layer with out_w==8; runtime `group_size`/`R`. (out_w in
-  9..15 stays R=1 — packing needs 2*group_size≤16; out of scope, see spec.)
-- Result: array util **50% → ~100%** (Conv5/6); full run **7,680,437 → 7,427,997
-  (−252,440, −3.3%)**, bit-identical `SCORE_CHK=D30179DF` 10/10. (The Phase-0
-  `prof_busy_layer` IRQ-wait proxy under-estimated this at ~0.2%; the clean
-  row_block on/off full-run A/B is the ground truth — measure, don't extrapolate.)
+Success criteria:
 
-### O: One-start-all-OC — OC-inner loop with all-OC-resident weights (`oc_single`, CTRL[12])
+- Real result: `=== Result: 10/10 correct ===` and `DEPLOY SUCCESS.`
+- `ALL TESTS PASSED.` only means `start7.S` wrote `123456789` to TEST MMIO after
+  `usercode7()` returned. It is useful, but it is not the MNIST success marker.
+- `Errors: 0` from ModelSim only means the simulation finished without simulator
+  errors.
 
-For layers with OC > 16 the legacy path (decision D) issues one NPU start per
-16-OC tile, each **re-sweeping the spatial output and reloading the im2col line
-buffer** — an O(OC/16) redundancy that grows with output-channel count.
-`oc_single` computes **all OC tiles in ONE start**: per spatial group the im2col
-window is loaded once and **reused across every OC tile** (OC-inner loop), so the
-per-OC im2col reload is removed. The primary goal is **generality** — removing an
-O(OC) redundancy that bigger models pay proportionally more — not MNIST cycles.
-- **Weights (decision G interaction):** OC-inner reuse would re-prefetch weights
-  per group unless all OC tiles' weights are resident. So `wgt_reader` prefetches
-  **all OC tiles** once into `wgt_buf[ko][MAX_OC_RESIDENT=64][ICG_BUF]` (outer
-  `pf_oct` tile loop); during CALC `i_oc_tile_sel` selects the active tile's 16
-  channels. Weight-read count is unchanged vs decision G.
-- **Regfile:** bias/scale/shift expanded to 64 entries (ch 0..15 legacy blocks,
-  ch 16..63 at `0x160/0x220/0x2E0`); `i_oc_tile_sel` (from FSM `oc_t`) presents
-  the active tile's 16-window. `i_oc_tile_sel==0` ⇒ legacy low-16 ⇒ byte-identical.
-- **FSM (`top_controller_fsm`):** after S_POST, if more OC tiles remain it advances
-  `oc_t` and re-enters S_PREFETCH_WGT (reuse settle path — weights already resident)
-  to re-CALC against the **same frozen im2col window** with the next tile's weights;
-  no spatial/window advance, no re-prefetch. `active_oc_idx` (= `oc_t` in oc_single,
-  else `oc_tile[9:4]`) drives the Out-SRAM write base and OC-tile selects. Spatial
-  exhaustion ⇒ S_DONE (one IRQ). oc_single off ⇒ `oc_t=0`, byte-identical.
-- **Firmware:** `npu_conv_pass(..., oc_single)` — one start writes all tiles'
-  bias/scale/shift, `NPU_OC`=full OC, CTRL[12]=1, one IRQ, then a single tile-major
-  copy/transpose/DDR-drain of `out_words*oc_passes`.
-- **Scope:** initially non-pool conv (**Conv3** 2 tiles, **Conv5** 4 tiles). Pooled
-  layers (Conv4/Conv6) were extended in **decision P** (per-OC-tile pooler state);
-  all four multi-tile conv layers are now oc_single.
-- **General:** any non-pool conv with OC ≤ `MAX_OC_RESIDENT` (64); `OC > 64`
-  falls back to multi-start (decision-D path), like decision G's ICG gate.
-- Result (bit-identical `SCORE_CHK=D30179DF`, 10/10): full run **7,427,997 →
-  7,376,666 (-51,331, -0.69%)**. Per-layer A/B confirms the O(OC) thesis — the
-  4-tile Conv5 wins big (**-76,600**, im2col reused across 3 extra tiles/group)
-  while the 2-tile Conv3 is the floor case (**+25,269**: the narrow-layer im2col
-  saving — FSM busy -3,160, load -2,560 — is outweighed by per-start CPU/MMIO
-  overhead). MNIST is the small-model floor; the win scales with OC for bigger
-  models. (Consistent with [[soc-npu-spec-estimate-caution]]: measure the full-run
-  A/B, the per-phase proxy misleads.)
+## What Runs Where
 
-### P: Pooled oc_single — per-OC-tile pooler state (decision O follow-on)
+NPU:
 
-Decision O's `oc_single` was limited to **non-pool** conv because the 2×2 pooler
-(`max_pooling_2x2`) holds cross-ROW state (previous-row line buffer + column/row
-phase + neighbour regs) that the OC-inner loop's interleaved tile drains corrupt.
-Decision P makes the pooler state **per-OC-tile** so pooled layers (Conv4, Conv6)
-also run oc_single. Chosen over the row-pair-loop-nesting alternative because it's
-**general for any out_w** (no need to pack 2 rows into the 16-wide array — infeasible
-for out_w=16) and needs **no FSM loop change** — only localized pooler/Out-write edits.
-- **`max_pooling_2x2`:** `line_buf`/`col`/`row_odd`/`cur_left`/`above_left` →
-  `[NUM_TILES=4]`, indexed by new `i_tile`; `i_start` clears all tiles. `i_tile==0`
-  (oc_single off) touches only tile 0 ⇒ byte-identical.
-- **Out-write counter:** the OC-inner loop revisits each tile once per group-row
-  (interleaved), so the within-tile pooled counter is **per-tile** (`pool_out_cnt[tile]`,
-  reset only on op start — not on tile switch) plus a tile-major base
-  `tile*pool_tile_words`. (A single counter / reset-on-switch overwrote a tile's
-  later pool-rows — the Conv4 2/10 bug.)
-- **Tile-id alignment:** the pooler emits a **registered** `o_pool_tile` aligned with
-  `o_pool_vld`, used for the write tile/base — the FSM `oc_t` may already have advanced
-  at the last pooled pixel of a drain (the Conv4 9/10 bug). Routed
-  `pooler → post_process_top → npu_top`.
-- **Timing safety:** `fsm_pp_done = rp_pool_done` holds S_POST until a tile's replay
-  completes and `oc_t` only advances at S_POST exit, so `i_tile` is stable for the
-  whole of a tile's drain/replay; the registered `o_pool_tile` covers the final pixel.
-- **General:** any pooled conv, any out_w; composes with row-par (I), row-block (N,
-  R=2 replay), and the per-tile HW transpose (L). `NUM_TILES`/`POOL_NTILES` is a
-  capacity knob (= MAX_OC_RESIDENT/16).
-- Result (bit-identical `SCORE_CHK=D30179DF`, 10/10): **Conv4** (2-tile pool)
-  7,376,666 → 7,343,116 (**-33,550**); **Conv6** (4-tile pool+transpose+row-block)
-  7,343,116 → 7,266,176 (**-76,940**, mirrors the 4-tile Conv5 non-pool -76,600).
-  All four multi-tile conv layers (Conv3/4/5/6) now oc_single. **Full run vs the
-  pre-decision-O baseline: 7,427,997 → 7,266,176 (-161,821, -2.18%)** (O -51,331 +
-  P -110,490). Per-image inference 123,492 → 112,042 (npu phase 594,680 → 480,180);
-  ≈ **0.56 ms/image @200MHz**.
+```text
+Conv1..Conv6:
+  HW padding when pad != 0
+  im2col
+  weight-prefetch reuse for ic_groups <= 4
+  16x16 systolic array
+  bias/scale/shift/ReLU
 
-### Q: Raw INT32 output — final-classifier FC on NPU (`int32_out`, CTRL[13])
+Conv2+Pool1, Conv4+Pool2, Conv6+Pool3:
+  2x2 maxpool folded into the same NPU pass
 
-Decision F kept FC2 (the 50→10 final classifier) on the CPU because the NPU
-post-process clamps to INT8, saturating the final logits (argmax would be wrong).
-But the array **already accumulates in INT32** — only the output write path
-quantizes. `int32_out` emits the **scaled, un-clamped INT32** result so any
-final-classifier / un-quantized FC can run on the NPU. General capability;
-removes decision F's limitation ("ALL FC on NPU").
-- **Capture point:** post_process **`s2_quant`** = `(psum+bias)*scale >>> shift`
-  (full INT32, BEFORE the S3 INT8 clamp) — exactly equals the CPU FC2's
-  `(acc*SCALE)>>SHIFT`, so it's bit-identical (same 64-bit signed product /
-  arithmetic-shift / low-32 path FC1's GEMM already matches its CPU oracle on).
-  Exposed as `o_feat32` (16×INT32), delay-matched to `o_feat`.
-- **Packing:** 16 OC × INT32 = 512 b don't fit one 128-b Out word, so a sequencer
-  in `npu_top` latches `o_feat32` at the GEMM write pulse and serializes **4 Out
-  words** (4×INT32 each) at base..base+3; DMA reads 4 words back. Off ⇒ INT8 path
-  untouched ⇒ byte-identical.
-- **Firmware:** `npu_gemm_pass(..., int32_out)` (OUT base = `pass*4`, sets CTRL[13],
-  DMA `4*oc_passes` words). FC2 runs `reduce=0` (legacy GEMM — IC=50 isn't a
-  256-multiple; zero-padded IC/OC contribute 0), `relu` off; CPU reads the 10 INT32
-  logits for argmax. CPU FC2 MAC loop removed.
-- Result: bit-identical `SCORE_CHK=D30179DF`, 10/10 (NPU INT32 == CPU FC2 exactly).
-  **Full run 7,266,176 → 7,323,134 (+56,958, +0.78%) — a REGRESSION:** FC2 is 500
-  MACs, too small to amortize the NPU per-pass overhead (~50 MMIO + IRQ + 2 DMAs),
-  so it loses to the CPU loop on MNIST. Kept for the **general capability** + "all
-  FC on NPU" uniformity; a model with a LARGE final FC wins with the same code.
-  (Phase 0: CPU FC2 = ~22.6K/img for 500 MACs ≈ 44 cyc/MAC — PicoRV32's slow
-  multicycle execution, not a slow multiplier. The profiled per-image misleadingly
-  showed a gain; the non-profiled full-run A/B is ground truth — see
-  [[soc-npu-spec-estimate-caution]].)
+FC1 + FC2 (whole MLP on NPU):
+  GEMM/FC mode via CTRL[7] gemm_en, gemm_reduce CTRL[10] (16-row IC reduction)
+  FC1 (1024->50, ReLU, INT8): input vector in Act PONG, weights in Wgt PONG
+  FC2 (50->10): int32_out CTRL[13] emits raw un-clamped INT32 logits; CPU only
+    reads the 10 logits for argmax (no CPU dot-product)
 
-### IRQ map (PicoRV32 `irq[]` bits)
+Data movement:
+  Weights RESIDENT in DDR (packed by gen_weights_hex.py, loaded by $readmemh =
+    flash/boot image); CPU DMAs them once into Wgt SRAM (resident all images)
+  Raw images RESIDENT in DDR (gen_act_hex.py byte-packs them, 49 words/image =
+    models a camera writing raw bytes to SDRAM); CPU DMAs the 49 raw words into
+    an Act-SRAM scratch, then HW img_expand expands them into the tile-major
+    Conv1 input IN SRAM -- no offline pad, no CPU pixel scatter
+  Inter-layer conv activations stay ON-CHIP: HW sram_copy moves each conv's Out
+    SRAM output to an Act-SRAM residency region (R0=word 0 / R1=word 1024 ping-
+    pong). Conv1..Conv6 never round-trip through DDR; Conv6/Pool3 lands straight
+    in Act PONG[0] where the FC1 GEMM reads it.
+  Only remaining DDR traffic: raw image in + FC1 output staging for FC2 input
+    + final FC2 INT32 logits out
+  DDR <-> Act/Wgt/Out SRAM via NPU AXI DMA; SRAM<->SRAM via img_expand/sram_copy
+  NPU done IRQ on CPU irq bit 3
+  DMA read/write done IRQs on CPU irq bits 4/5
+```
 
-| Bit | Source | Set by | Cleared by |
-|-----|--------|--------|------------|
-| 3 | NPU compute done | `axi_sys.v` latch on `npu_irq_done` | firmware writes `NPU_CTRL_CLEAR_DONE` in handler |
-| 4 | DMA read done | `axi_sys.v` latch on rising edge of `npu_dma_rd_done` | firmware reads `NPU_DMA_STATUS` in handler (ack), or writes `NPU_DMA_RD_TRIG` |
-| 5 | DMA write done | `axi_sys.v` latch on rising edge of `npu_dma_wr_done` | firmware reads `NPU_DMA_STATUS` in handler (ack), or writes `NPU_DMA_WR_TRIG` |
+CPU/firmware:
 
-**Critical:** all three IRQ lines are level-sensitive latches. The handler MUST drop the line before `retirq` or it re-fires forever. **The IRQ mask is set in `start7.S`** via `picorv32_maskirq_insn` — a `1` bit means *disabled*. It currently enables bits 3/4/5 (`~((1<<3)|(1<<4)|(1<<5))`); adding a new IRQ source requires un-masking its bit there, otherwise the latch sets but the CPU never responds.
+```text
+Layer scheduling and NPU/DMA register programming (one start per conv via oc_single)
+Argmax over the NPU FC2 INT32 logits and result checking
+(CPU no longer runs any conv/FC arithmetic -- the whole CNN+MLP is on the NPU)
+```
 
-### Out SRAM bank decoupling (Issue C)
+Notes:
 
-`param_regfile.v` register `0x14C`:
-- bit 0: `dma_act_ping_sel` — which Act SRAM bank DMA writes to
-- bit 1: `dma_wgt_ping_sel` — which Wgt SRAM bank DMA writes to
-- bit 2: `dma_out_ping_sel` — which Out SRAM bank DMA **reads from** (independent of NPU write bank `cfg_ping_pong_sel`)
+- Weights and input images BOTH enter the system from DDR. `gen_weights_hex.py`
+  emits a packed weight image; `gen_act_hex.py` now emits RAW byte-packed images
+  (49 words/image, the un-expanded camera bytes). The shared-memory model
+  `$readmemh`-loads both into DDR at boot (models flash + sensor-resident data).
+  Weights: CPU DMAs them DDR->Wgt SRAM. Images: CPU DMAs the 49 raw words
+  DDR->Act SRAM scratch, then the HW `img_expand` engine expands them in SRAM
+  (its output is bit-identical to the old offline tile-major pad). The firmware
+  never packs weights or scatters image pixels on the CPU; the old CPU-pack/
+  CPU-pad code and the build-time preload toggle were deleted.
+- Inter-layer conv activations are kept on-chip by the HW `sram_copy` engine
+  (Out SRAM -> Act SRAM), ping-ponging between two Act-SRAM regions R0/R1. No
+  conv output round-trips through DDR. `npu_conv_pass(... act_in, act_dst,
+  act_dst_pong)` carries the residency bases; `act_dst < 0` falls back to the old
+  DDR-drain path. Conv6 copies Pool3 straight into Act PONG[0] so FC1 reads it
+  with `in_resident=1` (no DDR load).
+- FC1 is on NPU GEMM, and its weights are pre-packed in CONV-OUTPUT order
+  (`pack_fc1_convorder`) so the GEMM reads the Pool3 output directly -- the old
+  CPU Pool3->FC1 transpose (reorder) is gone.
+- FC2 now runs on the NPU via `int32_out` (CTRL[13], decision Q): the GEMM emits
+  scaled but un-clamped INT32 logits (4 Out words = 16xINT32), so final-logit/
+  argmax fidelity is preserved without the old CPU dot-product. The CPU only reads
+  the 10 INT32 logits from `FC2_OUT_DDR` and runs argmax.
+- Conv3..Conv6 use `oc_single` (CTRL[12], decision O): one NPU start computes all
+  OC tiles with a single shared im2col load. All layers use `row_par` (CTRL[9],
+  task E) for 16-row spatial parallelism; narrow (out_w==8) layers also engage
+  `row_block` (CTRL[11]). bias/scale/shift for all 64 OCs are resident in the
+  param regfile (0x160..0x39C) so the FSM switches OC tiles without CPU reloads.
+- The old CPU-side `pad_activation()` helper has been removed. Hardware padding
+  is driven by `NPU_PAD` and `NPU_CTRL_HW_PAD`.
+- DMA helpers wait on IRQ flags (`dma_rd_irq_flag`, `dma_wr_irq_flag`) rather
+  than tight-polling `NPU_DMA_STATUS`. The IRQ handler reads `NPU_DMA_STATUS` to
+  acknowledge the level-sensitive DMA-done latches.
 
-Decoupling bit 2 from `cfg_ping_pong_sel` allows DMA to drain a completed Out SRAM bank while NPU simultaneously writes to the other bank, enabling future ping-pong overlap optimizations.
+Image preload and HW padding notes:
 
-### Debug prints
+- The important change is not "padding itself"; it is that image formatting moved
+  off the CPU/offline deploy path. `gen_act_hex.py` emits raw byte-packed 28x28
+  MNIST images (49 128-bit words/image), then runtime `img_expand` converts each
+  byte into one 16-lane activation word inside Act SRAM.
+- Spatial convolution padding is handled by the NPU FSM, not materialized in DDR
+  or SRAM. When `NPU_CTRL_HW_PAD` is set, the FSM injects border zero words while
+  reading the unpadded tile-major activation. Current conv pads are Conv1=1,
+  Conv2=1, Conv3=1, Conv4=2, Conv5=1, Conv6=1.
+- 16-lane/channel zero-fill still exists because the datapath word is 128-bit:
+  Conv1 uses only lane0, FC1 has 50 real outputs in a 64-slot tile layout, and
+  FC2 writes 16 INT32 logits but only scores[0..9] are real classes.
 
-Verbose per-layer dumps (max-abs, channel spot-checks) are guarded under `#ifdef DEBUG_VERBOSE`. Compile with `-DDEBUG_VERBOSE` to re-enable. Error/timeout messages (DMA rd/wr timeout, NPU IRQ timeout, DMA error) are always active.
+## Current Optimization State
 
-## Conventions
+Implemented and verified in the current tree:
 
-- Comments in RTL and firmware are bilingual (Chinese/English); keep matching surrounding style.
-- Register-map changes require touching both sides: `rtl/param_regfile.v` and `firmware/firmware.h`.
-- New RTL files must be added to `axi_sys.f`.
-- Firmware C code must be warning-clean under strict CFLAGS.
-- Multiple test programs exist (`deepnet_run.c`, `deepnet_deploy.c`), each defining `usercode7()`. Only one may be linked at a time; switch by editing `FW_C_SRCS` in `run_all.sh`.
-- `makehex.py` pads firmware binary to 524288 words for `$readmemh`.
-- DeepConvNet model assets: `deepnet.h` (dimensions), `deepnet_weights.h` (weights/biases), `mnist_test_images.h` (test images, generated by `extract_images.py`).
+- 128-bit AXI/DDR data path: NPU DMA, arbiter, and shared memory model are
+  128-bit. `axi_full_slave_v1_0_S00_AXI` now uses a width-correct `ADDR_LSB`
+  and registered read pipeline.
+- CPU 32->128 upsizer: `axi_upsizer_32_128` adapts the PicoRV32/bridge 32-bit
+  single-beat CPU path to the 128-bit fabric with lane-select `WSTRB`. The latest
+  version has a fast path for AW+W arriving in the same cycle, saving one cycle
+  on common CPU shared-memory writes.
+- Conv weight residency: `preload_conv_weights()` loads all conv weights once
+  into Wgt SRAM PING bank. Conv passes select per-layer/per-tile bases.
+- Weight-prefetch reuse: `wgt_reader` has an `ICG_BUF=4` buffer and dual-mode
+  prefetch. FSM prefetches once per OC tile for conv layers with `ic_groups<=4`.
+  GEMM and `ic_groups>4` use the fallback path.
+- NPU pooling: Conv2/4/6 fuse 2x2 maxpool into the post-process path.
+- NPU and DMA interrupts: NPU done uses bit 3; DMA read/write done use bits 4/5.
+- OC-pass output overlap: firmware can drain the previous Out SRAM bank while
+  the current OC pass computes (`NPU_OC_OVERLAP=1` by default). Resident layers
+  bypass this (they copy on-chip serially instead of draining to DDR).
+- `img_expand` engine (`rtl/img_expand.v`): reads raw byte-packed pixels from Act
+  SRAM Port B and writes one zero-extended 16-channel tile-major word per pixel
+  back to Act SRAM. Triggered by `NPU_DMA_EXPAND_TRIG` (0x158), done in
+  `NPU_DMA_STATUS[3]`. Builds the Conv1 input in SRAM; output bit-identical to
+  the old offline pad.
+- `sram_copy` engine (`rtl/sram_copy.v`): copies N 128-bit words Out SRAM Port B
+  -> Act SRAM Port B (1 word/cycle, no DDR). Triggered by `NPU_DMA_COPY_TRIG`
+  (0x154), done in `NPU_DMA_STATUS[2]`. Drives inter-layer SRAM residency
+  (R0/R1 ping-pong, and Conv6 -> Act PONG[0] for FC1). Both engines time-share
+  SRAM Port B with `axi_dma` and are mux'd in `npu_top` by `expand_busy` >
+  `copy_busy` > DMA priority; firmware never overlaps them with DMA.
+- Hardware padding: FSM reads tile-major unpadded input and injects border zeros.
+- GEMM/FC mode: `CTRL[7]` bypasses im2col, uses KH=KW=1, and supports
+  `gemm_reduce` (CTRL[10]) for 16-row IC reduction. FC1 and FC2 deploy paths use
+  NPU GEMM. FC2 uses `int32_out` (CTRL[13]) so final logits are scaled INT32, not
+  clamped INT8.
+- INT32 output completion: the externally visible NPU done/IRQ is delayed until
+  the 4-word `int32_out` serializer has committed all 16 INT32 lanes to Out SRAM.
+  This makes `done` mean "output is fully readable", not just "compute finished".
+- Runtime Pool3->FC1 transpose hardware was removed. FC1 weights are pre-packed in
+  Conv-output order by `gen_weights_hex.py`, so FC1 reads Pool3 directly.
+- RTL performance counters: exposed at `0x3000_03A4..0x3000_03BC`, cleared by
+  `NPU_PERF_CLR` at `0x3000_03A0`, printed by `print_perf()`.
+- Debug output is gated behind `DEBUG_VERBOSE`; `NPU_PROFILE` defaults to 0.
+
+Important caveats:
+
+- `axi_upsizer_32_128` is a SoC-specific adapter, not a general AXI width
+  converter. It assumes the CPU-side path is single-beat and single-outstanding,
+  as produced by `axi_lite_to_axi_full`. It does not implement generic burst
+  coalescing, multiple outstanding transactions, or a full W-before-AW write
+  skid path.
+- Combinational SRAM Port-B read (`COMB_B=1`): `axi_dma`, `img_expand`,
+  `sram_copy`, and the skip-read path all assume Port B returns `dob` the SAME
+  cycle the address is driven. This is a sim-model convention shared design-wide,
+  NOT specific to the new engines. The large Act/Out SRAMs (256KB/128KB) cannot be
+  combinational-read on FPGA (they map to registered-output BRAM, data valid +1
+  cycle; LUTRAM is only for tiny RAMs). A real FPGA port must flip the wrappers to
+  `COMB_B=0` AND add one read-latency pipeline stage to EVERY Port-B consumer
+  together (DMA + both engines + skip-read). Treat it as a whole-path change.
+- A parity/validation build for `NPU_GEMM_PARITY=1` if changing GEMM/FC logic.
+  Note: parity reads Pool3 from DDR, which SRAM residency no longer populates, so
+  a meaningful parity run needs a non-residency (DDR-drain) build.
+- Directed hardware-padding and weight-reuse tests if touching either FSM path.
+- `deepnet_run.c` Test11 is stale for the current weight layout: it loads only
+  9 Wgt SRAM words, while the current 16-OC conv weight layout needs 16*9 words
+  for that test. Its failure should not be used to judge the 128-bit AXI update
+  until the test is refreshed.
+
+## Main Gaps / Backlog
+
+Priority order from the current architecture and RTL counters:
+
+1. **Update report/docs to match the code.** `CLAUDE.md` is now refreshed, but
+   `docs/superpowers` checkboxes still read like unexecuted plans. Reconcile or
+   annotate them before using them as project status.
+2. **One-time setup/weight preload.** `TRAP - cyc_total ~= 0.12M` now -- just the
+   one-shot conv/FC weight preload DMA (8768 words DDR -> Wgt SRAM). Much smaller
+   share than before, but if contest scoring counts it, a pre-initialized Wgt-SRAM
+   image or faster boot DMA would shave it.
+3. **CPU data formatting / scheduling.** Conv1 input formatting is HW
+   (`img_expand`), the Pool3->FC1 reorder is folded into the FC1 weight packing,
+   and FC2 is now an NPU INT32 pass -- so the CPU runs NO conv/FC arithmetic. The
+   only remaining CPU work is per-layer NPU/DMA register programming and the final
+   argmax. The dominant remaining cost is the MMIO register writes per layer
+   (bias/scale/shift for up to 64 OCs + dims); batching or descriptor-driven
+   programming is the next lever.
+4. **Array-utilization METRIC is now misleading, not the bottleneck.** After the
+   compute-core port `npu_busy` is only 225,360 of 818,640 cyc_total (~27%), and
+   `arr_active` (27,170) collapsed because `row_par`/`oc_single` do ~15x more work
+   per array-active cycle -- so `array_util=arr/total=3%` UNDER-reads. Report
+   `npu_busy` reduction (1.23M->225K, -82%) or a MAC/active-cycle figure instead.
+   The remaining cyc_total is now CPU register programming + DMA/copy overhead, so
+   the next real lever is cutting per-layer CPU MMIO writes, not the array.
+5. **Low-power architecture.** Add real clock-enable/operand-isolation/SRAM-bank
+   gating and counters or trace evidence. Current enables are useful, but the
+   design still lacks a strong low-power proof.
+6. **Verification package.** Keep expanding directed tests. Current tests cover
+   pooling, post-process pooling, AXI read backpressure, and CPU 32->128 upsizer
+   lane/strobe behavior; still add DMA round-trip, GEMM parity, hardware-padding
+   bit-identical output, weight-reuse fallback, and coverage. The contest text
+   mentions a 95% path coverage target.
+7. **FC2/logit handling. (DONE)** FC2 now runs on the NPU via `int32_out`
+   (CTRL[13], decision Q): scaled un-clamped INT32 logits, so no INT8 saturation
+   of the final logits. The CPU only reads the 10 logits and runs argmax. The
+   whole CNN+MLP is now on the NPU.
+8. **On-chip residency. (DONE)** Inter-layer conv activations now stay in Act
+    SRAM via the `sram_copy` engine (R0/R1 ping-pong); Conv1 input is built in SRAM
+    by `img_expand`. DDR read/write beats dropped 26,040/18,240 -> 530/80 in the
+    latest run. Remaining DDR traffic is raw image input, FC1 output staging
+    (write then read for FC2), and the final FC2 INT32 logits. The next residency
+    step is keeping FC1->FC2 fully on-chip or replacing per-layer MMIO scheduling
+    with descriptors.
+9. **Simulation ergonomics.** `modelsim/run_modelsim.bat batch` via `run.do`
+   logs all signals and can be extremely slow. Use `run_flow.ps1 -Mode batch`
+   for normal regression, or change `run.do` to avoid `log -r /*` in batch mode.
+
+## Key Files
+
+```text
+Build/sim:
+  run_flow.ps1
+  modelsim/{compile.do,run.do,wave.do,run_modelsim.bat}
+
+Firmware:
+  firmware/{start7.S,irq.c,print.c,deepnet_deploy.c,firmware.h,
+            deepnet_weights.h,mnist_test_images.h}
+
+NPU RTL:
+  rtl/{npu_top,npu_axi_wrapper,param_regfile,axi_dma,top_controller_fsm,
+       im2col_line_buffer,wgt_reader,systolic_16x16,post_process_top,
+       max_pooling_2x2,vector_alu,sram_models}.v
+  rtl/{img_expand,sram_copy}.v   # on-chip SRAM data-movement engines
+
+SoC/TB:
+  rtl/{axi_sys,axi_sys_tb,picorv32,axi_lite_ram,axi_lite_to_axi_full,
+       axi_arbiter_2to1,axi_full_slave_v1_0_S00_AXI,axi_upsizer_32_128}.v
+
+Unit tests:
+  tests/{tb_max_pooling_2x2,tb_post_process_pool,
+         tb_axi_read_backpressure,tb_axi_upsizer}.v
+
+Design docs:
+  docs/superpowers/plans/*.md
+  docs/superpowers/specs/*.md
+
+Logs:
+  sim/modelsim/{compile.log,direct_batch.log,sim.log,*_batch.wlf}
+```
+
+## Address Map
+
+```text
+0x0000_0000..0x00FF_FFFF  private RAM (firmware)
+0x1000_0000               UART MMIO
+0x2000_0000               TEST MMIO
+0x3000_0000..0x3000_0FFF  NPU registers (param_regfile)
+0x4000_0000+              shared memory / DDR model
+```
+
+Important NPU register/control bits:
+
+```text
+CTRL[0] start        CTRL[9]  row_par      (16-row spatial parallelism, task E)
+CTRL[1] ping_pong    CTRL[10] gemm_reduce  (GEMM 16-row IC-reduction, decision M)
+CTRL[2] pool_en      CTRL[11] row_block    (row-block packing, narrow layers, #4)
+CTRL[4] clear_done   CTRL[12] oc_single    (all OC tiles in one start, decision O)
+CTRL[5] relu_en      CTRL[13] int32_out    (raw INT32 output, decision Q, FC2)
+CTRL[6] out_ping
+CTRL[7] gemm_en
+CTRL[8] hw_pad
+
+NPU_PAD            0x150  {pad_h[15:8], pad_w[7:0]}
+NPU_DMA_COPY_TRIG  0x154  write: start sram_copy (Out->Act residency)
+NPU_DMA_EXPAND_TRIG 0x158 write: start img_expand (raw->tile-major Conv1 input)
+NPU_BIAS/SCALE/SHIFT  ch0-15 @ 0x40/0x80/0xC0; ch16-63 @ 0x160/0x220/0x2E0
+                      (64-OC resident regfile for oc_single, decision O)
+NPU_PERF_CLR       0x3A0  (relocated above the 0x160..0x39C resident-param block)
+NPU_PERF_*         0x3A4..0x3BC
+NPU_DMA_STATUS     0x140  [0]rd_done [1]wr_done [2]copy_done [3]expand_done
+```
+
+Data path:
+
+```text
+print:    print_str/hex -> store 0x1000_0000 -> axi_sys UART decode -> $write
+NPU reg:  store 0x3000_xxxx -> axi_sys MMIO -> npu_axi_wrapper -> param_regfile
+CPU data: store/load 0x4000_xxxx -> axi_lite_to_axi_full (32-bit single beat)
+              -> axi_upsizer_32_128 -> 128-bit AXI arbiter
+              -> 128-bit shared DDR model
+NPU data: DDR <-> 128-bit AXI arbiter <-> npu_axi_wrapper
+              <-> 128-bit axi_dma <-> Act/Wgt/Out SRAM
+              <-> im2col / wgt_reader / systolic / post-process / vector ALU
+```
+
+AXI verification notes:
+
+```text
+tests/tb_axi_read_backpressure.v:
+  Runs the shared-memory read channel with RREADY gaps and the "last beat held
+  while a new AR arrives" conflict. Use -gDW=128 for the current shared-memory
+  width.
+
+tests/tb_axi_upsizer.v:
+  Checks CPU 32-bit writes into all four lanes of one 128-bit word, partial
+  WSTRB behavior, and readback lane muxing through axi_upsizer_32_128.
+```
+
+## Working Rules
+
+- Keep changes small and focused; preserve the 10/10 baseline.
+- Verify with smoke first, then batch.
+- For risky RTL timing changes in FSM, padding, GEMM, weight reuse, or pooling,
+  add a directed testbench before spending time on full MNIST simulation.
+- Use `run_flow.ps1 -Mode batch` for normal full regression.
+- Do not revert the ModelSim flow to VCS; do not restore old VCS/Verdi artifacts.
+- This directory is not a git repo; there is no local commit history to consult.

@@ -138,14 +138,6 @@ module npu_top #(
     wire [3:0]                       fsm_rows_per_grp;   // #4: R output rows packed
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
-    wire                            cfg_transpose_trig; // 0x15C: Conv6->FC transpose trigger pulse
-    wire                            transpose_done;
-    wire                            transpose_busy;
-    wire [SRAM_ADDR_W-1:0]          transpose_out_rd_addr;
-    wire                            transpose_out_rd_en;
-    wire [SRAM_ADDR_W-1:0]          transpose_act_wr_addr;
-    wire                            transpose_act_wr_en;
-    wire [ACT_DATA_W-1:0]           transpose_act_wr_data;
     wire                            expand_done;
     wire                            expand_busy;
     wire [SRAM_ADDR_W-1:0]          expand_addr;
@@ -163,6 +155,8 @@ module npu_top #(
     wire [7:0]                      cfg_pad_h;          // NPU_PAD[15:8]
     wire                            status_done_irq;
     wire                            status_busy;
+    wire                            npu_done_irq;
+    wire                            npu_busy_visible;
     wire                            dma_rd_err;
     wire                            dma_wr_err;
 
@@ -218,6 +212,36 @@ module npu_top #(
     wire                            cfg_dma_act_ping_sel; // DMA Act SRAM buffer select
     wire                            cfg_dma_wgt_ping_sel; // DMA Wgt SRAM buffer select
     wire                            cfg_dma_out_ping_sel; // DMA Out SRAM read bank (decoupled from NPU write bank)
+
+    // ===================================================================
+    // Performance counter event strobes (fed to param_regfile @0x3A4+).
+    // fsm_busy / fsm_array_vld are declared HERE (earlier than the FSM signal
+    // block below) because the param_regfile instance taps them above their FSM
+    // connection -- declaring at first use avoids an implicit-net redeclaration.
+    // ===================================================================
+    wire fsm_array_vld;
+    wire fsm_busy;
+
+    wire perf_rd_beat = m_axi_rvalid && m_axi_rready;  // one read data beat
+    wire perf_wr_beat = m_axi_wvalid && m_axi_wready;  // one write data beat
+
+    reg  perf_rd_busy_r, perf_wr_busy_r;               // burst-outstanding flags
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            perf_rd_busy_r <= 1'b0;
+            perf_wr_busy_r <= 1'b0;
+        end else begin
+            if (m_axi_arvalid && m_axi_arready)
+                perf_rd_busy_r <= 1'b1;
+            else if (m_axi_rvalid && m_axi_rready && m_axi_rlast)
+                perf_rd_busy_r <= 1'b0;
+
+            if (m_axi_awvalid && m_axi_awready)
+                perf_wr_busy_r <= 1'b1;
+            else if (m_axi_bvalid && m_axi_bready)
+                perf_wr_busy_r <= 1'b0;
+        end
+    end
 
     // ===================================================================
     // Instantiate Parameter Register File
@@ -317,8 +341,12 @@ module npu_top #(
         .i_copy_done       (copy_done),
         .o_expand_trig     (cfg_expand_trig),
         .i_expand_done     (expand_done),
-        .o_transpose_trig  (cfg_transpose_trig),
-        .i_transpose_done  (transpose_done)
+        .i_perf_busy       (fsm_busy),
+        .i_perf_arr_active (fsm_array_vld),
+        .i_perf_rd_beat    (perf_rd_beat),
+        .i_perf_wr_beat    (perf_wr_beat),
+        .i_perf_rd_busy    (perf_rd_busy_r),
+        .i_perf_wr_busy    (perf_wr_busy_r)
     );
 
     // ===================================================================
@@ -457,7 +485,6 @@ module npu_top #(
     wire [15:0]                 fsm_im2col_win_x;
     wire [15:0]                 fsm_im2col_win_y;
 
-    wire                        fsm_array_vld;
     wire                        fsm_array_k_end;
     wire                        fsm_array_drain_en;
 
@@ -481,7 +508,6 @@ module npu_top #(
 
     wire                        fsm_in_drain;
     wire                        fsm_in_post;
-    wire                        fsm_busy;
     wire                        fsm_done_irq;
 
     wire [9:0]                  fsm_cur_ic_tile;
@@ -585,9 +611,9 @@ module npu_top #(
     assign act_sram_addra = fsm_act_sram_addr;
 
     // Status signals
-    assign status_done_irq = fsm_done_irq;
-    assign status_busy     = fsm_busy;
-    assign irq_done        = fsm_done_irq;
+    assign status_done_irq = npu_done_irq;
+    assign status_busy     = npu_busy_visible;
+    assign irq_done        = npu_done_irq;
 
     // ===================================================================
     // Weight Reader
@@ -996,6 +1022,8 @@ module npu_top #(
     reg [1:0]             i32_cnt;
     reg                   i32_active;
     reg [SRAM_ADDR_W-1:0] i32_base;
+    reg                   i32_done_pending;
+    reg                   i32_done_irq_r;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             i32_buf <= {NUM_CH*32{1'b0}}; i32_cnt <= 2'd0;
@@ -1013,6 +1041,37 @@ module npu_top #(
     wire                  i32_wr_en   = i32_active;
     wire [SRAM_ADDR_W-1:0] i32_wr_addr = i32_base + {{(SRAM_ADDR_W-2){1'b0}}, i32_cnt};
     wire [ACT_DATA_W-1:0] i32_wr_data = i32_buf[i32_cnt*ACT_DATA_W +: ACT_DATA_W];
+    wire                  i32_last_write = i32_active && (i32_cnt == 2'd3);
+
+    // In INT32-output mode the FSM can reach DONE before the 4-word serializer
+    // has committed all logits to Out SRAM. Delay the externally visible done
+    // pulse until the final serializer write is on the SRAM write edge.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            i32_done_pending <= 1'b0;
+            i32_done_irq_r   <= 1'b0;
+        end else begin
+            i32_done_irq_r <= 1'b0;
+            if (cfg_start) begin
+                i32_done_pending <= 1'b0;
+            end
+
+            if (cfg_int32_out && fsm_done_irq) begin
+                if (!i32_active || i32_last_write) begin
+                    i32_done_pending <= 1'b0;
+                    i32_done_irq_r   <= 1'b1;
+                end else begin
+                    i32_done_pending <= 1'b1;
+                end
+            end else if (i32_done_pending && i32_last_write) begin
+                i32_done_pending <= 1'b0;
+                i32_done_irq_r   <= 1'b1;
+            end
+        end
+    end
+
+    assign npu_done_irq     = cfg_int32_out ? i32_done_irq_r : fsm_done_irq;
+    assign npu_busy_visible = fsm_busy | (cfg_int32_out & (i32_active | i32_done_pending));
 
     // In pool mode the Out-SRAM write is self-timed by the pooler's output
     // valid (pool_vld = pp_feat_vld) with the contiguous pool_out_addr_cnt;
@@ -1074,21 +1133,17 @@ module npu_top #(
     wire act_dma_wr_active = dma_sram_wr_en & ~cfg_dma_sram_sel;
     wire act_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd1);
 
-    // Copy/transpose engines take Act Port B while busy (writes); else DMA muxes.
+    // img_expand / sram_copy take Act Port B while busy; else DMA muxes.
     assign act_sram_addrb = expand_busy ? expand_addr
                           : copy_busy ? copy_act_wr_addr
-                          : transpose_busy ? transpose_act_wr_addr
                           : act_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
     assign act_sram_enb   = expand_busy ? expand_en
                           : copy_busy ? copy_act_wr_en
-                          : transpose_busy ? transpose_act_wr_en
                           : (act_dma_wr_active | act_dma_rd_active);
     assign act_sram_dib   = expand_busy ? expand_wdata
-                          : copy_busy ? copy_act_wr_data
-                          : transpose_busy ? transpose_act_wr_data : dma_sram_wr_data;
+                          : copy_busy ? copy_act_wr_data : dma_sram_wr_data;
     assign act_sram_web   = expand_busy ? expand_we
-                          : copy_busy ? copy_act_wr_en
-                          : transpose_busy ? transpose_act_wr_en : act_dma_wr_active;
+                          : copy_busy ? copy_act_wr_en : act_dma_wr_active;
 
     // Wgt SRAM Port B: DMA writes (sel=1) or DMA reads (rd_sram_sel=2)
     wire wgt_dma_wr_active = dma_sram_wr_en & cfg_dma_sram_sel;
@@ -1111,11 +1166,9 @@ module npu_top #(
     assign out_sram_addrb_mux = cfg_dma_out_rd_sel ? out_sram_addrb_dma : skip_rd_addr;
     assign out_sram_enb_mux   = cfg_dma_out_rd_sel ? out_sram_enb_dma   : skip_rd_en;
 
-    // Copy engine takes Out Port B while busy (reads); else the skip/DMA mux.
-    assign out_sram_addrb = copy_busy ? copy_out_rd_addr
-                          : transpose_busy ? transpose_out_rd_addr : out_sram_addrb_mux;
-    assign out_sram_enb   = copy_busy ? copy_out_rd_en
-                          : transpose_busy ? transpose_out_rd_en : out_sram_enb_mux;
+    // sram_copy takes Out Port B while busy (reads); else the skip/DMA mux.
+    assign out_sram_addrb = copy_busy ? copy_out_rd_addr : out_sram_addrb_mux;
+    assign out_sram_enb   = copy_busy ? copy_out_rd_en   : out_sram_enb_mux;
     assign out_sram_web   = 1'b0;
     assign out_sram_dib   = {ACT_DATA_W{1'b0}};
 
@@ -1160,35 +1213,6 @@ module npu_top #(
         .o_act_wr_data (copy_act_wr_data),
         .o_busy        (copy_busy),
         .o_done        (copy_done)
-    );
-
-    // ===================================================================
-    // Conv6 -> FC1 transpose engine (hardware reorder, decision L). Reads a
-    // pass's tile-major Out SRAM output (Port B), transposes to channel-major,
-    // writes Act SRAM (Port B). Banks follow cfg_dma_out_ping_sel (Out read) /
-    // cfg_dma_act_ping_sel (Act write, = PONG for the GEMM input). src/dst reuse
-    // the DMA SRAM-base regs; i_npos = cfg_dma_rd_len (positions this pass).
-    // Time-shares Port B with copy/dma (mutually exclusive in firmware).
-    // ===================================================================
-    transpose_engine #(
-        .ADDR_W   (SRAM_ADDR_W),
-        .DATA_W   (ACT_DATA_W),
-        .MAX_NPOS (16)
-    ) u_transpose (
-        .clk           (clk),
-        .rst_n         (rst_n),
-        .i_trig        (cfg_transpose_trig),
-        .i_src_base    (cfg_dma_rd_sram_base),
-        .i_dst_base    (cfg_dma_wr_sram_base),
-        .i_npos        (cfg_dma_rd_len),
-        .o_out_rd_addr (transpose_out_rd_addr),
-        .o_out_rd_en   (transpose_out_rd_en),
-        .i_out_rd_data (out_sram_dob),
-        .o_act_wr_addr (transpose_act_wr_addr),
-        .o_act_wr_en   (transpose_act_wr_en),
-        .o_act_wr_data (transpose_act_wr_data),
-        .o_busy        (transpose_busy),
-        .o_done        (transpose_done)
     );
 
     // ===================================================================
@@ -1284,35 +1308,5 @@ module npu_top #(
         .m_axi_bid       (m_axi_bid),
         .m_axi_bresp     (m_axi_bresp)
     );
-
-    // synthesis translate_off
-    // ---- #4-followup Phase 0: FSM-state cycle decomposition ----
-    // Counts where Conv5/6 (in_w==10, non-GEMM) busy goes: LOAD (im2col line-load)
-    // vs CALC (array sweep) vs DRAIN vs other. Decides if cross-OC-pass im2col
-    // reuse (cutting LOAD) actually pays off before committing.
-    integer c56_busy = 0, c56_load = 0, c56_calc = 0, c56_drain = 0;
-    integer all_busy = 0, all_load = 0, all_calc = 0, all_drain = 0;
-    wire dbg_is_c56 = (cfg_dim_in_w == 16'd10) && !cfg_gemm_en;
-    always @(posedge clk) begin
-        if (fsm_busy) begin
-            all_busy = all_busy + 1;
-            if (fsm_im2col_pixel_vld) all_load  = all_load  + 1;
-            if (fsm_array_vld)        all_calc  = all_calc  + 1;
-            if (fsm_in_drain)         all_drain = all_drain + 1;
-            if (dbg_is_c56) begin
-                c56_busy = c56_busy + 1;
-                if (fsm_im2col_pixel_vld) c56_load  = c56_load  + 1;
-                if (fsm_array_vld)        c56_calc  = c56_calc  + 1;
-                if (fsm_in_drain)         c56_drain = c56_drain + 1;
-            end
-        end
-    end
-    final begin
-        $display("FSMDBG all  : busy=%0d load=%0d calc=%0d drain=%0d",
-                 all_busy, all_load, all_calc, all_drain);
-        $display("FSMDBG c5/6 : busy=%0d load=%0d calc=%0d drain=%0d",
-                 c56_busy, c56_load, c56_calc, c56_drain);
-    end
-    // synthesis translate_on
 
 endmodule

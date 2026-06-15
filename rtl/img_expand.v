@@ -89,12 +89,4 @@ module img_expand #(
         end
     end
 
-    // synthesis translate_off
-    always @(posedge clk) begin
-        if (state == S_READ && i_rdata != {DATA_W{1'b0}})
-            $display("EXP_READ_NZ sw=%0d addr=%0d rdata=%032h", sw, o_addr, i_rdata);
-        if (state == S_WRITE && o_wdata != {DATA_W{1'b0}})
-            $display("EXP_WR_NZ out=%0d sw=%0d b=%0d addr=%0d wdata_lo=%08h", out_cnt, sw, b, o_addr, o_wdata[31:0]);
-    end
-    // synthesis translate_on
 endmodule
