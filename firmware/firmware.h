@@ -56,6 +56,7 @@ void usercode7(void);
 #define NPU_STRIDE     (NPU_BASE + 0x034)  // [15:8]SX [7:0]SY
 #define NPU_CLIP_MAX   (NPU_BASE + 0x118)  // post-process upper clamp [7:0], default 127; ReLU6 = q(6.0)
 #define NPU_SKIP_BASE  (NPU_BASE + 0x11C)  // residual skip-source Out-SRAM base (0 = same-addr legacy)
+#define NPU_GAVG_CFG   (NPU_BASE + 0x15C)  // global avgpool reciprocal: [25:0]mul [31:26]shift; mean=(sum*mul)>>shift, mul=round(2^shift/N)
 #define NPU_PAD        (NPU_BASE + 0x150)  // [15:8]pad_h [7:0]pad_w (hardware padding, CTRL[8])
 
 // Performance counters (RTL, read-only; write NPU_PERF_CLR to reset all)
@@ -114,6 +115,7 @@ void usercode7(void);
 #define NPU_CTRL_OC_SINGLE   (1 << 12) // all-OC-tiles in one start (decision O): OC-inner loop in HW
 #define NPU_CTRL_INT32_OUT   (1 << 13) // raw INT32 output (decision Q, final FC logits)
 #define NPU_CTRL_POOL_AVG    (1 << 16) // 2x2 average pooling (vs max); needs POOL_EN
+#define NPU_CTRL_GPOOL_EN    (1 << 17) // global average pooling (one mean word per OC tile)
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)

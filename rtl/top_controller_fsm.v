@@ -118,7 +118,10 @@ module top_controller_fsm #(
     output wire [15:0]              o_cur_oy,
 
     // === Decision O: active OC-tile selector (oc_single OC-inner loop) ===
-    output wire [2:0]               o_oc_tile_sel   // 0 when oc_single off (byte-identical)
+    output wire [2:0]               o_oc_tile_sel,  // 0 when oc_single off (byte-identical)
+
+    // === global avgpool: current output position is the last of this OC tile ===
+    output wire                     o_last_spatial
 );
 
     // -------------------------------------------------------------------
@@ -326,6 +329,13 @@ module top_controller_fsm #(
     // the outer oc_tile (0,16,32→idx 0,1,2). 0 when oc_single off ⇒ byte-identical.
     wire [5:0] active_oc_idx = i_oc_single ? {3'd0, oc_t} : oc_tile[9:4];
     assign o_oc_tile_sel = active_oc_idx[2:0];
+
+    // global avgpool: this output position is the last spatial point of the tile
+    // (used to trigger the single mean write). Valid during S_POST where cur_ox/oy
+    // hold the current position. group_size=1, rows_per_grp=1 in the plain (non
+    // row_par) mode global avgpool is used in.
+    assign o_last_spatial = (cur_ox + group_size >= out_w) &&
+                            (cur_oy + {12'd0, rows_per_grp} >= out_h);
 
     // Out SRAM write — include OC tile offset so tiles don't overwrite each other
     wire [SRAM_ADDR_W-1:0] out_wr_addr_calc;

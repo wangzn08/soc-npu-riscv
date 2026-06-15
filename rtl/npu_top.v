@@ -127,6 +127,10 @@ module npu_top #(
     wire [7:0]                      cfg_clip_max;
     wire                            cfg_pool_avg;
     wire [SRAM_ADDR_W-1:0]          cfg_skip_base;
+    wire                            cfg_gpool_en;
+    wire [31:0]                     cfg_gavg_mul;
+    wire [5:0]                      cfg_gavg_shift;
+    wire                            fsm_last_spatial;
     wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
@@ -291,6 +295,9 @@ module npu_top #(
         .o_oc_single      (cfg_oc_single),
         .o_int32_out      (cfg_int32_out),
         .o_pool_avg       (cfg_pool_avg),
+        .o_gpool_en       (cfg_gpool_en),
+        .o_gavg_mul       (cfg_gavg_mul),
+        .o_gavg_shift     (cfg_gavg_shift),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
         .o_clip_max       (cfg_clip_max),
@@ -609,7 +616,8 @@ module npu_top #(
         .o_cur_ic_tile        (fsm_cur_ic_tile),
         .o_cur_oc_tile        (fsm_cur_oc_tile),
         .o_cur_ox             (fsm_cur_ox),
-        .o_cur_oy             (fsm_cur_oy)
+        .o_cur_oy             (fsm_cur_oy),
+        .o_last_spatial       (fsm_last_spatial)
     );
 
     // Connect FSM to Act SRAM Port A
@@ -1081,19 +1089,61 @@ module npu_top #(
     assign npu_done_irq     = cfg_int32_out ? i32_done_irq_r : fsm_done_irq;
     assign npu_busy_visible = fsm_busy | (cfg_int32_out & (i32_active | i32_done_pending));
 
+    // -------------------------------------------------------------------
+    // Global average pooling (CTRL[17] gpool_en). Accumulates the per-position
+    // post-process output across the OC tile's spatial sweep and emits one mean
+    // word at the last position. Used in plain (non-pool/non-row_par/non-int32)
+    // legacy multi-start mode: one NPU start per 16-OC tile. gpool_en off ⇒ block
+    // idle and the write mux below is unchanged ⇒ byte-identical.
+    // -------------------------------------------------------------------
+    wire [ACT_DATA_W-1:0] gavg_feat;
+    wire                  gavg_feat_vld;
+    wire gpool_feed_vld = cfg_gpool_en & fsm_out_wr_en;                    // one per output position
+    wire gpool_last     = cfg_gpool_en & fsm_out_wr_en & fsm_last_spatial; // last position of tile
+
+    global_avg #(.NUM_CH(ARRAY_COLS)) u_global_avg (
+        .clk(clk), .rst_n(rst_n),
+        .i_start(cfg_start),
+        .i_feat(alu_res),
+        .i_feat_vld(gpool_feed_vld),
+        .i_last(gpool_last),
+        .i_avg_mul(cfg_gavg_mul),
+        .i_avg_shift(cfg_gavg_shift),
+        .o_feat(gavg_feat),
+        .o_feat_vld(gavg_feat_vld)
+    );
+
+    // Latch the tile's first output address; the single mean word lands there.
+    reg [OUT_SRAM_ADDR_W-1:0] gpool_addr;
+    reg                       gpool_addr_set;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            gpool_addr     <= {OUT_SRAM_ADDR_W{1'b0}};
+            gpool_addr_set <= 1'b0;
+        end else if (cfg_start) begin
+            gpool_addr_set <= 1'b0;
+        end else if (cfg_gpool_en && fsm_out_wr_en && !gpool_addr_set) begin
+            gpool_addr     <= fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
+            gpool_addr_set <= 1'b1;
+        end
+    end
+
     // In pool mode the Out-SRAM write is self-timed by the pooler's output
     // valid (pool_vld = pp_feat_vld) with the contiguous pool_out_addr_cnt;
     // in non-pool mode it is FSM-driven exactly as before.
-    assign out_sram_ena   = cfg_int32_out  ? i32_wr_en
+    assign out_sram_ena   = cfg_gpool_en   ? gavg_feat_vld
+                          : cfg_int32_out  ? i32_wr_en
                           : cfg_pool_en    ? pp_feat_vld
                           : cfg_row_par_en ? rp_wr_en
                           :                  fsm_out_wr_en;
     assign out_sram_wea   = out_sram_ena;
-    assign out_sram_addra = cfg_int32_out  ? i32_wr_addr[OUT_SRAM_ADDR_W-1:0]
+    assign out_sram_addra = cfg_gpool_en   ? gpool_addr
+                          : cfg_int32_out  ? i32_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           : cfg_pool_en    ? pool_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           : cfg_row_par_en ? rp_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           :                  fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
-    assign out_sram_dia   = cfg_int32_out  ? i32_wr_data : alu_res;
+    assign out_sram_dia   = cfg_gpool_en   ? gavg_feat
+                          : cfg_int32_out  ? i32_wr_data : alu_res;
 
     // synthesis translate_off
     `ifdef DEBUG
