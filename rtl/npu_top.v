@@ -851,6 +851,7 @@ module npu_top #(
 
     wire                  rp_pool_done;   // row-par pool replay complete (FSM advance)
     wire [1:0]            pp_pool_tile;   // decision P: tile of the pooled output (aligned w/ pp_feat_vld)
+    wire [NUM_CH*32-1:0] pp_feat32;      // decision Q: raw INT32 post-process output (16×INT32)
 
     // Valid signal for post-process from FSM (during DRAIN + pipeline flush)
     wire pp_input_vld;
@@ -880,7 +881,8 @@ module npu_top #(
         .o_pool_tile   (pp_pool_tile),
         .o_rp_pool_done(rp_pool_done),
         .o_feat        (pp_feat),
-        .o_feat_vld    (pp_feat_vld)
+        .o_feat_vld    (pp_feat_vld),
+        .o_feat32      (pp_feat32)
     );
 
     // ===================================================================

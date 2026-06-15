@@ -52,7 +52,12 @@ module post_process_top #(
 
     // Output feature data
     output wire [DATA_W-1:0]                o_feat,
-    output wire                             o_feat_vld
+    output wire                             o_feat_vld,
+
+    // Decision Q: raw INT32 output — the scaled, un-clamped stage-2 result
+    // (16 channels × 32 bit), delay-matched to o_feat/o_feat_vld. Used by the
+    // int32 write sequencer in npu_top for final-classifier FC (FC2).
+    output wire [NUM_OC*PSUM_WIDTH-1:0]     o_feat32
 );
 
     // -------------------------------------------------------------------
@@ -310,5 +315,35 @@ module post_process_top #(
 
     assign o_feat     = i_pool_en ? pool_out      : bypass_dly[POOL_LATENCY-1];
     assign o_feat_vld = i_pool_en ? pool_vld      : bypass_vld_dly[POOL_LATENCY-1];
+
+    // -------------------------------------------------------------------
+    // Decision Q: raw INT32 output. s2_quant is the scaled, un-clamped 32-bit
+    // result (= CPU's (psum+bias)*scale>>shift). Mirror the INT8 bypass delay
+    // (s3 register + POOL_LATENCY) so o_feat32 aligns with o_feat_vld. Used only
+    // in int32_out mode (GEMM/final-FC, non-pool); off ⇒ unused ⇒ byte-identical.
+    // -------------------------------------------------------------------
+    wire [NUM_OC*PSUM_WIDTH-1:0] s2_flat;
+    generate
+        for (gi = 0; gi < NUM_OC; gi = gi + 1) begin : gen_s2flat
+            assign s2_flat[gi*PSUM_WIDTH +: PSUM_WIDTH] = s2_quant[gi];
+        end
+    endgenerate
+
+    reg [NUM_OC*PSUM_WIDTH-1:0] s3_i32;                       // mirrors s3_act timing
+    reg [NUM_OC*PSUM_WIDTH-1:0] i32_dly [0:POOL_LATENCY-1];   // mirrors bypass_dly
+    integer di;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            s3_i32 <= {NUM_OC*PSUM_WIDTH{1'b0}};
+            for (di = 0; di < POOL_LATENCY; di = di + 1)
+                i32_dly[di] <= {NUM_OC*PSUM_WIDTH{1'b0}};
+        end else begin
+            if (s2_vld) s3_i32 <= s2_flat;        // == s3_act register stage
+            i32_dly[0] <= s3_i32;
+            i32_dly[1] <= i32_dly[0];
+            i32_dly[2] <= i32_dly[1];
+        end
+    end
+    assign o_feat32 = i32_dly[POOL_LATENCY-1];
 
 endmodule
