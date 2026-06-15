@@ -130,6 +130,7 @@ module npu_top #(
     wire                            cfg_row_par_en;     // CTRL[9]: 16-row spatial parallelism
     wire                            cfg_gemm_reduce;    // CTRL[10]: GEMM 16-row IC-reduction
     wire                            cfg_row_block_en;   // CTRL[11]: row-block packing (#4)
+    wire                            cfg_oc_single;      // CTRL[12]: all-OC in one start (decision O)
     wire [3:0]                       fsm_rows_per_grp;   // #4: R output rows packed
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
@@ -255,6 +256,7 @@ module npu_top #(
         .o_row_par_en     (cfg_row_par_en),
         .o_gemm_reduce    (cfg_gemm_reduce),
         .o_row_block_en   (cfg_row_block_en),
+        .o_oc_single      (cfg_oc_single),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
         .i_done_irq       (status_done_irq),
