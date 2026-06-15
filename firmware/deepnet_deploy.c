@@ -874,7 +874,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv4 + Pool2: 16x16 conv -> 2x2 maxpool -> 8x8.
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
                   32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, ACT_RES_B, 0, 0, 0);   // resident in=R1, out->R0
+                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, ACT_RES_B, 0, 0, 0);   // resident in=R1, out->R0 (pool, non-row-block: oc_single n/a — cross-group row-pairing)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool2", ACT_BUF_A, 64 * 32);
 #endif
@@ -895,7 +895,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv6 + Pool3: 8x8 conv -> 2x2 maxpool -> 4x4.
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
                   64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, ACT_RES_B, -1, 16, 0);   // resident in=R1; HW transpose -> Act PONG (FC1 input)
+                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, ACT_RES_B, -1, 16, 0);   // resident in=R1; HW transpose -> Act PONG (FC1 input) (pool+transpose: oc_single n/a — pool reorder/row-pair state not per-tile)
 
     // ---- Pool3 -> FC1 reorder: now done in HARDWARE (decision L) ----
     // The transpose engine wrote Conv6's tile-major Pool3 output directly into

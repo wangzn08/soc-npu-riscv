@@ -835,6 +835,11 @@ module npu_top #(
     // Conv output width for pooling row boundary detection
     // ===================================================================
     wire [15:0] conv_out_w = (cfg_dim_in_w - {8'd0, cfg_kw}) / {8'd0, cfg_sx} + 16'd1;
+    wire [15:0] conv_out_h = (cfg_dim_in_h - {8'd0, cfg_kh}) / {8'd0, cfg_sy} + 16'd1;
+    // Decision O: pooled words per OC-tile = (conv_out_w/2)*(conv_out_h/2). Used to
+    // place each OC tile's pooled output tile-major in the single-start (oc_single).
+    wire [SRAM_ADDR_W-1:0] pool_tile_words =
+         (conv_out_w[SRAM_ADDR_W-1:0] >> 1) * (conv_out_h[SRAM_ADDR_W-1:0] >> 1);
 
     // ===================================================================
     // Post-Processing Pipeline
@@ -897,16 +902,32 @@ module npu_top #(
     // Out SRAM write (Port A) — from post-process/ALU pipeline
     // ===================================================================
     // Pooled output address counter: increments only when pool_vld writes,
-    // so pooled outputs are stored contiguously.
+    // so pooled outputs are stored contiguously WITHIN an OC tile.
+    // Decision O (oc_single): the OC-inner loop emits pool outputs group-major /
+    // tile-inner, so a single contiguous counter would interleave tiles. Reset the
+    // counter at each OC-tile change and add a tile-major base (oc_t*pool_tile_words)
+    // so each tile lands tile-major. oc_single off ⇒ base 0, reset only on cfg_start
+    // ⇒ byte-identical to legacy.
+    reg [2:0] oc_tile_sel_d;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) oc_tile_sel_d <= 3'd0;
+        else        oc_tile_sel_d <= fsm_oc_tile_sel;
+    end
+    wire oc_tile_changed = cfg_oc_single && (fsm_oc_tile_sel != oc_tile_sel_d);
+
     reg [SRAM_ADDR_W-1:0] pool_out_addr_cnt;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             pool_out_addr_cnt <= {SRAM_ADDR_W{1'b0}};
-        else if (cfg_start)
+        else if (cfg_start || oc_tile_changed)
             pool_out_addr_cnt <= {SRAM_ADDR_W{1'b0}};
         else if (out_sram_ena)
             pool_out_addr_cnt <= pool_out_addr_cnt + {{SRAM_ADDR_W-1{1'b0}}, 1'b1};
     end
+    // Tile-major pooled write address (oc_single adds the per-tile base).
+    wire [SRAM_ADDR_W-1:0] pool_wr_addr = pool_out_addr_cnt
+         + (cfg_oc_single ? ({{(SRAM_ADDR_W-3){1'b0}}, fsm_oc_tile_sel} * pool_tile_words)
+                          : {SRAM_ADDR_W{1'b0}});
 
     // ---- Row-parallel non-pool Out-SRAM write sequencer ----
     // Drain emits row 15 first -> row 0 last (pe_core). Array row r holds output
@@ -963,7 +984,7 @@ module npu_top #(
                           : cfg_row_par_en ? rp_wr_en
                           :                  fsm_out_wr_en;
     assign out_sram_wea   = out_sram_ena;
-    assign out_sram_addra = cfg_pool_en    ? pool_out_addr_cnt[OUT_SRAM_ADDR_W-1:0]
+    assign out_sram_addra = cfg_pool_en    ? pool_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           : cfg_row_par_en ? rp_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           :                  fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
     assign out_sram_dia   = alu_res;
