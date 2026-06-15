@@ -412,10 +412,12 @@ static void npu_conv_pass(
     int row_par,       // 1 = 16-row spatial parallelism (task E)
     int act_in,        // Act SRAM word base the NPU reads input from (region ping-pong)
     int act_dst,       // >=0: copy output to Act SRAM word base act_dst (resident); <0: DMA to out_ddr_addr
-    int transpose_npos)// >0: transpose each pass's Out -> Act PONG[pass*npos] (decision L); 0: off
+    int transpose_npos,// >0: transpose each pass's Out -> Act PONG[pass*npos] (decision L); 0: off
+    int oc_single)     // 1 = decision O: compute ALL OC tiles in ONE NPU start (OC-inner loop in HW)
 {
     PROF_T0();
     int oc_passes  = oc / 16;
+    int use_oc_single = oc_single && (oc_passes > 1);
     // 2x2 pooling quarters the spatial size; only pooled points are written.
     int out_words  = pool_en ? (out_spatial >> 2) : out_spatial;
     int out_nbeats = out_words;    // SRAM words written per pass
@@ -431,6 +433,53 @@ static void npu_conv_pass(
     int prev_bank = 0;
     (void)prev_pass; (void)prev_bank;  // unused when overlap is disabled
 
+    if (use_oc_single) {
+        // ---- Decision O: ONE start computes all OC tiles (HW OC-inner loop) ----
+        // im2col window + all-OC-resident weights are loaded once per spatial group
+        // and reused across the OC tiles, instead of one start (re-sweep + reload)
+        // per 16-OC tile. Out SRAM receives every tile tile-major (tile t at
+        // t*out_words) in ONE bank (CTRL[6]=0); downstream copy/transpose unchanged.
+        int rb_out_w  = (in_w - kw) / sx + 1;
+        int row_block = row_par && (rb_out_w == 8);
+        npu_wr(NPU_IN_W, in_w);
+        npu_wr(NPU_IN_H, in_h);
+        npu_wr(NPU_IC, ic);
+        npu_wr(NPU_OC, oc);                  // full OC: FSM tiles internally (decision D+O)
+        npu_wr(NPU_KERNEL, (kh << 8) | kw);
+        npu_wr(NPU_STRIDE, (sx << 8) | sy);
+        npu_wr(NPU_PAD, (pad << 8) | pad);
+        npu_wr(NPU_ACT_ADDR_A, act_in);
+        npu_wr(NPU_WGT_ADDR_A, wgt_base);    // resident; wgt_reader addresses all tiles from base
+        npu_wr(NPU_OUT_ADDR_A, 0);
+        // All OC tiles' per-channel bias/scale/shift (ch 0..oc-1) into the 64-entry regfile.
+        for (int ch = 0; ch < oc; ch++) {
+            npu_wr(NPU_BIAS(ch),  (uint32_t)biases[ch]);
+            npu_wr(NPU_SCALE(ch), bias_scale);
+            npu_wr(NPU_SHIFT(ch), SCALE_SHIFT);
+        }
+        npu_irq_flag = 0;
+        npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_RELU_EN | NPU_CTRL_OC_SINGLE |
+                         (pool_en   ? NPU_CTRL_POOL_EN   : 0) |
+                         (pad       ? NPU_CTRL_HW_PAD    : 0) |
+                         (row_par   ? NPU_CTRL_ROW_PAR   : 0) |
+                         (row_block ? NPU_CTRL_ROW_BLOCK : 0));
+        int t = NPU_IRQ_TIMEOUT;
+        while (t-- > 0) if (npu_irq_flag) break;
+        if (t <= 0) print_str("  NPU IRQ timeout!\n");
+        if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_RD_ERR) print_str("  NPU DMA rd err!\n");
+        if (npu_rd(NPU_STATUS) & NPU_STATUS_DMA_WR_ERR) print_str("  NPU DMA wr err!\n");
+
+        if (transpose_npos > 0) {
+            // Per-tile transpose: tile pass sits at Out word base pass*out_words.
+            for (int pass = 0; pass < oc_passes; pass++)
+                dma_out_transpose_to_act((uint32_t)(pass * transpose_npos),
+                                         (uint32_t)(pass * out_words), transpose_npos, 0);
+        } else if (act_dst >= 0) {
+            dma_out_to_act((uint32_t)act_dst, 0, out_words * oc_passes, 0);
+        } else {
+            dma_out_to_ddr(out_ddr_addr, 0, out_words * oc_passes, 0);
+        }
+    } else
     for (int pass = 0; pass < oc_passes; pass++) {
         int oc_base  = pass * 16;
         int out_bank = pass & 1;   // NPU writes this pass into this Out bank
@@ -773,7 +822,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     img_expand(0, 2048, 28 * 28);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   1, SCALE_CONV1, conv1_b,
-                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0);   // resident: copy out -> Act ACT_RES_B
+                  ACT_BUF_B, 784, CONV1_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0, 0);   // resident: copy out -> Act ACT_RES_B (1 tile: oc_single n/a)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv1", ACT_BUF_B, 784 * 16);
     {
@@ -796,7 +845,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // dma_ddr_to_act(ACT_BUF_B, 0, 28 * 28 * 1);
     npu_conv_pass(30, 30, 16, 16, 3, 3, 1, 1,
                   16, SCALE_CONV2, conv2_b,
-                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1, ACT_RES_B, 0, 0);   // resident in=R1, out->R0
+                  ACT_BUF_B, 784, CONV2_WGT_BASE, 1, 1, 1, ACT_RES_B, 0, 0, 0);   // resident in=R1, out->R0 (1 tile: oc_single n/a)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool1", ACT_BUF_B, 196 * 16);
 #endif
@@ -806,7 +855,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // dma_ddr_to_act(ACT_BUF_B, 0, 14 * 14 * 1);
     npu_conv_pass(16, 16, 16, 32, 3, 3, 1, 1,
                   16, SCALE_CONV3, conv3_b,
-                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0);   // resident in=R0, out->R1
+                  ACT_BUF_A, 196, CONV3_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0, 1);   // resident in=R0, out->R1; oc_single (decision O)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv3", ACT_BUF_A, 196 * 32);
     {
@@ -825,7 +874,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv4 + Pool2: 16x16 conv -> 2x2 maxpool -> 8x8.
     npu_conv_pass(18, 18, 32, 32, 3, 3, 1, 1,
                   32, SCALE_CONV4, conv4_b,
-                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, ACT_RES_B, 0, 0);   // resident in=R1, out->R0
+                  ACT_BUF_A, 256, CONV4_WGT_BASE, 1, 2, 1, ACT_RES_B, 0, 0, 0);   // resident in=R1, out->R0
 #ifdef DEBUG_VERBOSE
     dbg_layer("Pool2", ACT_BUF_A, 64 * 32);
 #endif
@@ -835,7 +884,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
                   32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0);   // resident in=R0, out->R1
+                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0, 0);   // resident in=R0, out->R1
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 #endif
@@ -846,7 +895,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // NPU does Conv6 + Pool3: 8x8 conv -> 2x2 maxpool -> 4x4.
     npu_conv_pass(10, 10, 64, 64, 3, 3, 1, 1,
                   64, SCALE_CONV6, conv6_b,
-                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, ACT_RES_B, -1, 16);   // resident in=R1; HW transpose -> Act PONG (FC1 input)
+                  ACT_BUF_B, 64, CONV6_WGT_BASE, 1, 1, 1, ACT_RES_B, -1, 16, 0);   // resident in=R1; HW transpose -> Act PONG (FC1 input)
 
     // ---- Pool3 -> FC1 reorder: now done in HARDWARE (decision L) ----
     // The transpose engine wrote Conv6's tile-major Pool3 output directly into
