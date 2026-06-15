@@ -128,6 +128,7 @@ module npu_top #(
     wire                            cfg_pool_avg;
     wire [SRAM_ADDR_W-1:0]          cfg_skip_base;
     wire                            cfg_pw_en;
+    wire                            cfg_dw_en;
     wire                            cfg_gpool_en;
     wire [31:0]                     cfg_gavg_mul;
     wire [5:0]                      cfg_gavg_shift;
@@ -297,6 +298,7 @@ module npu_top #(
         .o_int32_out      (cfg_int32_out),
         .o_pool_avg       (cfg_pool_avg),
         .o_pw_en          (cfg_pw_en),
+        .o_dw_en          (cfg_dw_en),
         .o_gpool_en       (cfg_gpool_en),
         .o_gavg_mul       (cfg_gavg_mul),
         .o_gavg_shift     (cfg_gavg_shift),
@@ -674,9 +676,21 @@ module npu_top #(
         .o_plane_done      (wgt_reader_plane_done)
     );
 
-    // Connect wgt_reader to Wgt SRAM Port A
-    assign wgt_sram_ena   = wgt_reader_sram_en;
-    assign wgt_sram_addra = wgt_reader_sram_addr;
+    // ===================================================================
+    // Depthwise engine (CTRL[15] dw_en): channel-parallel MAC bypassing the
+    // array. Prefetches KO depthwise weight words from Wgt SRAM Port A during
+    // LOAD_ROW (wgt_reader idle then), then accumulates the im2col window taps.
+    // ===================================================================
+    wire [ARRAY_COLS-1:0][PSUM_WIDTH-1:0] dw_psum;
+    wire                     dw_vld;
+    wire [SRAM_ADDR_W-1:0]   dw_wgt_rd_addr;
+    wire                     dw_wgt_rd_en;
+    wire                     dw_wgt_active;
+    // (depthwise_engine instance is below, after im2col declares im2col_act_window)
+
+    // Connect wgt_reader to Wgt SRAM Port A; depthwise borrows it during prefetch.
+    assign wgt_sram_ena   = dw_wgt_active ? dw_wgt_rd_en   : wgt_reader_sram_en;
+    assign wgt_sram_addra = dw_wgt_active ? dw_wgt_rd_addr : wgt_reader_sram_addr;
 
     // ===================================================================
     // Im2Col Line Buffer
@@ -897,6 +911,27 @@ module npu_top #(
     wire [NUM_CH*32-1:0] pp_feat32;      // decision Q: raw INT32 post-process output (16×INT32)
 
     // Valid signal for post-process from FSM (during DRAIN + pipeline flush)
+    // Depthwise engine instance (im2col_act_window now in scope). Prefetches KO
+    // weight words from Wgt Port A during LOAD_ROW, then channel-parallel MACs the
+    // im2col taps; o_psum is muxed into post_process when cfg_dw_en.
+    depthwise_engine #(
+        .NUM_CH(ARRAY_COLS), .PSUM_WIDTH(PSUM_WIDTH), .SRAM_ADDR_W(SRAM_ADDR_W)
+    ) u_depthwise (
+        .clk(clk), .rst_n(rst_n),
+        .i_start(cfg_start & cfg_dw_en),   // only borrow Wgt port / accumulate in depthwise mode
+        .i_wgt_base(cfg_ping_pong_sel ? cfg_wgt_addr_pong : cfg_wgt_addr_ping),
+        .o_wgt_rd_addr(dw_wgt_rd_addr),
+        .o_wgt_rd_en(dw_wgt_rd_en),
+        .o_wgt_active(dw_wgt_active),
+        .i_wgt_rd_data(wgt_sram_doa),
+        .i_calc_vld(fsm_array_vld),
+        .i_offset(fsm_im2col_offset_sel),
+        .i_act(im2col_act_window[127:0]),
+        .i_k_end(fsm_array_k_end),
+        .o_psum(dw_psum),
+        .o_vld(dw_vld)
+    );
+
     wire pp_input_vld;
     assign pp_input_vld = fsm_array_drain_en || fsm_pp_start;
 
@@ -907,7 +942,7 @@ module npu_top #(
         .clk           (clk),
         .rst_n         (rst_n),
         .i_start       (cfg_start),
-        .i_psum        (array_psum_col),
+        .i_psum        (cfg_dw_en ? dw_psum : array_psum_col),  // depthwise bypasses the array
         .i_psum_vld    (pp_input_vld),
         .i_bias        (cfg_bias_val),
         .i_scale_mul   (cfg_scale_mul),

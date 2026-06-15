@@ -103,14 +103,16 @@ module tb_npu_integ;
     // CTRL bits
     localparam C_START = 32'h1, C_PINGPONG = 32'h2, C_RELU = 32'h20, C_GEMM = 32'h80;
     localparam C_PW = 32'h4000;  // CTRL[14] pw_en
+    localparam C_DW = 32'h8000;  // CTRL[15] dw_en
     // Register byte offsets
     localparam R_CTRL=10'h00, R_INW=10'h20, R_INH=10'h24, R_IC=10'h28, R_OC=10'h2C,
-               R_KERN=10'h30, R_STR=10'h34, R_ACTA=10'h08, R_WGTA=10'h10, R_OUTA=10'h18;
+               R_KERN=10'h30, R_STR=10'h34, R_ACTA=10'h08, R_WGTA=10'h10, R_OUTA=10'h18,
+               R_PAD=10'h150;
     function [9:0] R_BIAS (input integer ch); R_BIAS  = 10'h40 + ch*4; endfunction
     function [9:0] R_SCALE(input integer ch); R_SCALE = 10'h80 + ch*4; endfunction
     function [9:0] R_SHIFT(input integer ch); R_SHIFT = 10'hC0 + ch*4; endfunction
 
-    integer ic, oc, p;
+    integer ic, oc, p, t, oy, ox;
     reg [127:0] actw, wgtw, outw;
     reg [7:0] got, exp;
 
@@ -196,6 +198,46 @@ module tb_npu_integ;
             end
         end
         if (errors == 0) $display("  [PASS] PW_1x1: out[p][oc]=(oc%%4+1)*(p+1)");
+
+        // ================= TEST: depthwise 3x3 (dw_en) =================
+        // in 4x4 (no pad), IC=OC=16. act[pixel p][ch] = p+1 (all ch).
+        // wgt[ch][tap] = (tap == ch%9) ? 1 : 0  =>  out[oy][ox][oc] picks input
+        // pixel at tap=oc%9 of the (oy,ox) window: exp = (oy+t/3)*4+(ox+t%3)+1.
+        for (p = 0; p < 16; p = p + 1) begin
+            actw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1) actw[ic*8 +: 8] = p + 1;
+            act_poke(p, actw);
+        end
+        for (t = 0; t < 9; t = t + 1) begin
+            wgtw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1)
+                if (t == (ic % 9)) wgtw[ic*8 +: 8] = 8'd1;
+            wgt_poke(t, wgtw);
+        end
+        reg_write(R_INW, 4);  reg_write(R_INH, 4);
+        reg_write(R_IC, 16);  reg_write(R_OC, 16);
+        reg_write(R_KERN, (3<<8)|3); reg_write(R_STR, (1<<8)|1); reg_write(R_PAD, 0);
+        reg_write(R_ACTA, 0); reg_write(R_WGTA, 0); reg_write(R_OUTA, 0);
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            reg_write(R_BIAS(oc), 0); reg_write(R_SCALE(oc), 1); reg_write(R_SHIFT(oc), 0);
+        end
+        reg_write(R_CTRL, C_START | C_DW | C_RELU);
+        wait_done(20000);
+        repeat (5) @(negedge clk);
+        for (oy = 0; oy < 2; oy = oy + 1)
+          for (ox = 0; ox < 2; ox = ox + 1) begin
+            outw = dut.u_out_sram.u_bram.mem[oy*2 + ox];
+            for (oc = 0; oc < 16; oc = oc + 1) begin
+                t   = oc % 9;
+                got = outw[oc*8 +: 8];
+                exp = (oy + t/3)*4 + (ox + (t%3)) + 1;
+                if (got !== exp) begin
+                    $display("  [FAIL] DW out[oy%0d,ox%0d][oc%0d]=%0d exp=%0d", oy, ox, oc, got, exp);
+                    errors = errors + 1;
+                end
+            end
+          end
+        if (errors == 0) $display("  [PASS] DW_3x3: depthwise per-channel taps");
 
         if (errors == 0) $display("TB_NPU_INTEG PASS");
         else $display("TB_NPU_INTEG FAIL errors=%0d", errors);
