@@ -39,7 +39,8 @@ module max_pooling_2x2 #(
     input  wire [15:0]       i_width,
     input  wire [TILE_W-1:0] i_tile,       // decision P: active OC-tile (0 ⇒ legacy)
     output reg  [DATA_W-1:0] o_pool,
-    output reg               o_pool_vld
+    output reg               o_pool_vld,
+    output reg  [TILE_W-1:0] o_pool_tile   // decision P: tile of o_pool, aligned w/ o_pool_vld
 );
 
     // Decision P: the 2×2 pooler keeps cross-ROW state (previous-row line buffer +
@@ -87,11 +88,13 @@ module max_pooling_2x2 #(
     // Registered output: data and valid aligned.
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            o_pool     <= {DATA_W{1'b0}};
-            o_pool_vld <= 1'b0;
+            o_pool      <= {DATA_W{1'b0}};
+            o_pool_vld  <= 1'b0;
+            o_pool_tile <= {TILE_W{1'b0}};
         end else begin
-            o_pool     <= win_max;
-            o_pool_vld <= emit;
+            o_pool      <= win_max;
+            o_pool_vld  <= emit;
+            o_pool_tile <= i_tile;   // align tile id with the registered output
         end
     end
 

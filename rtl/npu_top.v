@@ -848,6 +848,7 @@ module npu_top #(
     wire                  pp_feat_vld;
 
     wire                  rp_pool_done;   // row-par pool replay complete (FSM advance)
+    wire [1:0]            pp_pool_tile;   // decision P: tile of the pooled output (aligned w/ pp_feat_vld)
 
     // Valid signal for post-process from FSM (during DRAIN + pipeline flush)
     wire pp_input_vld;
@@ -874,6 +875,7 @@ module npu_top #(
         .i_group_size  (fsm_group_size),
         .i_rows_per_grp(fsm_rows_per_grp),
         .i_oc_tile     (fsm_oc_tile_sel[1:0]),
+        .o_pool_tile   (pp_pool_tile),
         .o_rp_pool_done(rp_pool_done),
         .o_feat        (pp_feat),
         .o_feat_vld    (pp_feat_vld)
@@ -902,32 +904,35 @@ module npu_top #(
     // ===================================================================
     // Out SRAM write (Port A) — from post-process/ALU pipeline
     // ===================================================================
-    // Pooled output address counter: increments only when pool_vld writes,
-    // so pooled outputs are stored contiguously WITHIN an OC tile.
-    // Decision O (oc_single): the OC-inner loop emits pool outputs group-major /
-    // tile-inner, so a single contiguous counter would interleave tiles. Reset the
-    // counter at each OC-tile change and add a tile-major base (oc_t*pool_tile_words)
-    // so each tile lands tile-major. oc_single off ⇒ base 0, reset only on cfg_start
-    // ⇒ byte-identical to legacy.
-    reg [2:0] oc_tile_sel_d;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) oc_tile_sel_d <= 3'd0;
-        else        oc_tile_sel_d <= fsm_oc_tile_sel;
-    end
-    wire oc_tile_changed = cfg_oc_single && (fsm_oc_tile_sel != oc_tile_sel_d);
-
-    reg [SRAM_ADDR_W-1:0] pool_out_addr_cnt;
+    // Pooled output address counter: increments only when pool_vld writes, so
+    // pooled outputs are stored contiguously WITHIN an OC tile.
+    // Decision O/P (oc_single): the OC-inner loop emits pool outputs group-major /
+    // tile-inner — each OC tile is revisited once per group-row, interleaved with the
+    // other tiles. So the within-tile counter must be PER OC-tile (persist across a
+    // tile's interleaved visits, NOT reset on every tile switch). pool_wr_addr adds a
+    // tile-major base (oc_t*pool_tile_words). oc_single off ⇒ only tile 0's counter,
+    // base 0, reset on cfg_start ⇒ byte-identical to the legacy single counter.
+    localparam POOL_NTILES = 4;
+    reg [SRAM_ADDR_W-1:0] pool_out_cnt [0:POOL_NTILES-1];
+    // pp_pool_tile is registered in the pooler aligned with pp_feat_vld, so the
+    // write address uses the tile of the pixel actually being written (not the FSM's
+    // possibly-advanced oc_t). 0 when oc_single off.
+    wire [1:0] pool_act_tile = cfg_oc_single ? pp_pool_tile : 2'd0;
+    integer pti;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
-            pool_out_addr_cnt <= {SRAM_ADDR_W{1'b0}};
-        else if (cfg_start || oc_tile_changed)
-            pool_out_addr_cnt <= {SRAM_ADDR_W{1'b0}};
+            for (pti = 0; pti < POOL_NTILES; pti = pti + 1)
+                pool_out_cnt[pti] <= {SRAM_ADDR_W{1'b0}};
+        else if (cfg_start)
+            for (pti = 0; pti < POOL_NTILES; pti = pti + 1)
+                pool_out_cnt[pti] <= {SRAM_ADDR_W{1'b0}};
         else if (out_sram_ena)
-            pool_out_addr_cnt <= pool_out_addr_cnt + {{SRAM_ADDR_W-1{1'b0}}, 1'b1};
+            pool_out_cnt[pool_act_tile] <= pool_out_cnt[pool_act_tile]
+                                         + {{SRAM_ADDR_W-1{1'b0}}, 1'b1};
     end
     // Tile-major pooled write address (oc_single adds the per-tile base).
-    wire [SRAM_ADDR_W-1:0] pool_wr_addr = pool_out_addr_cnt
-         + (cfg_oc_single ? ({{(SRAM_ADDR_W-3){1'b0}}, fsm_oc_tile_sel} * pool_tile_words)
+    wire [SRAM_ADDR_W-1:0] pool_wr_addr = pool_out_cnt[pool_act_tile]
+         + (cfg_oc_single ? ({{(SRAM_ADDR_W-2){1'b0}}, pool_act_tile} * pool_tile_words)
                           : {SRAM_ADDR_W{1'b0}});
 
     // ---- Row-parallel non-pool Out-SRAM write sequencer ----

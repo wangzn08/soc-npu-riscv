@@ -47,6 +47,7 @@ module post_process_top #(
     input  wire [15:0]                      i_group_size,
     input  wire [3:0]                       i_rows_per_grp,   // #4: R rows packed (1 = byte-identical)
     input  wire [1:0]                       i_oc_tile,        // decision P: active OC-tile (0 ⇒ legacy)
+    output wire [1:0]                       o_pool_tile,      // decision P: tile of o_feat (pool), aligned w/ o_feat_vld
     output wire                             o_rp_pool_done,   // replay complete (FSM advance)
 
     // Output feature data
@@ -277,7 +278,8 @@ module post_process_top #(
         .i_width     (i_width),
         .i_tile      (i_oc_tile),   // decision P: active OC-tile (oc_single OC-inner loop)
         .o_pool      (pool_out),
-        .o_pool_vld  (pool_vld)
+        .o_pool_vld  (pool_vld),
+        .o_pool_tile (o_pool_tile)
     );
 
     // Bypass mux: when pooling disabled, match latency of max_pooling_2x2
