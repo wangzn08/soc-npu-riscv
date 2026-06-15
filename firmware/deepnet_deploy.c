@@ -689,7 +689,8 @@ static void npu_gemm_pass(int in_dim, int out_dim, int scale_mul_val,
                           const int32_t *biases, int relu_en,
                           uint32_t in_ddr, uint32_t out_ddr, int wgt_base,
                           int in_resident,  // 1: input already in Act PONG (decision L), skip DMA
-                          int reduce)       // 1: GEMM 16-row IC-reduction (decision M)
+                          int reduce,       // 1: GEMM 16-row IC-reduction (decision M)
+                          int int32_out)    // 1: raw INT32 output (decision Q, final FC) — 4 words/pass
 {
     int icg        = (in_dim + 15) / 16;
     int oc_passes  = (out_dim + 15) / 16;
@@ -711,7 +712,8 @@ static void npu_gemm_pass(int in_dim, int out_dim, int scale_mul_val,
         // ping_pong=1 -> FSM latches the *_B (pong) base registers
         npu_wr(NPU_ACT_ADDR_B, 0);
         npu_wr(NPU_WGT_ADDR_B, (uint32_t)(wgt_base + pass * tile_words));
-        npu_wr(NPU_OUT_ADDR_B, (uint32_t)pass);   // pass p -> Out word p
+        // INT32 raw output uses 4 Out words/pass (16×INT32); INT8 uses 1.
+        npu_wr(NPU_OUT_ADDR_B, (uint32_t)(int32_out ? pass * 4 : pass));
 
         for (int ch = 0; ch < 16; ch++) {
             int oc = pass * 16 + ch;
@@ -722,15 +724,16 @@ static void npu_gemm_pass(int in_dim, int out_dim, int scale_mul_val,
 
         npu_irq_flag = 0;
         npu_wr(NPU_CTRL, NPU_CTRL_START | NPU_CTRL_PING_PONG | NPU_CTRL_GEMM_EN |
-                         (relu_en ? NPU_CTRL_RELU_EN : 0) |
-                         (reduce  ? NPU_CTRL_GEMM_REDUCE : 0));
+                         (relu_en   ? NPU_CTRL_RELU_EN    : 0) |
+                         (reduce    ? NPU_CTRL_GEMM_REDUCE : 0) |
+                         (int32_out ? NPU_CTRL_INT32_OUT  : 0));
         int t = NPU_IRQ_TIMEOUT;
         while (t-- > 0)
             if (npu_irq_flag) break;
         if (t <= 0) print_str("  GEMM IRQ timeout!\n");
     }
-    // All passes wrote Out PING (CTRL[6]=0) words 0..oc_passes-1.
-    dma_out_to_ddr(out_ddr, 0, oc_passes, 0);
+    // INT8: oc_passes words (1/pass). INT32 (decision Q): 4 words/pass.
+    dma_out_to_ddr(out_ddr, 0, int32_out ? oc_passes * 4 : oc_passes, 0);
 }
 
 // ================================================================
@@ -931,30 +934,23 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
         { uint32_t _fc1 = rdcycle32();
 #endif
         npu_gemm_pass(AFFINE1_IN, AFFINE1_OUT, SCALE_AFFINE1, affine1_b, 1,
-                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1, 1);
+                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1, 1, 0);
 #if NPU_PROFILE
           prof_fc1 += rdcycle32() - _fc1; }
 #endif
-        // ---- CPU FC2 (50→10, raw int32): reads NPU FC1 output (channel-major,
-        //      OCs 50..63 are exact 0 from padded weights). FC2 stays on CPU
-        //      because the NPU's INT8 output saturates the final logits. ----
+        // ---- Decision Q: NPU FC2 (50→10, raw INT32 logits) ----
+        // FC1's channel-major DDR output is the FC2 input vector. int32_out emits
+        // the scaled, UN-clamped INT32 (= CPU's (acc*SCALE)>>SHIFT), so argmax is
+        // exact and FC2 no longer needs the CPU (removes decision F's limitation).
+        // reduce=0: legacy GEMM streams the 4 IC-groups (IC=50 isn't a 256-multiple);
+        // the zero-padded IC 50..63 / OC 10..15 contribute 0. relu off (logits signed).
 #if NPU_PROFILE
         { uint32_t _fc2 = rdcycle32();
 #endif
-        volatile int8_t *f1 = (volatile int8_t *)FC1_OUT_DDR;
-        const int8_t *w2 = &affine2_W[0][0];
-        // Read FC1's output from DDR once into fast private RAM; the FC2 loop
-        // otherwise re-reads each f1[ic] AFFINE2_OUT times (each a ~70-cyc
-        // single-beat AXI DDR read). Phase-0 measurement: this DDR re-read,
-        // not FC1 GEMM, dominates the affine bucket.
-        int8_t f1_loc[AFFINE2_IN];
-        for (int ic = 0; ic < AFFINE2_IN; ic++) f1_loc[ic] = f1[ic];
-        for (int oc = 0; oc < AFFINE2_OUT; oc++) {
-            int32_t acc = affine2_b[oc];
-            for (int ic = 0; ic < AFFINE2_IN; ic++)
-                acc += (int32_t)f1_loc[ic] * (int32_t)w2[oc * AFFINE2_IN + ic];
-            scores[oc] = (int32_t)(((int64_t)acc * SCALE_AFFINE2) >> SCALE_SHIFT);
-        }
+        npu_gemm_pass(AFFINE2_IN, AFFINE2_OUT, SCALE_AFFINE2, affine2_b, 0,
+                      FC1_OUT_DDR, FC2_OUT_DDR, FC2_WGT_BASE, 0, 0, 1);
+        volatile int32_t *s2 = (volatile int32_t *)FC2_OUT_DDR;
+        for (int oc = 0; oc < AFFINE2_OUT; oc++) scores[oc] = s2[oc];
 #if NPU_PROFILE
           prof_fc2 += rdcycle32() - _fc2; }
 #endif
@@ -966,7 +962,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     {
         // NPU FC1 vs CPU affine1 — must be bit-identical (same quant path).
         npu_gemm_pass(AFFINE1_IN, AFFINE1_OUT, SCALE_AFFINE1, affine1_b, 1,
-                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1, 1);
+                      AFFINE_SCR, FC1_OUT_DDR, FC1_WGT_BASE, 1, 1, 0);
         volatile int8_t *nf = (volatile int8_t *)FC1_OUT_DDR;
         int mism = 0;
         for (int i = 0; i < AFFINE1_OUT; i++)
@@ -979,7 +975,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
         // 50..63 are exact 0 from padded weights). Scores are INT8-clamped; the
         // ship criterion is argmax(NPU int8) == argmax(CPU int32) for every image.
         npu_gemm_pass(AFFINE2_IN, AFFINE2_OUT, SCALE_AFFINE2, affine2_b, 0,
-                      FC1_OUT_DDR, FC2_OUT_DDR, FC2_WGT_BASE, 0, 0);
+                      FC1_OUT_DDR, FC2_OUT_DDR, FC2_WGT_BASE, 0, 0, 0);
         volatile int8_t *ns = (volatile int8_t *)FC2_OUT_DDR;
         int nbest = 0, cbest = 0;
         for (int i = 1; i < AFFINE2_OUT; i++) {
