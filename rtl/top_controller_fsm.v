@@ -33,6 +33,7 @@ module top_controller_fsm #(
     input  wire                     i_gemm_reduce,  // GEMM 16-row IC-reduction (decision M)
     input  wire                     i_row_block_en, // #4: row-block packing for narrow layers
     input  wire                     i_oc_single,    // decision O: all OC-tiles in one start (OC-inner loop)
+    input  wire                     i_pw_en,        // 1x1 pointwise: bypass im2col, direct per-pixel feed
     input  wire [7:0]               i_pad_w,        // zero-pad columns each side
     input  wire [7:0]               i_pad_h,        // zero-pad rows each side
     input  wire [SRAM_ADDR_W-1:0]   i_act_base_ping,
@@ -193,7 +194,9 @@ module top_controller_fsm #(
     // the spatial sweep. General over any model; GEMM excluded (handled separately).
     localparam ICG_BUF          = 4;
     localparam WGT_REUSE_SETTLE = 16'd2;  // im2col window settle when skipping prefetch
-    wire reuse_mode = !i_gemm_en && (ic_groups <= ICG_BUF);
+    // pointwise reuses weights across the spatial sweep (1x1 weights are position
+    // independent), so it joins the per-OC-tile reuse path like conv ic_groups<=4.
+    wire reuse_mode = (!i_gemm_en && (ic_groups <= ICG_BUF)) || i_pw_en;
 
     // Input stride in 128-bit words per row
     wire [SRAM_ADDR_W-1:0] act_row_stride;
@@ -235,6 +238,12 @@ module top_controller_fsm #(
     wire [SRAM_ADDR_W-1:0] gemm_act_addr;
     assign gemm_act_addr = act_base_addr + {{(SRAM_ADDR_W-12){1'b0}}, ic_tile[15:4]};
 
+    // Pointwise (1x1): read the pixel at (cur_oy, cur_ox) for the current IC tile
+    // directly from tile-major Act SRAM (no im2col). For 1x1, out_w==in_w.
+    wire [SRAM_ADDR_W-1:0] pw_pix_off = (cur_oy * i_dim_in_w + cur_ox) * ic_groups;
+    wire [SRAM_ADDR_W-1:0] pw_act_addr = act_base_addr + pw_pix_off
+                         + {{(SRAM_ADDR_W-12){1'b0}}, ic_tile[15:4]};
+
     // Hardware padding: read the previous layer's UNPADDED output tile-major and
     // inject border zeros, so im2col sees the same padded stream as before but no
     // CPU pad_activation is needed. unpad = i_dim_in_w/h - 2*pad (padded dims kept
@@ -256,6 +265,7 @@ module top_controller_fsm #(
                          + {{(SRAM_ADDR_W-8){1'b0}}, super_step, 4'd0}   // s*16
                          + {{(SRAM_ADDR_W-5){1'b0}}, aload_cnt};
     assign o_act_sram_addr = reduce    ? rdc_act_addr
+                           : i_pw_en   ? pw_act_addr
                            : i_gemm_en ? gemm_act_addr
                            : i_hw_pad  ? tilemaj_addr
                            :             act_rd_addr;
@@ -264,7 +274,7 @@ module top_controller_fsm #(
     // CALC where it is replicated to all 16 array rows).
     assign o_act_sram_en   = reduce
                            ? ((state == S_RDC_ALOAD) && (aload_cnt < 5'd16))
-                           : i_gemm_en
+                           : (i_gemm_en || i_pw_en)
                            ? ((state == S_PREFETCH_WGT) && (pf_wait_cnt == 16'd0))
                            : ((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w) && (load_col_cnt > 16'd0)
                               && (!i_hw_pad || !at_border));   // skip SRAM read on border
@@ -425,7 +435,7 @@ module top_controller_fsm #(
                             plane_trig_r <= 1'b1;        // kick first super-step's plane prefetch
                             state <= S_RDC_WLOAD;
                         end else begin
-                            state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
+                            state <= (i_gemm_en || i_pw_en) ? S_PREFETCH_WGT : S_LOAD_ROW;
                         end
                     end
                 end
@@ -594,8 +604,10 @@ module top_controller_fsm #(
                         cur_oy <= cur_oy + {12'd0, rows_per_grp};
                         cur_in_col <= 16'd0;
                         cur_in_row <= cur_in_row + {8'd0, i_stride_sy};
-                        state <= S_LOAD_ROW; // Need new row data
+                        // pointwise has no im2col rows to load; go straight to compute.
+                        state <= i_pw_en ? S_PREFETCH_WGT : S_LOAD_ROW;
                         load_col_cnt <= 16'd0;
+                        pf_wait_cnt  <= 16'd0;   // pw: re-arm the per-position act read on row change
                     end else begin
                         // All spatial positions done for this OC tile
                         cur_ox <= 16'd0;
@@ -608,7 +620,7 @@ module top_controller_fsm #(
                             // Next OC tile (legacy multi-start path)
                             oc_tile <= oc_tile + 16'd16;
                             wgt_loaded <= 1'b0;   // new OC tile → re-prefetch its weights
-                            state <= i_gemm_en ? S_PREFETCH_WGT : S_LOAD_ROW;
+                            state <= (i_gemm_en || i_pw_en) ? S_PREFETCH_WGT : S_LOAD_ROW;
                             load_col_cnt <= 16'd0;
                             pf_wait_cnt  <= 16'd0;
                         end else begin

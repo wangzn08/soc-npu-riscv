@@ -127,6 +127,7 @@ module npu_top #(
     wire [7:0]                      cfg_clip_max;
     wire                            cfg_pool_avg;
     wire [SRAM_ADDR_W-1:0]          cfg_skip_base;
+    wire                            cfg_pw_en;
     wire                            cfg_gpool_en;
     wire [31:0]                     cfg_gavg_mul;
     wire [5:0]                      cfg_gavg_shift;
@@ -295,6 +296,7 @@ module npu_top #(
         .o_oc_single      (cfg_oc_single),
         .o_int32_out      (cfg_int32_out),
         .o_pool_avg       (cfg_pool_avg),
+        .o_pw_en          (cfg_pw_en),
         .o_gpool_en       (cfg_gpool_en),
         .o_gavg_mul       (cfg_gavg_mul),
         .o_gavg_shift     (cfg_gavg_shift),
@@ -581,6 +583,7 @@ module npu_top #(
         .i_gemm_reduce        (cfg_gemm_reduce),
         .i_row_block_en       (cfg_row_block_en),
         .i_oc_single          (cfg_oc_single),
+        .i_pw_en              (cfg_pw_en),
         .o_oc_tile_sel        (fsm_oc_tile_sel),
         .o_rows_per_grp       (fsm_rows_per_grp),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
@@ -801,9 +804,9 @@ module npu_top #(
         // rows (same replication im2col does for conv) — every PE in a column
         // computes the identical dot product, so drain/POST capture is
         // phase-independent. Conv mode: im2col window as before.
-        .i_act       (cfg_gemm_reduce ? act_row_bus
-                    : cfg_gemm_en     ? {ARRAY_ROWS{act_sram_doa}}
-                    :                   im2col_act_window),
+        .i_act       (cfg_gemm_reduce       ? act_row_bus
+                    : (cfg_gemm_en|cfg_pw_en) ? {ARRAY_ROWS{act_sram_doa}}
+                    :                         im2col_act_window),
         .i_wgt       (wgt_reader_wgt),
         .i_wgt_plane (wgt_reader_plane),
         .i_reduce    (cfg_gemm_reduce),

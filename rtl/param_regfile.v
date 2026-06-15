@@ -90,6 +90,7 @@ module param_regfile #(
     output wire                         o_oc_single,     // CTRL[12]: all-OC-tiles in one start (decision O / Level 2)
     output wire                         o_int32_out,     // CTRL[13]: raw INT32 output (decision Q, final FC)
     output wire                         o_pool_avg,      // CTRL[16]: 2x2 average pooling (vs max)
+    output wire                         o_pw_en,         // CTRL[14]: 1x1 pointwise conv (im2col bypass)
     output wire                         o_gpool_en,      // CTRL[17]: global average pooling
     output wire [31:0]                  o_gavg_mul,      // NPU_GAVG_CFG[25:0]: reciprocal multiplier (1/N)
     output wire [5:0]                   o_gavg_shift,    // NPU_GAVG_CFG[31:26]: reciprocal shift
@@ -204,6 +205,7 @@ module param_regfile #(
     reg        ctrl_oc_single;   // CTRL[12]: all-OC-tiles in one start (decision O)
     reg        ctrl_int32_out;   // CTRL[13]: raw INT32 output (decision Q)
     reg        ctrl_pool_avg;    // CTRL[16]: 2x2 average pooling (vs max)
+    reg        ctrl_pw_en;       // CTRL[14]: 1x1 pointwise conv
     reg        ctrl_gpool_en;    // CTRL[17]: global average pooling
     reg [25:0] gavg_mul;         // NPU_GAVG_CFG: reciprocal multiplier (1/N)
     reg [5:0]  gavg_shift;       // NPU_GAVG_CFG: reciprocal shift
@@ -327,6 +329,7 @@ module param_regfile #(
             ctrl_oc_single   <= 1'b0;   // oc-single off by default
             ctrl_int32_out   <= 1'b0;   // int32 raw output off by default
             ctrl_pool_avg    <= 1'b0;   // average pooling off by default (max)
+            ctrl_pw_en       <= 1'b0;   // pointwise off by default
             ctrl_gpool_en    <= 1'b0;   // global average pooling off by default
             gavg_mul         <= 26'd0;
             gavg_shift       <= 6'd0;
@@ -411,6 +414,7 @@ module param_regfile #(
                         ctrl_oc_single   <= s_axi_wdata[12];
                         ctrl_int32_out   <= s_axi_wdata[13];
                         ctrl_pool_avg    <= s_axi_wdata[16];
+                        ctrl_pw_en       <= s_axi_wdata[14];
                         ctrl_gpool_en    <= s_axi_wdata[17];
                     end
                     // STATUS is read-only (write ignored)
@@ -566,7 +570,7 @@ module param_regfile #(
             if (s_axi_arvalid && s_axi_arready && !rvalid) begin
                 rvalid <= 1'b1;
                 case (s_axi_araddr[ADDR_W-1:0])
-                    10'h00: rdata <= {14'd0, ctrl_gpool_en, ctrl_pool_avg, 2'd0, ctrl_int32_out, ctrl_oc_single, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
+                    10'h00: rdata <= {14'd0, ctrl_gpool_en, ctrl_pool_avg, 1'b0, ctrl_pw_en, ctrl_int32_out, ctrl_oc_single, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
                     10'h04: rdata <= {28'd0, i_dma_wr_err, i_dma_rd_err, i_busy, done_irq_latched};
                     10'h08: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_ping};
                     10'h0C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_pong};
@@ -674,6 +678,7 @@ module param_regfile #(
     assign o_oc_single    = ctrl_oc_single;
     assign o_int32_out    = ctrl_int32_out;
     assign o_pool_avg     = ctrl_pool_avg;
+    assign o_pw_en        = ctrl_pw_en;
     assign o_gpool_en     = ctrl_gpool_en;
     assign o_gavg_mul     = {6'd0, gavg_mul};
     assign o_gavg_shift   = gavg_shift;

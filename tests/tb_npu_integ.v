@@ -102,6 +102,7 @@ module tb_npu_integ;
 
     // CTRL bits
     localparam C_START = 32'h1, C_PINGPONG = 32'h2, C_RELU = 32'h20, C_GEMM = 32'h80;
+    localparam C_PW = 32'h4000;  // CTRL[14] pw_en
     // Register byte offsets
     localparam R_CTRL=10'h00, R_INW=10'h20, R_INH=10'h24, R_IC=10'h28, R_OC=10'h2C,
                R_KERN=10'h30, R_STR=10'h34, R_ACTA=10'h08, R_WGTA=10'h10, R_OUTA=10'h18;
@@ -109,7 +110,7 @@ module tb_npu_integ;
     function [9:0] R_SCALE(input integer ch); R_SCALE = 10'h80 + ch*4; endfunction
     function [9:0] R_SHIFT(input integer ch); R_SHIFT = 10'hC0 + ch*4; endfunction
 
-    integer ic, oc;
+    integer ic, oc, p;
     reg [127:0] actw, wgtw, outw;
     reg [7:0] got, exp;
 
@@ -158,6 +159,43 @@ module tb_npu_integ;
             end
         end
         if (errors == 0) $display("  [PASS] GEMM_KNOWN: out[oc]=oc+1");
+
+        // ================= TEST: 1x1 pointwise (pw_en) =================
+        // in 2x2, IC=16, OC=16. act[p][ic]=p+1 (all ic); wgt[oc][ic]=(ic<(oc%4+1))?1:0
+        // => out[p][oc] = (oc%4+1)*(p+1), one word per pixel at out addr p.
+        for (p = 0; p < 4; p = p + 1) begin
+            actw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1) actw[ic*8 +: 8] = p + 1;
+            act_poke(p, actw);
+        end
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            wgtw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1)
+                if (ic < (oc % 4 + 1)) wgtw[ic*8 +: 8] = 8'd1;
+            wgt_poke(oc, wgtw);
+        end
+        reg_write(R_INW, 2);  reg_write(R_INH, 2);
+        reg_write(R_IC, 16);  reg_write(R_OC, 16);
+        reg_write(R_KERN, (1<<8)|1); reg_write(R_STR, (1<<8)|1);
+        reg_write(R_ACTA, 0); reg_write(R_WGTA, 0); reg_write(R_OUTA, 0);
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            reg_write(R_BIAS(oc), 0); reg_write(R_SCALE(oc), 1); reg_write(R_SHIFT(oc), 0);
+        end
+        reg_write(R_CTRL, C_START | C_PW | C_RELU);
+        wait_done(20000);
+        repeat (5) @(negedge clk);
+        for (p = 0; p < 4; p = p + 1) begin
+            outw = dut.u_out_sram.u_bram.mem[p];
+            for (oc = 0; oc < 16; oc = oc + 1) begin
+                got = outw[oc*8 +: 8];
+                exp = (oc % 4 + 1) * (p + 1);
+                if (got !== exp) begin
+                    $display("  [FAIL] PW out[p=%0d][oc=%0d]=%0d exp=%0d", p, oc, got, exp);
+                    errors = errors + 1;
+                end
+            end
+        end
+        if (errors == 0) $display("  [PASS] PW_1x1: out[p][oc]=(oc%%4+1)*(p+1)");
 
         if (errors == 0) $display("TB_NPU_INTEG PASS");
         else $display("TB_NPU_INTEG FAIL errors=%0d", errors);

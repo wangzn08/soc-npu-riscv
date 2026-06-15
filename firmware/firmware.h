@@ -114,6 +114,7 @@ void usercode7(void);
 #define NPU_CTRL_ROW_BLOCK   (1 << 11) // row-block packing for narrow layers (#4)
 #define NPU_CTRL_OC_SINGLE   (1 << 12) // all-OC-tiles in one start (decision O): OC-inner loop in HW
 #define NPU_CTRL_INT32_OUT   (1 << 13) // raw INT32 output (decision Q, final FC logits)
+#define NPU_CTRL_PW_EN       (1 << 14) // 1x1 pointwise conv (im2col bypass, direct per-pixel feed)
 #define NPU_CTRL_POOL_AVG    (1 << 16) // 2x2 average pooling (vs max); needs POOL_EN
 #define NPU_CTRL_GPOOL_EN    (1 << 17) // global average pooling (one mean word per OC tile)
 
