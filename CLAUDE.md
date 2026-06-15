@@ -143,15 +143,15 @@ Argmax: find predicted digit                                          [CPU]
 
 | Offset | Name | Description |
 |--------|------|-------------|
-| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en, `[10]`gemm_reduce, `[11]`row_block_en |
+| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en, `[10]`gemm_reduce, `[11]`row_block_en, `[12]`oc_single |
 | `0x150` | PAD | `[15:8]`pad_h, `[7:0]`pad_w (hardware padding border, with CTRL[8]) |
 | `0x004` | STATUS | `[0]`done_irq, `[1]`busy, `[2]`dma_rd_err, `[3]`dma_wr_err (RO) |
 | `0x008–0x01C` | SRAM addrs | Act/Wgt/Out SRAM base addresses (ping/pong) |
 | `0x020–0x02C` | Dimensions | IN_W, IN_H, IC, OC |
 | `0x030–0x034` | Kernel/Stride | `[15:8]=KH/SX, [7:0]=KW/SY` |
-| `0x040–0x07C` | BIAS | 16× per-OC 32-bit bias values |
-| `0x080–0x0BC` | SCALE_MUL | 16× per-OC 32-bit scale multipliers |
-| `0x0C0–0x0FC` | SCALE_SHIFT | 16× per-OC 6-bit shift amounts |
+| `0x040–0x07C` | BIAS | per-OC 32-bit bias, channels 0..15 (decision O: ch 16..63 at `0x160–0x21C`) |
+| `0x080–0x0BC` | SCALE_MUL | per-OC 32-bit scale mul, ch 0..15 (ch 16..63 at `0x220–0x2DC`) |
+| `0x0C0–0x0FC` | SCALE_SHIFT | per-OC 6-bit shift, ch 0..15 (ch 16..63 at `0x2E0–0x39C`) |
 | `0x120–0x148` | DMA | Read/write triggers, DDR addr, length, SRAM base, status, sel |
 | `0x140` | DMA_STATUS | `[0]`rd_done `[1]`wr_done `[2]`copy_done (RO) |
 | `0x154` | COPY_TRIG | write → start on-chip Out→Act copy (`sram_copy`, decision J); src/dst/len reuse DMA RD_SRAM_BASE/WR_SRAM_BASE/RD_LEN |
@@ -403,6 +403,50 @@ Conv5/6 (group_size=8) → R=2 → 100% utilization. Like decisions I/M, the goa
   (−252,440, −3.3%)**, bit-identical `SCORE_CHK=D30179DF` 10/10. (The Phase-0
   `prof_busy_layer` IRQ-wait proxy under-estimated this at ~0.2%; the clean
   row_block on/off full-run A/B is the ground truth — measure, don't extrapolate.)
+
+### O: One-start-all-OC — OC-inner loop with all-OC-resident weights (`oc_single`, CTRL[12])
+
+For layers with OC > 16 the legacy path (decision D) issues one NPU start per
+16-OC tile, each **re-sweeping the spatial output and reloading the im2col line
+buffer** — an O(OC/16) redundancy that grows with output-channel count.
+`oc_single` computes **all OC tiles in ONE start**: per spatial group the im2col
+window is loaded once and **reused across every OC tile** (OC-inner loop), so the
+per-OC im2col reload is removed. The primary goal is **generality** — removing an
+O(OC) redundancy that bigger models pay proportionally more — not MNIST cycles.
+- **Weights (decision G interaction):** OC-inner reuse would re-prefetch weights
+  per group unless all OC tiles' weights are resident. So `wgt_reader` prefetches
+  **all OC tiles** once into `wgt_buf[ko][MAX_OC_RESIDENT=64][ICG_BUF]` (outer
+  `pf_oct` tile loop); during CALC `i_oc_tile_sel` selects the active tile's 16
+  channels. Weight-read count is unchanged vs decision G.
+- **Regfile:** bias/scale/shift expanded to 64 entries (ch 0..15 legacy blocks,
+  ch 16..63 at `0x160/0x220/0x2E0`); `i_oc_tile_sel` (from FSM `oc_t`) presents
+  the active tile's 16-window. `i_oc_tile_sel==0` ⇒ legacy low-16 ⇒ byte-identical.
+- **FSM (`top_controller_fsm`):** after S_POST, if more OC tiles remain it advances
+  `oc_t` and re-enters S_PREFETCH_WGT (reuse settle path — weights already resident)
+  to re-CALC against the **same frozen im2col window** with the next tile's weights;
+  no spatial/window advance, no re-prefetch. `active_oc_idx` (= `oc_t` in oc_single,
+  else `oc_tile[9:4]`) drives the Out-SRAM write base and OC-tile selects. Spatial
+  exhaustion ⇒ S_DONE (one IRQ). oc_single off ⇒ `oc_t=0`, byte-identical.
+- **Firmware:** `npu_conv_pass(..., oc_single)` — one start writes all tiles'
+  bias/scale/shift, `NPU_OC`=full OC, CTRL[12]=1, one IRQ, then a single tile-major
+  copy/transpose/DDR-drain of `out_words*oc_passes`.
+- **Scope = non-pool conv layers.** Enabled on **Conv3** (2 tiles) and **Conv5**
+  (4 tiles, row-block). **Pooled layers (Conv4/Conv6) stay legacy:** the
+  post_process pool reorder buffer + 2×2 row-pairing hold state that is **not
+  per-OC-tile**, so the OC-inner interleaving of tile drains corrupts it (Conv4
+  also pairs conv rows across groups). Per-OC-tile pooler/reorder state is future
+  work. The tile-major pooled write address (`pool_wr_addr = oc_t*pool_tile_words
+  + cnt`, counter reset per tile) is in place (byte-identical when off) for that.
+- **General:** any non-pool conv with OC ≤ `MAX_OC_RESIDENT` (64); `OC > 64`
+  falls back to multi-start (decision-D path), like decision G's ICG gate.
+- Result (bit-identical `SCORE_CHK=D30179DF`, 10/10): full run **7,427,997 →
+  7,376,666 (-51,331, -0.69%)**. Per-layer A/B confirms the O(OC) thesis — the
+  4-tile Conv5 wins big (**-76,600**, im2col reused across 3 extra tiles/group)
+  while the 2-tile Conv3 is the floor case (**+25,269**: the narrow-layer im2col
+  saving — FSM busy -3,160, load -2,560 — is outweighed by per-start CPU/MMIO
+  overhead). MNIST is the small-model floor; the win scales with OC for bigger
+  models. (Consistent with [[soc-npu-spec-estimate-caution]]: measure the full-run
+  A/B, the per-phase proxy misleads.)
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 
