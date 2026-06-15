@@ -430,13 +430,9 @@ O(OC) redundancy that bigger models pay proportionally more — not MNIST cycles
 - **Firmware:** `npu_conv_pass(..., oc_single)` — one start writes all tiles'
   bias/scale/shift, `NPU_OC`=full OC, CTRL[12]=1, one IRQ, then a single tile-major
   copy/transpose/DDR-drain of `out_words*oc_passes`.
-- **Scope = non-pool conv layers.** Enabled on **Conv3** (2 tiles) and **Conv5**
-  (4 tiles, row-block). **Pooled layers (Conv4/Conv6) stay legacy:** the
-  post_process pool reorder buffer + 2×2 row-pairing hold state that is **not
-  per-OC-tile**, so the OC-inner interleaving of tile drains corrupts it (Conv4
-  also pairs conv rows across groups). Per-OC-tile pooler/reorder state is future
-  work. The tile-major pooled write address (`pool_wr_addr = oc_t*pool_tile_words
-  + cnt`, counter reset per tile) is in place (byte-identical when off) for that.
+- **Scope:** initially non-pool conv (**Conv3** 2 tiles, **Conv5** 4 tiles). Pooled
+  layers (Conv4/Conv6) were extended in **decision P** (per-OC-tile pooler state);
+  all four multi-tile conv layers are now oc_single.
 - **General:** any non-pool conv with OC ≤ `MAX_OC_RESIDENT` (64); `OC > 64`
   falls back to multi-start (decision-D path), like decision G's ICG gate.
 - Result (bit-identical `SCORE_CHK=D30179DF`, 10/10): full run **7,427,997 →
@@ -447,6 +443,41 @@ O(OC) redundancy that bigger models pay proportionally more — not MNIST cycles
   overhead). MNIST is the small-model floor; the win scales with OC for bigger
   models. (Consistent with [[soc-npu-spec-estimate-caution]]: measure the full-run
   A/B, the per-phase proxy misleads.)
+
+### P: Pooled oc_single — per-OC-tile pooler state (decision O follow-on)
+
+Decision O's `oc_single` was limited to **non-pool** conv because the 2×2 pooler
+(`max_pooling_2x2`) holds cross-ROW state (previous-row line buffer + column/row
+phase + neighbour regs) that the OC-inner loop's interleaved tile drains corrupt.
+Decision P makes the pooler state **per-OC-tile** so pooled layers (Conv4, Conv6)
+also run oc_single. Chosen over the row-pair-loop-nesting alternative because it's
+**general for any out_w** (no need to pack 2 rows into the 16-wide array — infeasible
+for out_w=16) and needs **no FSM loop change** — only localized pooler/Out-write edits.
+- **`max_pooling_2x2`:** `line_buf`/`col`/`row_odd`/`cur_left`/`above_left` →
+  `[NUM_TILES=4]`, indexed by new `i_tile`; `i_start` clears all tiles. `i_tile==0`
+  (oc_single off) touches only tile 0 ⇒ byte-identical.
+- **Out-write counter:** the OC-inner loop revisits each tile once per group-row
+  (interleaved), so the within-tile pooled counter is **per-tile** (`pool_out_cnt[tile]`,
+  reset only on op start — not on tile switch) plus a tile-major base
+  `tile*pool_tile_words`. (A single counter / reset-on-switch overwrote a tile's
+  later pool-rows — the Conv4 2/10 bug.)
+- **Tile-id alignment:** the pooler emits a **registered** `o_pool_tile` aligned with
+  `o_pool_vld`, used for the write tile/base — the FSM `oc_t` may already have advanced
+  at the last pooled pixel of a drain (the Conv4 9/10 bug). Routed
+  `pooler → post_process_top → npu_top`.
+- **Timing safety:** `fsm_pp_done = rp_pool_done` holds S_POST until a tile's replay
+  completes and `oc_t` only advances at S_POST exit, so `i_tile` is stable for the
+  whole of a tile's drain/replay; the registered `o_pool_tile` covers the final pixel.
+- **General:** any pooled conv, any out_w; composes with row-par (I), row-block (N,
+  R=2 replay), and the per-tile HW transpose (L). `NUM_TILES`/`POOL_NTILES` is a
+  capacity knob (= MAX_OC_RESIDENT/16).
+- Result (bit-identical `SCORE_CHK=D30179DF`, 10/10): **Conv4** (2-tile pool)
+  7,376,666 → 7,343,116 (**-33,550**); **Conv6** (4-tile pool+transpose+row-block)
+  7,343,116 → 7,266,176 (**-76,940**, mirrors the 4-tile Conv5 non-pool -76,600).
+  All four multi-tile conv layers (Conv3/4/5/6) now oc_single. **Full run vs the
+  pre-decision-O baseline: 7,427,997 → 7,266,176 (-161,821, -2.18%)** (O -51,331 +
+  P -110,490). Per-image inference 123,492 → 112,042 (npu phase 594,680 → 480,180);
+  ≈ **0.56 ms/image @200MHz**.
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 
