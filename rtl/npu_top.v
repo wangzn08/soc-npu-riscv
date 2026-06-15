@@ -873,6 +873,7 @@ module npu_top #(
         .i_row_par_en  (cfg_row_par_en),
         .i_group_size  (fsm_group_size),
         .i_rows_per_grp(fsm_rows_per_grp),
+        .i_oc_tile     (fsm_oc_tile_sel[1:0]),
         .o_rp_pool_done(rp_pool_done),
         .o_feat        (pp_feat),
         .o_feat_vld    (pp_feat_vld)

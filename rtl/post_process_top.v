@@ -46,6 +46,7 @@ module post_process_top #(
     input  wire                             i_row_par_en,
     input  wire [15:0]                      i_group_size,
     input  wire [3:0]                       i_rows_per_grp,   // #4: R rows packed (1 = byte-identical)
+    input  wire [1:0]                       i_oc_tile,        // decision P: active OC-tile (0 ⇒ legacy)
     output wire                             o_rp_pool_done,   // replay complete (FSM advance)
 
     // Output feature data
@@ -274,7 +275,7 @@ module post_process_top #(
         .i_feat      (pool_feat_in),
         .i_feat_vld  (pool_feat_vld_in),
         .i_width     (i_width),
-        .i_tile      (2'd0),     // P1: dormant; routed to oc_t in P2
+        .i_tile      (i_oc_tile),   // decision P: active OC-tile (oc_single OC-inner loop)
         .o_pool      (pool_out),
         .o_pool_vld  (pool_vld)
     );
