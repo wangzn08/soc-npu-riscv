@@ -117,15 +117,15 @@ Conv6:  10×10×64 (pad 8→10)  → 8×8×64, 3×3, stride 1, ReLU          [NP
 Pool3:  8×8×64 → 4×4×64                                              [CPU]
 Reorder: spatial-first-per-tile → channels-first                      [NPU HW transpose, decision L]
 Affine1: 1024 → 50, ReLU                                             [NPU GEMM]
-Affine2: 50 → 10, raw INT32 scores                                   [CPU]
+Affine2: 50 → 10, raw INT32 scores                                   [NPU GEMM, int32_out — decision Q]
 Argmax: find predicted digit                                          [CPU]
 ```
 
 **NPU operations:** 6 conv layers (all 3×3 INT8 with ReLU) via `npu_conv_pass()`, plus **Affine1 (1024→50) via `npu_gemm_pass()`** (GEMM/FC mode, decision F). Conv weights are preloaded into the Wgt SRAM **PING** bank once (`preload_conv_weights`); FC weights into the **PONG** bank once (`preload_fc_weights`); both stay resident across all images. Each NPU op configures registers, starts the NPU, waits for IRQ (`npu_irq_flag`), then DMA-reads results back to DDR.
 
-**CPU operations:** Conv1 image formatting (image → tile-major DDR words), data reorder, **Affine2 (50→10, raw INT32 logits)**, argmax. All in `deepnet_deploy.c`. (Max-pool is fused into the NPU conv pass via `pool_en`; **activation padding is now done in hardware** — decision H — so `pad_activation` and `cpu_max_pool_2x2` are both unused.)
+**CPU operations:** Conv1 image formatting (image → tile-major DDR words), data reorder, and **argmax** (reads the 10 INT32 logits). All in `deepnet_deploy.c`. (Max-pool is fused into the NPU conv pass via `pool_en`; **activation padding is now done in hardware** — decision H — so `pad_activation` and `cpu_max_pool_2x2` are both unused. **Affine2 now runs on the NPU** via `int32_out` — decision Q.)
 
-**Note:** NPU pooling (`pool_en`) IS used — Conv2/Conv4/Conv6 fuse 2×2 max-pool into the same NPU pass. **Affine2 stays on CPU** because the NPU's INT8 post-process output saturates the final logits (argmax would be wrong); FC1 (the bottleneck) and any INT8-activation FC layer benefit from the NPU, the final logits layer does not.
+**Note:** NPU pooling (`pool_en`) IS used — Conv2/Conv4/Conv6 fuse 2×2 max-pool into the same NPU pass. **Affine2 (50→10) now runs on the NPU** via the `int32_out` raw-INT32 output mode (decision Q) — it previously stayed on CPU because the INT8 post-process saturates the final logits, which `int32_out` fixes. (On MNIST this regresses ~57K because FC2 is too small to amortize NPU overhead; kept for the general "all FC on NPU" capability.)
 
 ### DDR Buffer Layout (firmware/deepnet_deploy.c)
 
@@ -143,7 +143,7 @@ Argmax: find predicted digit                                          [CPU]
 
 | Offset | Name | Description |
 |--------|------|-------------|
-| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en, `[10]`gemm_reduce, `[11]`row_block_en, `[12]`oc_single |
+| `0x000` | CTRL | `[0]`start, `[1]`ping_pong, `[2]`pool_en, `[3]`eltwise_en, `[4]`clear_done, `[5]`relu_en, `[6]`out_ping, `[7]`gemm_en, `[8]`hw_pad, `[9]`row_par_en, `[10]`gemm_reduce, `[11]`row_block_en, `[12]`oc_single, `[13]`int32_out |
 | `0x150` | PAD | `[15:8]`pad_h, `[7:0]`pad_w (hardware padding border, with CTRL[8]) |
 | `0x004` | STATUS | `[0]`done_irq, `[1]`busy, `[2]`dma_rd_err, `[3]`dma_wr_err (RO) |
 | `0x008–0x01C` | SRAM addrs | Act/Wgt/Out SRAM base addresses (ping/pong) |
@@ -182,7 +182,7 @@ Fully-connected layers run on the systolic array as a degenerate 1×1 conv. `gem
 - **General-purpose:** any `IC ≤ 1024` (HW `ic_group` counter width) and any `OC` (16-tiled), configured via registers — not hardcoded to the MNIST model.
 - **Bank convention:** GEMM runs with `ping_pong=1` → input vector in Act **PONG**, FC weights resident in Wgt **PONG** (packed by `pack_fc_tile`, layout `word(o,g)=o*icg+g`); conv keeps PING. Output to Out PING (`CTRL[6]=0`).
 - **Firmware:** `npu_gemm_pass(in_dim,out_dim,scale,bias,relu,in_ddr,out_ddr,wgt_base)`.
-- **Limitation:** the NPU post-process clamps output to INT8, which saturates final-classifier logits → Affine2 (50→10) stays on CPU. Intermediate FC layers with INT8 activations (Affine1) run on the NPU. This moved Affine1 from ~22.3M to ~0.6M cycles; full 10-image run 40.87M → 22.62M.
+- **Limitation (lifted by decision Q):** the NPU post-process clamps output to INT8, which saturates final-classifier logits → Affine2 (50→10) used to stay on CPU. **Decision Q's `int32_out` mode removes this — Affine2 now runs on the NPU.** Affine1 (the bottleneck) moved from ~22.3M to ~0.6M cycles; full 10-image run 40.87M → 22.62M.
 
 ### G: Weight-prefetch reuse — per-OC-tile, general (`ICG_BUF`)
 
@@ -478,6 +478,37 @@ for out_w=16) and needs **no FSM loop change** — only localized pooler/Out-wri
   pre-decision-O baseline: 7,427,997 → 7,266,176 (-161,821, -2.18%)** (O -51,331 +
   P -110,490). Per-image inference 123,492 → 112,042 (npu phase 594,680 → 480,180);
   ≈ **0.56 ms/image @200MHz**.
+
+### Q: Raw INT32 output — final-classifier FC on NPU (`int32_out`, CTRL[13])
+
+Decision F kept FC2 (the 50→10 final classifier) on the CPU because the NPU
+post-process clamps to INT8, saturating the final logits (argmax would be wrong).
+But the array **already accumulates in INT32** — only the output write path
+quantizes. `int32_out` emits the **scaled, un-clamped INT32** result so any
+final-classifier / un-quantized FC can run on the NPU. General capability;
+removes decision F's limitation ("ALL FC on NPU").
+- **Capture point:** post_process **`s2_quant`** = `(psum+bias)*scale >>> shift`
+  (full INT32, BEFORE the S3 INT8 clamp) — exactly equals the CPU FC2's
+  `(acc*SCALE)>>SHIFT`, so it's bit-identical (same 64-bit signed product /
+  arithmetic-shift / low-32 path FC1's GEMM already matches its CPU oracle on).
+  Exposed as `o_feat32` (16×INT32), delay-matched to `o_feat`.
+- **Packing:** 16 OC × INT32 = 512 b don't fit one 128-b Out word, so a sequencer
+  in `npu_top` latches `o_feat32` at the GEMM write pulse and serializes **4 Out
+  words** (4×INT32 each) at base..base+3; DMA reads 4 words back. Off ⇒ INT8 path
+  untouched ⇒ byte-identical.
+- **Firmware:** `npu_gemm_pass(..., int32_out)` (OUT base = `pass*4`, sets CTRL[13],
+  DMA `4*oc_passes` words). FC2 runs `reduce=0` (legacy GEMM — IC=50 isn't a
+  256-multiple; zero-padded IC/OC contribute 0), `relu` off; CPU reads the 10 INT32
+  logits for argmax. CPU FC2 MAC loop removed.
+- Result: bit-identical `SCORE_CHK=D30179DF`, 10/10 (NPU INT32 == CPU FC2 exactly).
+  **Full run 7,266,176 → 7,323,134 (+56,958, +0.78%) — a REGRESSION:** FC2 is 500
+  MACs, too small to amortize the NPU per-pass overhead (~50 MMIO + IRQ + 2 DMAs),
+  so it loses to the CPU loop on MNIST. Kept for the **general capability** + "all
+  FC on NPU" uniformity; a model with a LARGE final FC wins with the same code.
+  (Phase 0: CPU FC2 = ~22.6K/img for 500 MACs ≈ 44 cyc/MAC — PicoRV32's slow
+  multicycle execution, not a slow multiplier. The profiled per-image misleadingly
+  showed a gain; the non-profiled full-run A/B is ground truth — see
+  [[soc-npu-spec-estimate-caution]].)
 
 ### IRQ map (PicoRV32 `irq[]` bits)
 
