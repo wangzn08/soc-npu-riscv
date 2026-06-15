@@ -55,6 +55,7 @@ void usercode7(void);
 #define NPU_KERNEL     (NPU_BASE + 0x030)  // [15:8]KH [7:0]KW
 #define NPU_STRIDE     (NPU_BASE + 0x034)  // [15:8]SX [7:0]SY
 #define NPU_CLIP_MAX   (NPU_BASE + 0x118)  // post-process upper clamp [7:0], default 127; ReLU6 = q(6.0)
+#define NPU_SKIP_BASE  (NPU_BASE + 0x11C)  // residual skip-source Out-SRAM base (0 = same-addr legacy)
 #define NPU_PAD        (NPU_BASE + 0x150)  // [15:8]pad_h [7:0]pad_w (hardware padding, CTRL[8])
 
 // Performance counters (RTL, read-only; write NPU_PERF_CLR to reset all)

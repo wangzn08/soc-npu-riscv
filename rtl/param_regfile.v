@@ -93,6 +93,7 @@ module param_regfile #(
     output wire [7:0]                   o_pad_w,         // NPU_PAD[7:0]: zero-pad columns each side
     output wire [7:0]                   o_pad_h,         // NPU_PAD[15:8]: zero-pad rows each side
     output wire [7:0]                   o_clip_max,      // NPU_CLIP_MAX (0x118): post-process upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
+    output wire [SRAM_ADDR_W-1:0]       o_skip_base,     // NPU_SKIP_BASE (0x11C): residual skip source Out-SRAM base (0 = same-addr legacy)
 
     // Status
     input  wire                         i_done_irq,
@@ -202,6 +203,7 @@ module param_regfile #(
     reg        ctrl_pool_avg;    // CTRL[16]: 2x2 average pooling (vs max)
     reg [15:0] pad_cfg;         // NPU_PAD: {pad_h[15:8], pad_w[7:0]}
     reg [7:0]  clip_max;        // NPU_CLIP_MAX: post-process upper clamp value
+    reg [SRAM_ADDR_W-1:0] skip_base;  // NPU_SKIP_BASE: residual skip source base
 
     // Status
     wire       status_done;
@@ -321,6 +323,7 @@ module param_regfile #(
             ctrl_pool_avg    <= 1'b0;   // average pooling off by default (max)
             pad_cfg         <= 16'd0;
             clip_max        <= 8'd127;   // default = legacy ReLU clamp [0,127]
+            skip_base       <= {SRAM_ADDR_W{1'b0}};  // default 0 = same-addr legacy residual
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
             act_addr_pong   <= {SRAM_ADDR_W{1'b0}};
             wgt_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -460,6 +463,7 @@ module param_regfile #(
                     10'h110: total_ops_h <= s_axi_wdata[15:0];
                     10'h114: total_ops_w <= s_axi_wdata[15:0];
                     10'h118: clip_max    <= s_axi_wdata[7:0];   // NPU_CLIP_MAX
+                    10'h11C: skip_base   <= s_axi_wdata[SRAM_ADDR_W-1:0];  // NPU_SKIP_BASE
 
                     // DMA control registers (0x120-0x13C)
                     10'h120: dma_rd_req_d     <= 1'b1;  // Write triggers DMA read pulse
@@ -594,6 +598,7 @@ module param_regfile #(
                     10'h110: rdata <= {16'd0, total_ops_h};
                     10'h114: rdata <= {16'd0, total_ops_w};
                     10'h118: rdata <= {24'd0, clip_max};
+                    10'h11C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, skip_base};
 
                     // DMA status (0x140, read-only)
                     10'h140: rdata <= {28'd0, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
@@ -657,6 +662,7 @@ module param_regfile #(
     assign o_pad_w        = pad_cfg[7:0];
     assign o_pad_h        = pad_cfg[15:8];
     assign o_clip_max     = clip_max;
+    assign o_skip_base    = skip_base;
     assign o_clear_done   = ctrl_clear_done;
 
     assign o_act_addr_ping = act_addr_ping;

@@ -126,6 +126,7 @@ module npu_top #(
     wire                            cfg_relu_en;
     wire [7:0]                      cfg_clip_max;
     wire                            cfg_pool_avg;
+    wire [SRAM_ADDR_W-1:0]          cfg_skip_base;
     wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
@@ -293,6 +294,7 @@ module npu_top #(
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
         .o_clip_max       (cfg_clip_max),
+        .o_skip_base      (cfg_skip_base),
         .i_done_irq       (status_done_irq),
         .i_busy           (status_busy),
         .i_dma_rd_err     (dma_rd_err),
@@ -1163,7 +1165,10 @@ module npu_top #(
     // Out SRAM Port B: mux between skip-read path and DMA read
     // Skip path: reads previous layer's output for eltwise addition
     wire skip_rd_en = cfg_eltwise_en & pp_feat_vld & ~cfg_dma_out_rd_sel;
-    wire [OUT_SRAM_ADDR_W-1:0] skip_rd_addr = fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
+    // Residual skip source: configurable base (NPU_SKIP_BASE) + the write-position
+    // offset. cfg_skip_base=0 ⇒ same-address legacy in-place accumulate.
+    wire [OUT_SRAM_ADDR_W-1:0] skip_rd_addr =
+             cfg_skip_base[OUT_SRAM_ADDR_W-1:0] + fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
 
     // Out SRAM Port B address/en mux
     wire [OUT_SRAM_ADDR_W-1:0] out_sram_addrb_mux;
