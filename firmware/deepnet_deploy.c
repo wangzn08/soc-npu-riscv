@@ -884,7 +884,7 @@ void deepnet_inference(const int8_t *input, int32_t *scores)
     // dma_ddr_to_act(ACT_BUF_A, 0, 8 * 8 * 2);
     npu_conv_pass(10, 10, 32, 64, 3, 3, 1, 1,
                   32, SCALE_CONV5, conv5_b,
-                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0, 0);   // resident in=R0, out->R1
+                  ACT_BUF_B, 64, CONV5_WGT_BASE, 0, 1, 1, 0, ACT_RES_B, 0, 1);   // resident in=R0, out->R1; oc_single (decision O)
 #ifdef DEBUG_VERBOSE
     dbg_layer("Conv5", ACT_BUF_B, 64 * 64);
 #endif
