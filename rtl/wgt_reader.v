@@ -30,7 +30,9 @@ module wgt_reader #(
     parameter WGT_BUS_W      = NUM_OC * WGT_GROUP_W,      // 2048
     parameter SRAM_ADDR_W    = 14,
     parameter IC_GROUPS_MAX  = 64,   // max IC groups (1024 ch / 16)
-    parameter ICG_BUF        = 4     // IC-tiles held on-chip for per-OC-tile reuse
+    parameter ICG_BUF        = 4,    // IC-tiles held on-chip for per-OC-tile reuse
+    parameter MAX_OC_RESIDENT = 64,  // decision O: all-OC-tiles held on-chip (OC tiles × 16)
+    parameter OC_TILES_W     = 3     // width of OC-tile counter (1..MAX_OC_RESIDENT/16)
 ) (
     input  wire                         clk,
     input  wire                         rst_n,
@@ -51,6 +53,11 @@ module wgt_reader #(
     input  wire [3:0]                   i_wgt_ic_sel,      // during CALC: which ic_group's weights to present (reuse)
     output wire                         o_prefetch_done,   // Pre-fetch complete
 
+    // === Decision O: all-OC-resident (oc_single) ===
+    input  wire                         i_oc_single,       // 1=prefetch ALL OC-tiles once, hold resident
+    input  wire [OC_TILES_W-1:0]        i_oc_tiles_total,  // number of 16-OC tiles for the layer (1..4)
+    input  wire [OC_TILES_W-1:0]        i_oc_tile_sel,     // during CALC: which OC-tile's weights to present
+
     // === Kernel offset selection (during CALC_MAC) ===
     input  wire [3:0]                   i_wgt_offset,      // 0..8 kernel offset selector
 
@@ -70,7 +77,9 @@ module wgt_reader #(
     // Pre-fetch buffer: 9 offsets × 16 OC groups × 128 bits
     // wgt_buf[ko][oc] = 128-bit weight group
     // -------------------------------------------------------------------
-    reg [WGT_GROUP_W-1:0] wgt_buf [0:KERNEL_OFFSETS-1][0:NUM_OC-1][0:ICG_BUF-1];
+    // Decision O: 2nd dim sized to MAX_OC_RESIDENT so all OC-tiles can be held
+    // resident in oc_single mode; legacy modes only ever touch indices 0..NUM_OC-1.
+    reg [WGT_GROUP_W-1:0] wgt_buf [0:KERNEL_OFFSETS-1][0:MAX_OC_RESIDENT-1][0:ICG_BUF-1];
 
     // -------------------------------------------------------------------
     // Pre-fetch state machine
@@ -87,7 +96,12 @@ module wgt_reader #(
     reg [4:0] pf_oc_d;     // Delayed oc
     reg [3:0] pf_icg;      // Current IC group being pre-fetched (reuse mode)
     reg [3:0] pf_icg_d;    // Delayed (matches SRAM 1-cycle latency)
+    reg [OC_TILES_W-1:0] pf_oct;    // Current OC-tile being pre-fetched (oc_single)
+    reg [OC_TILES_W-1:0] pf_oct_d;  // Delayed (matches SRAM 1-cycle latency)
     reg       pf_done_r;
+
+    // oc_single behaves like prefetch_all for IC groups (hold every group resident).
+    wire pf_all = i_prefetch_all || i_oc_single;
 
     // Address stride between consecutive OCs for the same (ic_group, ko)
     // KO = i_kernel_offsets (runtime kh*kw): conv 3x3 -> 9 (identical to old
@@ -100,11 +114,17 @@ module wgt_reader #(
     wire [SRAM_ADDR_W-1:0] addr_oc_component;
     wire [SRAM_ADDR_W-1:0] addr_ic_component;
 
-    assign addr_oc_component = {{(SRAM_ADDR_W-10){1'b0}}, i_oc_base} * oc_stride;
-    // Reuse mode prefetches every ic_group (pf_icg); legacy mode the single i_ic_group.
-    wire [9:0] eff_icg = i_prefetch_all ? {6'd0, pf_icg} : i_ic_group;
+    // oc_single sweeps all OC-tiles: the effective OC base is pf_oct*16.
+    wire [9:0] eff_oc_base = i_oc_single ? {{(6-OC_TILES_W){1'b0}}, pf_oct, 4'd0} : i_oc_base;
+    assign addr_oc_component = {{(SRAM_ADDR_W-10){1'b0}}, eff_oc_base} * oc_stride;
+    // Reuse / oc_single prefetch every ic_group (pf_icg); legacy uses single i_ic_group.
+    wire [9:0] eff_icg = pf_all ? {6'd0, pf_icg} : i_ic_group;
     assign addr_ic_component = {{(SRAM_ADDR_W-10){1'b0}}, eff_icg}
                              * {{(SRAM_ADDR_W-8){1'b0}}, i_kernel_offsets};
+
+    // Global OC store / select index = oc_tile*16 + oc_in_tile (oc_single), else oc.
+    wire [6:0] pf_oc_store_idx = i_oc_single ? {pf_oct_d, pf_oc_d[3:0]} : {3'b0, pf_oc_d[3:0]};
+    wire [3:0] pf_icg_store    = pf_all ? pf_icg_d : 4'd0;
 
     wire [SRAM_ADDR_W-1:0] sram_rd_addr;
     assign sram_rd_addr = i_wgt_base
@@ -201,6 +221,8 @@ module wgt_reader #(
             pf_oc_d      <= 5'd0;
             pf_icg       <= 4'd0;
             pf_icg_d     <= 4'd0;
+            pf_oct       <= {OC_TILES_W{1'b0}};
+            pf_oct_d     <= {OC_TILES_W{1'b0}};
             pf_done_r    <= 1'b0;
             pf_reading_d <= 1'b0;
         end else begin
@@ -208,6 +230,7 @@ module wgt_reader #(
             pf_ko_d <= pf_ko;
             pf_oc_d <= pf_oc;
             pf_icg_d <= pf_icg;
+            pf_oct_d <= pf_oct;
             pf_reading_d <= (pf_state == PF_READING);
 
             case (pf_state)
@@ -217,6 +240,7 @@ module wgt_reader #(
                         pf_ko    <= 4'd0;
                         pf_oc    <= 5'd0;
                         pf_icg   <= 4'd0;
+                        pf_oct   <= {OC_TILES_W{1'b0}};
                     end
                     pf_done_r <= 1'b0;
                 end
@@ -226,20 +250,26 @@ module wgt_reader #(
                     // Only write when pf_reading_d is asserted, which gates out the
                     // stale SRAM data present on the first cycle after PF_DONE→PF_READING.
                     if (pf_reading_d)
-                        wgt_buf[pf_ko_d][pf_oc_d][i_prefetch_all ? pf_icg_d : 4'd0] <= i_sram_data;
+                        wgt_buf[pf_ko_d][pf_oc_store_idx][pf_icg_store] <= i_sram_data;
 
-                    // Done after last OC of last offset; in reuse mode also after the
-                    // last IC group (prefetch every group of the OC tile once).
+                    // Done after last OC of last offset; reuse/oc_single also after the
+                    // last IC group; oc_single also after the last OC tile.
                     if (pf_oc == 5'd15 && pf_ko == (i_kernel_offsets[3:0] - 4'd1) &&
-                        (!i_prefetch_all || pf_icg == (i_ic_groups_total[3:0] - 4'd1))) begin
+                        (!pf_all || pf_icg == (i_ic_groups_total[3:0] - 4'd1)) &&
+                        (!i_oc_single || pf_oct == (i_oc_tiles_total - {{(OC_TILES_W-1){1'b0}},1'b1}))) begin
                         pf_state <= PF_WAIT_LAST;
                     end else begin
-                        // Advance OC, then kernel offset, then IC group (reuse)
+                        // Advance OC, then kernel offset, then IC group, then OC tile
                         if (pf_oc == 5'd15) begin
                             pf_oc <= 5'd0;
                             if (pf_ko == (i_kernel_offsets[3:0] - 4'd1)) begin
                                 pf_ko  <= 4'd0;
-                                pf_icg <= pf_icg + 4'd1;   // advances only when i_prefetch_all
+                                if (!pf_all || pf_icg == (i_ic_groups_total[3:0] - 4'd1)) begin
+                                    pf_icg <= 4'd0;
+                                    pf_oct <= pf_oct + {{(OC_TILES_W-1){1'b0}},1'b1}; // only in oc_single
+                                end else begin
+                                    pf_icg <= pf_icg + 4'd1;   // advances when pf_all
+                                end
                             end else begin
                                 pf_ko <= pf_ko + 4'd1;
                             end
@@ -251,7 +281,7 @@ module wgt_reader #(
 
                 PF_WAIT_LAST: begin
                     // Capture the final SRAM read data (1 cycle after last address)
-                    wgt_buf[pf_ko_d][pf_oc_d][i_prefetch_all ? pf_icg_d : 4'd0] <= i_sram_data;
+                    wgt_buf[pf_ko_d][pf_oc_store_idx][pf_icg_store] <= i_sram_data;
                     pf_state  <= PF_DONE;
                     pf_done_r <= 1'b1;
                 end
@@ -264,6 +294,7 @@ module wgt_reader #(
                         pf_ko    <= 4'd0;
                         pf_oc    <= 5'd0;
                         pf_icg   <= 4'd0;
+                        pf_oct   <= {OC_TILES_W{1'b0}};
                     end else begin
                         pf_state <= PF_IDLE;
                     end
@@ -282,13 +313,16 @@ module wgt_reader #(
     wire [3:0] ko_sel;
     assign ko_sel = i_wgt_offset;
 
-    // Reuse mode selects the current ic_group from the buffer; legacy uses slot 0.
-    wire [3:0] ic_sel = i_prefetch_all ? i_wgt_ic_sel : 4'd0;
+    // Reuse / oc_single select the current ic_group from the buffer; legacy uses slot 0.
+    wire [3:0] ic_sel = pf_all ? i_wgt_ic_sel : 4'd0;
+    // oc_single selects the active OC-tile's 16 channels (base = tile*16); else tile 0.
+    wire [6:0] oc_out_base = i_oc_single ? {i_oc_tile_sel, 4'd0} : 7'd0;
 
     genvar gi;
     generate
         for (gi = 0; gi < NUM_OC; gi = gi + 1) begin : gen_wgt_out
-            assign o_wgt[gi*WGT_GROUP_W +: WGT_GROUP_W] = wgt_buf[ko_sel][gi][ic_sel];
+            assign o_wgt[gi*WGT_GROUP_W +: WGT_GROUP_W] =
+                wgt_buf[ko_sel][oc_out_base + gi[6:0]][ic_sel];
         end
     endgenerate
 

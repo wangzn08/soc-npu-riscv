@@ -131,6 +131,9 @@ module npu_top #(
     wire                            cfg_gemm_reduce;    // CTRL[10]: GEMM 16-row IC-reduction
     wire                            cfg_row_block_en;   // CTRL[11]: row-block packing (#4)
     wire                            cfg_oc_single;      // CTRL[12]: all-OC in one start (decision O)
+    wire [2:0]                      cfg_oc_tiles_total; // #16-OC tiles (1..4), assigned below
+    wire [2:0]                      fsm_wgt_oc_tile_sel; // active OC-tile during CALC (oc_single)
+    assign fsm_wgt_oc_tile_sel = 3'd0;  // step 3: dormant; FSM drives this in step 4
     wire [3:0]                       fsm_rows_per_grp;   // #4: R output rows packed
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
@@ -173,6 +176,7 @@ module npu_top #(
     wire [15:0]                     cfg_dim_in_h;
     wire [15:0]                     cfg_dim_in_c;
     wire [15:0]                     cfg_dim_out_c;
+    assign cfg_oc_tiles_total = (cfg_dim_out_c + 16'd15) >> 4;  // decision O: #16-OC tiles
     wire [7:0]                      cfg_kh;
     wire [7:0]                      cfg_kw;
     wire [7:0]                      cfg_sx;
@@ -609,6 +613,9 @@ module npu_top #(
         .i_prefetch_all    (fsm_prefetch_all),
         .i_wgt_ic_sel      (fsm_wgt_ic_sel),
         .o_prefetch_done   (fsm_wgt_prefetch_done),
+        .i_oc_single       (cfg_oc_single),
+        .i_oc_tiles_total  (cfg_oc_tiles_total),
+        .i_oc_tile_sel     (fsm_wgt_oc_tile_sel),
         .i_wgt_offset      (fsm_im2col_offset_sel),
         .o_wgt             (wgt_reader_wgt),
         .o_wgt_vld         (wgt_reader_wgt_vld),
