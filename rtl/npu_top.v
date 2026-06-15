@@ -987,17 +987,46 @@ module npu_top #(
     wire rp_wr_en = cfg_row_par_en & ~cfg_pool_en & rp_col_valid;
     wire rp_done  = rp_active && (rp_vld_cnt == 5'd15) && pp_feat_vld;
 
+    // ---- Decision Q: raw INT32 output write sequencer (GEMM/final-FC) ----
+    // 16 OC × INT32 = 512 bits don't fit one 128-bit Out word, so latch the INT32
+    // post-process result (pp_feat32) at the single GEMM write pulse and serialize
+    // it into 4 Out-SRAM words (4×INT32 each) at base..base+3. Off ⇒ unused ⇒
+    // byte-identical (the INT8 path drives out_sram_* exactly as before).
+    reg [NUM_CH*32-1:0]   i32_buf;
+    reg [1:0]             i32_cnt;
+    reg                   i32_active;
+    reg [SRAM_ADDR_W-1:0] i32_base;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            i32_buf <= {NUM_CH*32{1'b0}}; i32_cnt <= 2'd0;
+            i32_active <= 1'b0; i32_base <= {SRAM_ADDR_W{1'b0}};
+        end else if (cfg_int32_out && fsm_out_wr_en && !i32_active) begin
+            i32_buf    <= pp_feat32;                    // 16×INT32 latched at the GEMM write
+            i32_base   <= fsm_out_wr_addr;
+            i32_cnt    <= 2'd0;
+            i32_active <= 1'b1;
+        end else if (i32_active) begin
+            if (i32_cnt == 2'd3) i32_active <= 1'b0;
+            i32_cnt <= i32_cnt + 2'd1;
+        end
+    end
+    wire                  i32_wr_en   = i32_active;
+    wire [SRAM_ADDR_W-1:0] i32_wr_addr = i32_base + {{(SRAM_ADDR_W-2){1'b0}}, i32_cnt};
+    wire [ACT_DATA_W-1:0] i32_wr_data = i32_buf[i32_cnt*ACT_DATA_W +: ACT_DATA_W];
+
     // In pool mode the Out-SRAM write is self-timed by the pooler's output
     // valid (pool_vld = pp_feat_vld) with the contiguous pool_out_addr_cnt;
     // in non-pool mode it is FSM-driven exactly as before.
-    assign out_sram_ena   = cfg_pool_en    ? pp_feat_vld
+    assign out_sram_ena   = cfg_int32_out  ? i32_wr_en
+                          : cfg_pool_en    ? pp_feat_vld
                           : cfg_row_par_en ? rp_wr_en
                           :                  fsm_out_wr_en;
     assign out_sram_wea   = out_sram_ena;
-    assign out_sram_addra = cfg_pool_en    ? pool_wr_addr[OUT_SRAM_ADDR_W-1:0]
+    assign out_sram_addra = cfg_int32_out  ? i32_wr_addr[OUT_SRAM_ADDR_W-1:0]
+                          : cfg_pool_en    ? pool_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           : cfg_row_par_en ? rp_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           :                  fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
-    assign out_sram_dia   = alu_res;
+    assign out_sram_dia   = cfg_int32_out  ? i32_wr_data : alu_res;
 
     // synthesis translate_off
     `ifdef DEBUG
