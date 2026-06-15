@@ -96,6 +96,7 @@ void usercode7(void);
 #define NPU_CTRL_GEMM_REDUCE (1 << 10) // GEMM 16-row IC-reduction (decision M): util 6.25%->~100%
 #define NPU_CTRL_ROW_BLOCK   (1 << 11) // row-block packing (#4): pack R output rows, narrow layers 50%->100%
 #define NPU_CTRL_OC_SINGLE   (1 << 12) // all-OC-tiles in one start (decision O): im2col+weights reused across OC tiles
+#define NPU_CTRL_INT32_OUT   (1 << 13) // raw INT32 output (decision Q): emit scaled un-clamped INT32 (final-FC logits)
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)

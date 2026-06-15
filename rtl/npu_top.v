@@ -131,6 +131,7 @@ module npu_top #(
     wire                            cfg_gemm_reduce;    // CTRL[10]: GEMM 16-row IC-reduction
     wire                            cfg_row_block_en;   // CTRL[11]: row-block packing (#4)
     wire                            cfg_oc_single;      // CTRL[12]: all-OC in one start (decision O)
+    wire                            cfg_int32_out;      // CTRL[13]: raw INT32 output (decision Q)
     wire [2:0]                      cfg_oc_tiles_total; // #16-OC tiles (1..4), assigned below
     wire [2:0]                      fsm_oc_tile_sel;     // active OC-tile from FSM (oc_single OC-inner loop)
     wire [2:0]                      fsm_wgt_oc_tile_sel = fsm_oc_tile_sel;
@@ -261,6 +262,7 @@ module npu_top #(
         .o_gemm_reduce    (cfg_gemm_reduce),
         .o_row_block_en   (cfg_row_block_en),
         .o_oc_single      (cfg_oc_single),
+        .o_int32_out      (cfg_int32_out),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
         .i_done_irq       (status_done_irq),
