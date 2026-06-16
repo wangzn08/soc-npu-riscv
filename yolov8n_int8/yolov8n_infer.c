@@ -11,6 +11,10 @@
 #include "yolov8n_infer.h"
 #include "yolov8n_layers.h"
 
+/* env-gated debug dump: print dequantized first-8 values of a conv output,
+ * keyed by conv index, so it lines up with ONNX checkpoint tensors. */
+static void dbg_dump_conv(int ci, const void *tp);
+
 /* ================================================================ */
 /* Tensor: int8 CHW layout, with its own per-tensor scale/zero_point */
 /* ================================================================ */
@@ -167,11 +171,16 @@ static Tensor conv_int8(int ci, const Tensor *in) {
                     const int8_t *wic = woc + (long long)ic * KH * KW;
                     for (int kh = 0; kh < KH; kh++) {
                         int ih = oh * S - P + kh;
-                        if (ih < 0 || ih >= in->h) continue;
                         for (int kw = 0; kw < KW; kw++) {
                             int iw = ow * S - P + kw;
-                            if (iw < 0 || iw >= in->w) continue;
-                            acc += (int32_t)in_ch[ih * in->w + iw] * (int32_t)wic[kh * KW + kw];
+                            /* ONNX QLinearConv pads with the input zero-point, so
+                             * padded taps contribute in_zp * weight (NOT skipped).
+                             * Skipping them desyncs from the in_zp*wsum correction
+                             * below and corrupts every conv edge. */
+                            int8_t ival = (ih < 0 || ih >= in->h || iw < 0 || iw >= in->w)
+                                              ? (int8_t)in->zero_point
+                                              : in_ch[ih * in->w + iw];
+                            acc += (int32_t)ival * (int32_t)wic[kh * KW + kw];
                         }
                     }
                 }
@@ -182,7 +191,37 @@ static Tensor conv_int8(int ci, const Tensor *in) {
             }
         }
     }
+    if (getenv("YOLO_DEBUG_DUMP")) dbg_dump_conv(ci, &out);
     return out;
+}
+
+/* Dump dequantized first-8 values for the conv indices that map to the
+ * ONNX checkpoint tensors (conv0, C2f.2 cv1, SPPF cv2, scale2 bbox head). */
+static void dbg_dump_conv(int ci, const void *tp) {
+    if (ci != 0 && ci != 2 && ci != 26 && ci != 61) return;
+    const Tensor *t = (const Tensor *)tp;
+    const char *tag = "?";
+    if (ci == 0)  tag = "conv0   /model.0/act/Mul_output_0";
+    if (ci == 2)  tag = "conv2   /model.2/cv1/act/Mul_output_0";
+    if (ci == 26) tag = "conv26  /model.9/cv2/act/Mul_output_0";
+    if (ci == 61) tag = "conv61  /model.22/cv2.2/cv2.2.2/Conv_output_0";
+    fprintf(stderr, "DEBUG %s: shape=(%d,%d,%d) scale=%.8f zp=%d first8= ",
+            tag, t->c, t->h, t->w, t->scale, t->zero_point);
+    for (int i = 0; i < 8; i++)
+        fprintf(stderr, "%.6f ", (t->data[i] - t->zero_point) * t->scale);
+    fprintf(stderr, "\n");
+    if (ci == 0 && getenv("YOLO_DEBUG_INTERIOR")) {
+        int W = t->w, H = t->h;
+        int idxs[6][2] = {{160,160},{160,161},{100,100},{200,50},{0,0},{1,1}};
+        fprintf(stderr, "  conv0 ch0 interior:");
+        for (int k = 0; k < 6; k++) {
+            int r = idxs[k][0], c = idxs[k][1];
+            (void)H;
+            int8_t v = t->data[r*W + c];
+            fprintf(stderr, " [%d,%d]=%.4f", r, c, (v - t->zero_point) * t->scale);
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 /* ================================================================ */
