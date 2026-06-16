@@ -33,7 +33,9 @@ module post_process_top #(
     // Feature map geometry (for pooling)
     input  wire [15:0]                      i_width,
     input  wire                             i_pool_en,
+    input  wire                             i_pool_avg,   // 0=max pool (legacy), 1=2x2 average pool
     input  wire                             i_relu_en,
+    input  wire [7:0]                       i_clip_max,   // upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
 
     // Pooling state control (from FSM)
     input  wire                             i_start,      // op-start pulse: reset pool phase
@@ -128,13 +130,14 @@ module post_process_top #(
         for (gi = 0; gi < NUM_OC; gi = gi + 1) begin : gen_s3
             wire [PSUM_WIDTH-1:0] s2_val = s2_quant[gi];
             wire is_neg  = s2_val[PSUM_WIDTH-1];  // sign bit
-            wire is_gt127 = (s2_val > 32'd127);
+            wire is_gt   = (s2_val > {24'd0, i_clip_max});  // exceeds configurable upper clamp
 
             wire [ACT_WIDTH-1:0] act_val;
-            // When relu_en: negative→0, >127→127, else pass through
-            // When !relu_en: only clamp >127→127, keep negative values
+            // When relu_en: negative→0, >clip_max→clip_max, else pass through
+            // When !relu_en: only clamp >clip_max→clip_max, keep negative values
+            // clip_max defaults to 127 (legacy ReLU); set lower for ReLU6.
             assign act_val = (i_relu_en && is_neg) ? {ACT_WIDTH{1'b0}} :
-                             is_gt127              ? 8'd127 :
+                             is_gt                 ? i_clip_max :
                                                      s2_val[ACT_WIDTH-1:0];
 
             always @(posedge clk) begin
@@ -281,6 +284,7 @@ module post_process_top #(
         .i_feat      (pool_feat_in),
         .i_feat_vld  (pool_feat_vld_in),
         .i_width     (i_width),
+        .i_avg       (i_pool_avg),  // CTRL[16]: 2x2 average vs max
         .i_tile      (i_oc_tile),   // decision P: active OC-tile (oc_single OC-inner loop)
         .o_pool      (pool_out),
         .o_pool_vld  (pool_vld),

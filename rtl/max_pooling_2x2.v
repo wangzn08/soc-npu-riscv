@@ -37,6 +37,7 @@ module max_pooling_2x2 #(
     input  wire [DATA_W-1:0] i_feat,
     input  wire              i_feat_vld,
     input  wire [15:0]       i_width,
+    input  wire              i_avg,        // 0=max (legacy), 1=2x2 average
     input  wire [TILE_W-1:0] i_tile,       // decision P: active OC-tile (0 ⇒ legacy)
     output reg  [DATA_W-1:0] o_pool,
     output reg               o_pool_vld,
@@ -81,7 +82,11 @@ module max_pooling_2x2 #(
             wire [ACT_WIDTH-1:0] br = i_feat[gi*ACT_WIDTH +: ACT_WIDTH];
             wire [ACT_WIDTH-1:0] mtop = (tl >= tr) ? tl : tr;
             wire [ACT_WIDTH-1:0] mbot = (bl >= br) ? bl : br;
-            assign win_max[gi*ACT_WIDTH +: ACT_WIDTH] = (mtop >= mbot) ? mtop : mbot;
+            wire [ACT_WIDTH-1:0] mx   = (mtop >= mbot) ? mtop : mbot;
+            // 2x2 average: (a+b+c+d)/4, floor. sum needs +2 bits of headroom.
+            wire [ACT_WIDTH+1:0] sum4 = {2'd0, tl} + {2'd0, tr} + {2'd0, bl} + {2'd0, br};
+            wire [ACT_WIDTH-1:0] avg  = sum4[ACT_WIDTH+1:2];
+            assign win_max[gi*ACT_WIDTH +: ACT_WIDTH] = i_avg ? avg : mx;
         end
     endgenerate
 

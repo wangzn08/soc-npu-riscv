@@ -89,8 +89,16 @@ module param_regfile #(
     output wire                         o_row_block_en,  // CTRL[11]: row-block packing for narrow layers (#4)
     output wire                         o_oc_single,     // CTRL[12]: all-OC-tiles in one start (decision O / Level 2)
     output wire                         o_int32_out,     // CTRL[13]: raw INT32 output (decision Q, final FC)
+    output wire                         o_pool_avg,      // CTRL[16]: 2x2 average pooling (vs max)
+    output wire                         o_pw_en,         // CTRL[14]: 1x1 pointwise conv (im2col bypass)
+    output wire                         o_dw_en,         // CTRL[15]: depthwise conv (channel-parallel MAC)
+    output wire                         o_gpool_en,      // CTRL[17]: global average pooling
+    output wire [31:0]                  o_gavg_mul,      // NPU_GAVG_CFG[25:0]: reciprocal multiplier (1/N)
+    output wire [5:0]                   o_gavg_shift,    // NPU_GAVG_CFG[31:26]: reciprocal shift
     output wire [7:0]                   o_pad_w,         // NPU_PAD[7:0]: zero-pad columns each side
     output wire [7:0]                   o_pad_h,         // NPU_PAD[15:8]: zero-pad rows each side
+    output wire [7:0]                   o_clip_max,      // NPU_CLIP_MAX (0x118): post-process upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
+    output wire [SRAM_ADDR_W-1:0]       o_skip_base,     // NPU_SKIP_BASE (0x11C): residual skip source Out-SRAM base (0 = same-addr legacy)
 
     // Status
     input  wire                         i_done_irq,
@@ -197,7 +205,15 @@ module param_regfile #(
     reg        ctrl_row_block;   // CTRL[11]: row-block packing (#4)
     reg        ctrl_oc_single;   // CTRL[12]: all-OC-tiles in one start (decision O)
     reg        ctrl_int32_out;   // CTRL[13]: raw INT32 output (decision Q)
+    reg        ctrl_pool_avg;    // CTRL[16]: 2x2 average pooling (vs max)
+    reg        ctrl_pw_en;       // CTRL[14]: 1x1 pointwise conv
+    reg        ctrl_dw_en;       // CTRL[15]: depthwise conv
+    reg        ctrl_gpool_en;    // CTRL[17]: global average pooling
+    reg [25:0] gavg_mul;         // NPU_GAVG_CFG: reciprocal multiplier (1/N)
+    reg [5:0]  gavg_shift;       // NPU_GAVG_CFG: reciprocal shift
     reg [15:0] pad_cfg;         // NPU_PAD: {pad_h[15:8], pad_w[7:0]}
+    reg [7:0]  clip_max;        // NPU_CLIP_MAX: post-process upper clamp value
+    reg [SRAM_ADDR_W-1:0] skip_base;  // NPU_SKIP_BASE: residual skip source base
 
     // Status
     wire       status_done;
@@ -314,7 +330,15 @@ module param_regfile #(
             ctrl_row_block   <= 1'b0;   // row-block packing off by default
             ctrl_oc_single   <= 1'b0;   // oc-single off by default
             ctrl_int32_out   <= 1'b0;   // int32 raw output off by default
+            ctrl_pool_avg    <= 1'b0;   // average pooling off by default (max)
+            ctrl_pw_en       <= 1'b0;   // pointwise off by default
+            ctrl_dw_en       <= 1'b0;   // depthwise off by default
+            ctrl_gpool_en    <= 1'b0;   // global average pooling off by default
+            gavg_mul         <= 26'd0;
+            gavg_shift       <= 6'd0;
             pad_cfg         <= 16'd0;
+            clip_max        <= 8'd127;   // default = legacy ReLU clamp [0,127]
+            skip_base       <= {SRAM_ADDR_W{1'b0}};  // default 0 = same-addr legacy residual
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
             act_addr_pong   <= {SRAM_ADDR_W{1'b0}};
             wgt_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -392,6 +416,10 @@ module param_regfile #(
                         ctrl_row_block   <= s_axi_wdata[11];
                         ctrl_oc_single   <= s_axi_wdata[12];
                         ctrl_int32_out   <= s_axi_wdata[13];
+                        ctrl_pool_avg    <= s_axi_wdata[16];
+                        ctrl_pw_en       <= s_axi_wdata[14];
+                        ctrl_dw_en       <= s_axi_wdata[15];
+                        ctrl_gpool_en    <= s_axi_wdata[17];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -452,6 +480,8 @@ module param_regfile #(
                     10'h10C: out_y_base  <= s_axi_wdata[15:0];
                     10'h110: total_ops_h <= s_axi_wdata[15:0];
                     10'h114: total_ops_w <= s_axi_wdata[15:0];
+                    10'h118: clip_max    <= s_axi_wdata[7:0];   // NPU_CLIP_MAX
+                    10'h11C: skip_base   <= s_axi_wdata[SRAM_ADDR_W-1:0];  // NPU_SKIP_BASE
 
                     // DMA control registers (0x120-0x13C)
                     10'h120: dma_rd_req_d     <= 1'b1;  // Write triggers DMA read pulse
@@ -475,6 +505,10 @@ module param_regfile #(
                     10'h150: pad_cfg <= s_axi_wdata[15:0];  // {pad_h, pad_w}
                     10'h154: copy_trig_d <= 1'b1;            // trigger on-chip Out->Act copy
                     10'h158: expand_trig_d <= 1'b1;          // trigger img_expand
+                    10'h15C: begin                            // NPU_GAVG_CFG
+                        gavg_mul   <= s_axi_wdata[25:0];
+                        gavg_shift <= s_axi_wdata[31:26];
+                    end
 
                     default: ; // Ignore unmapped addresses
                 endcase
@@ -540,7 +574,7 @@ module param_regfile #(
             if (s_axi_arvalid && s_axi_arready && !rvalid) begin
                 rvalid <= 1'b1;
                 case (s_axi_araddr[ADDR_W-1:0])
-                    10'h00: rdata <= {18'd0, ctrl_int32_out, ctrl_oc_single, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
+                    10'h00: rdata <= {14'd0, ctrl_gpool_en, ctrl_pool_avg, ctrl_dw_en, ctrl_pw_en, ctrl_int32_out, ctrl_oc_single, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
                     10'h04: rdata <= {28'd0, i_dma_wr_err, i_dma_rd_err, i_busy, done_irq_latched};
                     10'h08: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_ping};
                     10'h0C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_pong};
@@ -585,6 +619,9 @@ module param_regfile #(
                     10'h10C: rdata <= {16'd0, out_y_base};
                     10'h110: rdata <= {16'd0, total_ops_h};
                     10'h114: rdata <= {16'd0, total_ops_w};
+                    10'h118: rdata <= {24'd0, clip_max};
+                    10'h11C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, skip_base};
+                    10'h15C: rdata <= {gavg_shift, gavg_mul};
 
                     // DMA status (0x140, read-only)
                     10'h140: rdata <= {28'd0, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
@@ -644,8 +681,16 @@ module param_regfile #(
     assign o_row_block_en = ctrl_row_block;
     assign o_oc_single    = ctrl_oc_single;
     assign o_int32_out    = ctrl_int32_out;
+    assign o_pool_avg     = ctrl_pool_avg;
+    assign o_pw_en        = ctrl_pw_en;
+    assign o_dw_en        = ctrl_dw_en;
+    assign o_gpool_en     = ctrl_gpool_en;
+    assign o_gavg_mul     = {6'd0, gavg_mul};
+    assign o_gavg_shift   = gavg_shift;
     assign o_pad_w        = pad_cfg[7:0];
     assign o_pad_h        = pad_cfg[15:8];
+    assign o_clip_max     = clip_max;
+    assign o_skip_base    = skip_base;
     assign o_clear_done   = ctrl_clear_done;
 
     assign o_act_addr_ping = act_addr_ping;

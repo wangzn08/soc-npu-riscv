@@ -4,7 +4,7 @@ Handoff note for the SoC/NPU MNIST deployment. Read before changing code.
 
 ## Project Snapshot
 
-Workspace: `D:\cpu+npu\soc\soc`
+Workspace: `E:\code\6-10\soc`
 
 This is a small RTL CPU+NPU SoC for the Phytium enterprise problem 3 track:
 
@@ -37,9 +37,8 @@ Current architecture:
   by default and the FSM is byte-identical when off. Together they cut `npu_busy`
   by ~82% and put the whole MLP (FC1+FC2) on the NPU.
 
-Simulator flow is ModelSim/Questa, not VCS. Use `run_flow.ps1` for normal
-verification. `modelsim/run_modelsim.bat batch` logs all signals through
-`run.do` and is much slower; prefer `run_flow.ps1 -Mode batch` for regression.
+Simulator flow is ModelSim/Questa, not VCS. Use `run_all.sh` for normal
+verification.
 
 ## Competition Requirements And Assessment
 
@@ -110,40 +109,35 @@ The key principle is: CPU schedules, NPU covers Conv/Pool/FC, the data path stay
 wide enough to feed the array, and performance/power claims are backed by
 counters rather than architecture diagrams alone.
 
-## Environment
+## Environment & Build
 
-```text
-ModelSim:   D:\Soft\modeltech64_10.4\win64
-License:    D:\Soft\modeltech64_10.4\win64\LICENSE.TXT
-RISC-V GCC: D:\cpu+npu\soc\tools\riscv-none-elf-gcc\xpack-riscv-none-elf-gcc-15.2.0-1\bin
+All commands run from an MSYS/Git Bash shell on Windows (not PowerShell/cmd).
+
+```bash
+bash run_all.sh              # full flow: fw + RTL compile + simulation
+bash run_all.sh fw           # firmware only
+bash run_all.sh compile      # RTL compile only (vlib + vlog)
+bash run_all.sh sim          # full flow, headless
+bash run_all.sh waves        # full flow + GUI waveform
+bash run_all.sh clean        # remove sim artifacts
+bash run_all.sh distclean    # also remove firmware/build
 ```
 
-Use the root-level `run_flow.ps1`. Do not use `make`. Both `run_flow.ps1` and
-`modelsim/run_modelsim.bat` self-locate their root.
+The Makefile is deprecated; use `run_all.sh` instead.
 
-## Commands
+Tool paths (override via environment variables):
+- `RISCV_PREFIX` — RISC-V GCC toolchain (default: `E:/Riscv_Tools/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-`)
+- `MGC_LICENSE_FILE` — ModelSim license (default: `E:/modelsim/LICENSE.TXT`)
+- `PYTHON` — Python interpreter (default: `python`)
 
-```powershell
-# Compile RTL only
-cmd /c modelsim\run_modelsim.bat compile
+### How testing works
 
-# Smoke: builds firmware + RTL, runs 1 us to check boot/elaboration
-powershell -ExecutionPolicy Bypass -File .\run_flow.ps1 -Mode smoke -App deepnet_deploy.c
-
-# Full 10-image MNIST batch, normal regression path
-powershell -ExecutionPolicy Bypass -File .\run_flow.ps1 -Mode batch -App deepnet_deploy.c
-
-# GUI / VCD only when waveform inspection is needed
-powershell -ExecutionPolicy Bypass -File .\run_flow.ps1 -Mode gui -App deepnet_deploy.c
-```
-
-`run_flow.ps1` builds `firmware/build/firmware7.hex`, compiles RTL, then runs
-ModelSim. Batch log: `sim/modelsim/direct_batch.log`. Firmware build uses
-`-Werror -Wall -Wextra -Wshadow ...`; keep firmware warning-clean.
-
-PowerShell gotcha: avoid piping native exe stderr through `2>&1` in PS 5.1 when
-you need exit-code behavior. The linker emits a harmless RWX LOAD segment
-warning that can be wrapped as `NativeCommandError`.
+There is no unit-test framework. "The test" is one simulation run:
+- The testbench (`rtl/axi_sys_tb.v`) prints `ALL TESTS PASSED.` when firmware writes `123456789` to MMIO `0x2000_0000`, or `ERROR!`/`TIMEOUT` otherwise.
+- Firmware `print_*` output appears on the simulator console via UART MMIO.
+- The current firmware (`deepnet_deploy.c`) runs 10 MNIST images and prints per-image predictions and an overall accuracy count.
+- `vsim` must run from the repo root — firmware hex path is resolved by `$readmemh` relative to the simulation working directory.
+- After editing RTL, run `bash run_all.sh clean` before recompiling (or vlog the changed file manually).
 
 ## Current Result
 
@@ -151,7 +145,7 @@ Latest normal regression verified on 2026-06-15 (NPU compute-core port:
 row_par + oc_single + gemm_reduce + FC2-on-NPU INT32):
 
 ```text
-Command: powershell -ExecutionPolicy Bypass -File .\run_flow.ps1 -Mode batch -App deepnet_deploy.c
+Command: bash run_all.sh sim
 Result:  10/10 correct, DEPLOY SUCCESS
 TRAP:    941,155 clock cycles  (~4.7 ms for 10 images @ 200 MHz, ~0.47 ms/image)
 Sim:     Errors: 0, Warnings: 18
@@ -473,14 +467,14 @@ Priority order from the current architecture and RTL counters:
     step is keeping FC1->FC2 fully on-chip or replacing per-layer MMIO scheduling
     with descriptors.
 9. **Simulation ergonomics.** `modelsim/run_modelsim.bat batch` via `run.do`
-   logs all signals and can be extremely slow. Use `run_flow.ps1 -Mode batch`
-   for normal regression, or change `run.do` to avoid `log -r /*` in batch mode.
+   logs all signals and can be extremely slow. Use `bash run_all.sh sim` for
+   normal regression, or change `run.do` to avoid `log -r /*` in batch mode.
 
 ## Key Files
 
 ```text
 Build/sim:
-  run_flow.ps1
+  run_all.sh
   modelsim/{compile.do,run.do,wave.do,run_modelsim.bat}
 
 Firmware:
@@ -525,15 +519,31 @@ Important NPU register/control bits:
 CTRL[0] start        CTRL[9]  row_par      (16-row spatial parallelism, task E)
 CTRL[1] ping_pong    CTRL[10] gemm_reduce  (GEMM 16-row IC-reduction, decision M)
 CTRL[2] pool_en      CTRL[11] row_block    (row-block packing, narrow layers, #4)
-CTRL[4] clear_done   CTRL[12] oc_single    (all OC tiles in one start, decision O)
-CTRL[5] relu_en      CTRL[13] int32_out    (raw INT32 output, decision Q, FC2)
-CTRL[6] out_ping
-CTRL[7] gemm_en
-CTRL[8] hw_pad
+CTRL[3] eltwise_en   CTRL[12] oc_single    (all OC tiles in one start, decision O)
+CTRL[4] clear_done   CTRL[13] int32_out    (raw INT32 output, decision Q, FC2)
+CTRL[5] relu_en      CTRL[14] pw_en        (1x1 pointwise conv, im2col bypass)
+CTRL[6] out_ping     CTRL[15] dw_en        (depthwise conv, channel-parallel MAC)
+CTRL[7] gemm_en      CTRL[16] pool_avg     (2x2 average pooling, vs max)
+CTRL[8] hw_pad       CTRL[17] gpool_en     (global average pooling)
 
+Operator-generality block (2026-06-16, opt-in, default OFF = bit-identical; each
+has a directed/integration TB; stride>1 conv deferred):
+  pw_en[14]   1x1 pointwise: reuses conv sweep + weight reuse, reads each pixel
+              directly (GEMM-style array feed), bypassing im2col. IC<=16.
+  dw_en[15]   depthwise: rtl/depthwise_engine.v, 16 channel-parallel INT32 MACs
+              bypassing the array, fed by the im2col window; KO=9 per-tap weight
+              words prefetched from Wgt Port A (borrowed during LOAD_ROW).
+  pool_avg[16]/gpool_en[17] avg + global-avg pooling (rtl/global_avg.v + NPU_GAVG_CFG).
+  NPU_CLIP_MAX configurable post-process upper clamp (ReLU6). NPU_SKIP_BASE
+  configurable residual skip base (light INT8 residual). tests/tb_npu_integ.v is a
+  reusable npu_top integration harness (drive config + preload SRAM + golden check).
+
+NPU_CLIP_MAX       0x118  post-process upper clamp [7:0] (default 127; ReLU6 = q(6.0))
+NPU_SKIP_BASE      0x11C  residual skip-source Out-SRAM base (0 = same-addr legacy)
 NPU_PAD            0x150  {pad_h[15:8], pad_w[7:0]}
 NPU_DMA_COPY_TRIG  0x154  write: start sram_copy (Out->Act residency)
 NPU_DMA_EXPAND_TRIG 0x158 write: start img_expand (raw->tile-major Conv1 input)
+NPU_GAVG_CFG       0x15C  global avgpool reciprocal: [25:0]mul [31:26]shift (mean=(sum*mul)>>shift)
 NPU_BIAS/SCALE/SHIFT  ch0-15 @ 0x40/0x80/0xC0; ch16-63 @ 0x160/0x220/0x2E0
                       (64-OC resident regfile for oc_single, decision O)
 NPU_PERF_CLR       0x3A0  (relocated above the 0x160..0x39C resident-param block)
@@ -570,9 +580,18 @@ tests/tb_axi_upsizer.v:
 ## Working Rules
 
 - Keep changes small and focused; preserve the 10/10 baseline.
-- Verify with smoke first, then batch.
+- Verify with smoke first, then batch (`bash run_all.sh sim`).
 - For risky RTL timing changes in FSM, padding, GEMM, weight reuse, or pooling,
   add a directed testbench before spending time on full MNIST simulation.
-- Use `run_flow.ps1 -Mode batch` for normal full regression.
+- Use `bash run_all.sh sim` for normal full regression.
 - Do not revert the ModelSim flow to VCS; do not restore old VCS/Verdi artifacts.
-- This directory is not a git repo; there is no local commit history to consult.
+
+## Conventions
+
+- Comments in RTL and firmware are bilingual (Chinese/English); keep matching surrounding style.
+- Register-map changes require touching both sides: `rtl/param_regfile.v` and `firmware/firmware.h`.
+- New RTL files must be added to `axi_sys.f`.
+- Firmware C code must be warning-clean under strict CFLAGS.
+- Multiple test programs exist (`deepnet_run.c`, `deepnet_deploy.c`), each defining `usercode7()`. Only one may be linked at a time; switch by editing `FW_C_SRCS` in `run_all.sh`.
+- `makehex.py` pads firmware binary to 524288 words for `$readmemh`.
+- DeepConvNet model assets: `deepnet.h` (dimensions), `deepnet_weights.h` (weights/biases), `mnist_test_images.h` (test images, generated by `extract_images.py`).

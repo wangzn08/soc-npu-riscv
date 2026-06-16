@@ -124,6 +124,15 @@ module npu_top #(
     wire                            cfg_eltwise_en;
     wire                            cfg_clear_done;
     wire                            cfg_relu_en;
+    wire [7:0]                      cfg_clip_max;
+    wire                            cfg_pool_avg;
+    wire [SRAM_ADDR_W-1:0]          cfg_skip_base;
+    wire                            cfg_pw_en;
+    wire                            cfg_dw_en;
+    wire                            cfg_gpool_en;
+    wire [31:0]                     cfg_gavg_mul;
+    wire [5:0]                      cfg_gavg_shift;
+    wire                            fsm_last_spatial;
     wire                            cfg_out_ping_sel;   // NPU write bank for Out SRAM (CTRL[6])
     wire                            cfg_gemm_en;        // GEMM/FC mode (CTRL[7])
     wire                            cfg_hw_pad;         // hardware padding (CTRL[8])
@@ -287,8 +296,16 @@ module npu_top #(
         .o_row_block_en   (cfg_row_block_en),
         .o_oc_single      (cfg_oc_single),
         .o_int32_out      (cfg_int32_out),
+        .o_pool_avg       (cfg_pool_avg),
+        .o_pw_en          (cfg_pw_en),
+        .o_dw_en          (cfg_dw_en),
+        .o_gpool_en       (cfg_gpool_en),
+        .o_gavg_mul       (cfg_gavg_mul),
+        .o_gavg_shift     (cfg_gavg_shift),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
+        .o_clip_max       (cfg_clip_max),
+        .o_skip_base      (cfg_skip_base),
         .i_done_irq       (status_done_irq),
         .i_busy           (status_busy),
         .i_dma_rd_err     (dma_rd_err),
@@ -568,6 +585,7 @@ module npu_top #(
         .i_gemm_reduce        (cfg_gemm_reduce),
         .i_row_block_en       (cfg_row_block_en),
         .i_oc_single          (cfg_oc_single),
+        .i_pw_en              (cfg_pw_en),
         .o_oc_tile_sel        (fsm_oc_tile_sel),
         .o_rows_per_grp       (fsm_rows_per_grp),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
@@ -603,7 +621,8 @@ module npu_top #(
         .o_cur_ic_tile        (fsm_cur_ic_tile),
         .o_cur_oc_tile        (fsm_cur_oc_tile),
         .o_cur_ox             (fsm_cur_ox),
-        .o_cur_oy             (fsm_cur_oy)
+        .o_cur_oy             (fsm_cur_oy),
+        .o_last_spatial       (fsm_last_spatial)
     );
 
     // Connect FSM to Act SRAM Port A
@@ -657,9 +676,21 @@ module npu_top #(
         .o_plane_done      (wgt_reader_plane_done)
     );
 
-    // Connect wgt_reader to Wgt SRAM Port A
-    assign wgt_sram_ena   = wgt_reader_sram_en;
-    assign wgt_sram_addra = wgt_reader_sram_addr;
+    // ===================================================================
+    // Depthwise engine (CTRL[15] dw_en): channel-parallel MAC bypassing the
+    // array. Prefetches KO depthwise weight words from Wgt SRAM Port A during
+    // LOAD_ROW (wgt_reader idle then), then accumulates the im2col window taps.
+    // ===================================================================
+    wire [ARRAY_COLS-1:0][PSUM_WIDTH-1:0] dw_psum;
+    wire                     dw_vld;
+    wire [SRAM_ADDR_W-1:0]   dw_wgt_rd_addr;
+    wire                     dw_wgt_rd_en;
+    wire                     dw_wgt_active;
+    // (depthwise_engine instance is below, after im2col declares im2col_act_window)
+
+    // Connect wgt_reader to Wgt SRAM Port A; depthwise borrows it during prefetch.
+    assign wgt_sram_ena   = dw_wgt_active ? dw_wgt_rd_en   : wgt_reader_sram_en;
+    assign wgt_sram_addra = dw_wgt_active ? dw_wgt_rd_addr : wgt_reader_sram_addr;
 
     // ===================================================================
     // Im2Col Line Buffer
@@ -787,9 +818,9 @@ module npu_top #(
         // rows (same replication im2col does for conv) — every PE in a column
         // computes the identical dot product, so drain/POST capture is
         // phase-independent. Conv mode: im2col window as before.
-        .i_act       (cfg_gemm_reduce ? act_row_bus
-                    : cfg_gemm_en     ? {ARRAY_ROWS{act_sram_doa}}
-                    :                   im2col_act_window),
+        .i_act       (cfg_gemm_reduce       ? act_row_bus
+                    : (cfg_gemm_en|cfg_pw_en) ? {ARRAY_ROWS{act_sram_doa}}
+                    :                         im2col_act_window),
         .i_wgt       (wgt_reader_wgt),
         .i_wgt_plane (wgt_reader_plane),
         .i_reduce    (cfg_gemm_reduce),
@@ -880,6 +911,27 @@ module npu_top #(
     wire [NUM_CH*32-1:0] pp_feat32;      // decision Q: raw INT32 post-process output (16×INT32)
 
     // Valid signal for post-process from FSM (during DRAIN + pipeline flush)
+    // Depthwise engine instance (im2col_act_window now in scope). Prefetches KO
+    // weight words from Wgt Port A during LOAD_ROW, then channel-parallel MACs the
+    // im2col taps; o_psum is muxed into post_process when cfg_dw_en.
+    depthwise_engine #(
+        .NUM_CH(ARRAY_COLS), .PSUM_WIDTH(PSUM_WIDTH), .SRAM_ADDR_W(SRAM_ADDR_W)
+    ) u_depthwise (
+        .clk(clk), .rst_n(rst_n),
+        .i_start(cfg_start & cfg_dw_en),   // only borrow Wgt port / accumulate in depthwise mode
+        .i_wgt_base(cfg_ping_pong_sel ? cfg_wgt_addr_pong : cfg_wgt_addr_ping),
+        .o_wgt_rd_addr(dw_wgt_rd_addr),
+        .o_wgt_rd_en(dw_wgt_rd_en),
+        .o_wgt_active(dw_wgt_active),
+        .i_wgt_rd_data(wgt_sram_doa),
+        .i_calc_vld(fsm_array_vld),
+        .i_offset(fsm_im2col_offset_sel),
+        .i_act(im2col_act_window[127:0]),
+        .i_k_end(fsm_array_k_end),
+        .o_psum(dw_psum),
+        .o_vld(dw_vld)
+    );
+
     wire pp_input_vld;
     assign pp_input_vld = fsm_array_drain_en || fsm_pp_start;
 
@@ -890,14 +942,16 @@ module npu_top #(
         .clk           (clk),
         .rst_n         (rst_n),
         .i_start       (cfg_start),
-        .i_psum        (array_psum_col),
+        .i_psum        (cfg_dw_en ? dw_psum : array_psum_col),  // depthwise bypasses the array
         .i_psum_vld    (pp_input_vld),
         .i_bias        (cfg_bias_val),
         .i_scale_mul   (cfg_scale_mul),
         .i_scale_shift (cfg_scale_shift),
         .i_width       (conv_out_w),
         .i_pool_en     (cfg_pool_en),
+        .i_pool_avg    (cfg_pool_avg),
         .i_relu_en     (cfg_relu_en),
+        .i_clip_max    (cfg_clip_max),
         .i_in_drain    (fsm_in_drain),
         .i_in_post     (fsm_in_post),
         .i_row_par_en  (cfg_row_par_en),
@@ -1073,19 +1127,61 @@ module npu_top #(
     assign npu_done_irq     = cfg_int32_out ? i32_done_irq_r : fsm_done_irq;
     assign npu_busy_visible = fsm_busy | (cfg_int32_out & (i32_active | i32_done_pending));
 
+    // -------------------------------------------------------------------
+    // Global average pooling (CTRL[17] gpool_en). Accumulates the per-position
+    // post-process output across the OC tile's spatial sweep and emits one mean
+    // word at the last position. Used in plain (non-pool/non-row_par/non-int32)
+    // legacy multi-start mode: one NPU start per 16-OC tile. gpool_en off ⇒ block
+    // idle and the write mux below is unchanged ⇒ byte-identical.
+    // -------------------------------------------------------------------
+    wire [ACT_DATA_W-1:0] gavg_feat;
+    wire                  gavg_feat_vld;
+    wire gpool_feed_vld = cfg_gpool_en & fsm_out_wr_en;                    // one per output position
+    wire gpool_last     = cfg_gpool_en & fsm_out_wr_en & fsm_last_spatial; // last position of tile
+
+    global_avg #(.NUM_CH(ARRAY_COLS)) u_global_avg (
+        .clk(clk), .rst_n(rst_n),
+        .i_start(cfg_start),
+        .i_feat(alu_res),
+        .i_feat_vld(gpool_feed_vld),
+        .i_last(gpool_last),
+        .i_avg_mul(cfg_gavg_mul),
+        .i_avg_shift(cfg_gavg_shift),
+        .o_feat(gavg_feat),
+        .o_feat_vld(gavg_feat_vld)
+    );
+
+    // Latch the tile's first output address; the single mean word lands there.
+    reg [OUT_SRAM_ADDR_W-1:0] gpool_addr;
+    reg                       gpool_addr_set;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            gpool_addr     <= {OUT_SRAM_ADDR_W{1'b0}};
+            gpool_addr_set <= 1'b0;
+        end else if (cfg_start) begin
+            gpool_addr_set <= 1'b0;
+        end else if (cfg_gpool_en && fsm_out_wr_en && !gpool_addr_set) begin
+            gpool_addr     <= fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
+            gpool_addr_set <= 1'b1;
+        end
+    end
+
     // In pool mode the Out-SRAM write is self-timed by the pooler's output
     // valid (pool_vld = pp_feat_vld) with the contiguous pool_out_addr_cnt;
     // in non-pool mode it is FSM-driven exactly as before.
-    assign out_sram_ena   = cfg_int32_out  ? i32_wr_en
+    assign out_sram_ena   = cfg_gpool_en   ? gavg_feat_vld
+                          : cfg_int32_out  ? i32_wr_en
                           : cfg_pool_en    ? pp_feat_vld
                           : cfg_row_par_en ? rp_wr_en
                           :                  fsm_out_wr_en;
     assign out_sram_wea   = out_sram_ena;
-    assign out_sram_addra = cfg_int32_out  ? i32_wr_addr[OUT_SRAM_ADDR_W-1:0]
+    assign out_sram_addra = cfg_gpool_en   ? gpool_addr
+                          : cfg_int32_out  ? i32_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           : cfg_pool_en    ? pool_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           : cfg_row_par_en ? rp_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           :                  fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
-    assign out_sram_dia   = cfg_int32_out  ? i32_wr_data : alu_res;
+    assign out_sram_dia   = cfg_gpool_en   ? gavg_feat
+                          : cfg_int32_out  ? i32_wr_data : alu_res;
 
     // synthesis translate_off
     `ifdef DEBUG
@@ -1157,7 +1253,10 @@ module npu_top #(
     // Out SRAM Port B: mux between skip-read path and DMA read
     // Skip path: reads previous layer's output for eltwise addition
     wire skip_rd_en = cfg_eltwise_en & pp_feat_vld & ~cfg_dma_out_rd_sel;
-    wire [OUT_SRAM_ADDR_W-1:0] skip_rd_addr = fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
+    // Residual skip source: configurable base (NPU_SKIP_BASE) + the write-position
+    // offset. cfg_skip_base=0 ⇒ same-address legacy in-place accumulate.
+    wire [OUT_SRAM_ADDR_W-1:0] skip_rd_addr =
+             cfg_skip_base[OUT_SRAM_ADDR_W-1:0] + fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
 
     // Out SRAM Port B address/en mux
     wire [OUT_SRAM_ADDR_W-1:0] out_sram_addrb_mux;

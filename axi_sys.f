@@ -35,4 +35,6 @@ rtl/sram_models.v
 rtl/axi_dma.v
 rtl/sram_copy.v
 rtl/img_expand.v
+rtl/global_avg.v
+rtl/depthwise_engine.v
 rtl/transpose_engine.v
