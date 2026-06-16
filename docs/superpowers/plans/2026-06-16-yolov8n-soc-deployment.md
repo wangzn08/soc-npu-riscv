@@ -1,133 +1,125 @@
-# YOLOv8n INT8 → SoC NPU 部署计划（可行性验证优先 · 640×640 · SiLU LUT）
+# YOLOv8n INT8 → SoC NPU 部署计划（RTL 仿真报告 · 640×640 · 放大 SRAM 整网驻留 · SiLU LUT）
 
-> **新窗口执行说明**：这是一份**部署可行性计划**,不是逐行 TDD 脚本——后期阶段的具体
-> 代码依赖 Phase 0 的尺寸分析结果。请按阶段推进,每个阶段都有明确的**门控(gate)**和
-> **黄金参考对齐**验收。建议在新窗口里先读本文件 + `CLAUDE.md` + `yolov8n_int8/REPORT.md`。
+> **新窗口执行说明**：这是一份**部署可行性计划**(目标=RTL 仿真报告,不上 FPGA),不是逐行
+> TDD 脚本。按阶段推进,每阶段有**门控**和**C 黄金参考逐层对齐**验收。新窗口先读本文件 +
+> `CLAUDE.md` + `yolov8n_int8/REPORT.md`。
 
-**目标**：在现有 PicoRV32 + 16×16 NPU SoC 的 RTL 仿真上,跑通 YOLOv8n INT8 的一个**代表性
-子集**(640×640 输入),每层输出与已验证的纯 C 参考引擎逐层数值对齐,作为完整部署前的
-de-risk。
+**目标**：在现有 PicoRV32 + 16×16 NPU SoC 的 **RTL 仿真**上跑通 YOLOv8n INT8(640×640),
+每层输出与已验证的纯 C 参考引擎逐层数值对齐,产出仿真报告(功能 + 数值对齐 + 性能计数器)。
 
 **已锁定决策**：
-1. **可行性验证优先**——先扩展算子 + 解决大特征图数据通路,跑通代表性子集,不强求一上来
-   就整网端到端。
-2. **保持 640×640**——真实部署分辨率;因此**片上存储/空间分块是第一难题**,必须 Phase 0/2
-   优先解决。
-3. **SiLU 用 NPU post-process LUT**——256 项 int8→int8 查表,与现有 bias/scale/shift epilogue
-   同级,原模型不需重训/重量化。
+1. **交付 = RTL 仿真报告**(不做 FPGA 验证)。→ 因此**直接在 `sram_models.v` 把片上 SRAM 放大到
+   能整网驻留,砍掉空间分块**(空间分块是 FPGA 资源现实路线,本次不做)。
+2. **保持 640×640** 输入。
+3. **SiLU 用 NPU post-process LUT**(256 项 int8→int8),原模型不重训。
+4. **可行性优先**:先放大 SRAM + 补算子,把代表性子集跑通对齐,再向整网扩。
+
+> **诚实声明(必须写进报告)**:放大 SRAM 到数 MB + 维持 `COMB_B=1`(Port-B 组合读)是**仿真
+> 约定下的功能/数值验证简化**,**不代表 FPGA 资源/时序现实**(典型 FPGA BRAM 只 0.5–4MB,且大
+> SRAM 在 FPGA 上要 +1 拍寄存器输出)。本工作证明的是"YOLOv8n INT8 能在该 NPU 数据通路上数值
+> 正确地跑通",FPGA 落地需另做空间分块/资源优化。
 
 ---
 
 ## 0. 现状与差距(执行者必读)
 
-**已有的黄金参考(本仓库 `yolov8n_int8/`)**：
-- `yolov8n_infer.c`：纯 C 全 INT8 引擎,数据路径与 NPU 一致(int8×int8→int32 累加 + 输入
-  zero-point 校正 + 定点 epilogue),已与 onnxruntime 对齐(conv0 ~1 LSB),COCO val2017
-  INT8 mAP50-95=0.352。**这是每一层的 bit 级黄金输出来源**(用 `YOLO_DEBUG_DUMP` 钩子)。
-- `yolov8n_int8.onnx`(已正确量化,排除 decode 尾)、`weights/*.bin`(int8 权重)、
-  `yolov8n_layers.h`(`yolo_conv[64]` 维度 + `yolo_act_quant[64]` 激活 scale/zp + `yolo_glue_quant`)。
+**黄金参考(本仓库 `yolov8n_int8/`)**：
+- `yolov8n_infer.c`：纯 C 全 INT8 引擎,数据路径与 NPU 一致(int8×int8→int32 + 输入 zero-point
+  校正 + 定点 epilogue),已与 onnxruntime 对齐(conv0 ~1 LSB),INT8 mAP50-95=0.352。**逐层 bit 级
+  黄金输出来源**(`YOLO_DEBUG_DUMP` 钩子;按需给更多层加 dump)。
+- `yolov8n_int8.onnx`(已正确量化)、`weights/*.bin`(int8 权重)、`yolov8n_layers.h`
+  (`yolo_conv[64]` 维度 + `yolo_act_quant[64]` 激活 scale/zp + `yolo_glue_quant`)。
 
-**现有 NPU 能力(见 CLAUDE.md)**——大部分 YOLOv8n 需要的算子其实已经在 `npu-operator-generality`
-分支里:
-- 3×3 conv、`pw_en`(1×1 pointwise,YOLOv8n 大量用)、`dw_en`(depthwise,YOLOv8n 不用)、
-  maxpool(SPPF 用)、`NPU_SKIP_BASE`(残差 add,C2f 用)、`NPU_CLIP_MAX`(ReLU6 钳位)、
-  16×16 array、`oc_single`/`row_par`/`gemm_reduce`、AXI DMA、`img_expand`/`sram_copy`、perf 计数器。
-- 大通道(YOLOv8n 最多 256+ OC)：现有 `ic_groups`/`oc_single` 分块逻辑天然支持,只是迭代更多次,**不是新能力**。
+**现有 NPU 已支持(见 CLAUDE.md,多在 `npu-operator-generality` 分支)**：3×3 conv、`pw_en`
+(1×1,YOLOv8n 大量用)、maxpool、`NPU_SKIP_BASE`(残差 add)、`NPU_CLIP_MAX`(ReLU6)、16×16
+array、`oc_single`/`row_par`/`gemm_reduce`、AXI DMA、`img_expand`/`sram_copy`、perf 计数器。
+**大通道(256+ OC/IC)由现有 ic/oc 分块天然支持,不是新能力。**
 
-**YOLOv8n 相对当前 NPU 的真实差距(本计划要解决的)**：
-1. **大特征图空间分块**(最难)：640×640 → conv0 输出 320×320×16 ≈ 1.6 MB,远超 Act SRAM
-   256 KB。当前 NPU 只在 MNIST(28×28)验证过,整图驻留片上。**必须引入空间 tiling + DDR
-   streaming + 3×3 卷积 tile 边界 halo/padding**。
-2. **SiLU**：post_process 无此算子 → 加 256 项 LUT。
-3. **最近邻 2× 上采样**(neck FPN/PAN)：无此引擎 → 仿 `img_expand`/`sram_copy` 写一个。
-4. **Concat dataflow**(C2f/SPPF/neck)：需把多源 int8 块 requant 到统一 scale 后聚到连续
-   Act 区域;可基于 `sram_copy` 扩展。
-5. **检测头 decode(DFL softmax/box 解码/sigmoid/NMS)保持 CPU 浮点**,与 C 参考一致,不上 NPU。
+**本计划要补的差距**(空间分块已砍,所以只剩算子 + 容量):
+1. **片上 SRAM 容量**:放大 `sram_models.v` 的 Act/Wgt/Out 到整网驻留(Phase 1)。这是"用仿真
+   自由度换掉最难的工程问题"。
+2. **SiLU**:post_process 加 256 项 LUT。
+3. **最近邻 2× 上采样**(neck):新引擎。
+4. **Concat dataflow**(C2f/SPPF/neck):多源 int8 requant 到统一 scale 聚连续区。
+5. **检测头 decode(DFL/box/sigmoid/NMS)保持 CPU 浮点**,照搬 C 参考,不上 NPU。
 
----
-
-## 验证方法论(贯穿所有阶段)
-
-**C 引擎逐层 int8 输出 = 黄金**。每个 NPU 层/算子上线后,dump 其 Out-SRAM int8 结果,与 C 引擎
-对应层输出**逐元素比对,要求 bit-exact 或 ≤±1 LSB**(定点 shift 舍入)。复用 `yolov8n_infer.c`
-的 `YOLO_DEBUG_DUMP`,必要时给 C 引擎加更多层的 dump 钩子。**不允许只看"能跑/有框",必须逐层对数。**
+**瓶颈预期(供报告性能叙事)**:放大 SRAM + 整网片上驻留后,DDR 只搬"输入图 + 权重 + 最终
+logits",**带宽不再是瓶颈**;阵列对 YOLOv8n(4.35 GMAC,峰值 0.82 TMAC/s,理想 ~5.3ms/图)
+**过配**。剩余 cyc 主导预计是**一次性权重预载 + CPU 逐层 MMIO 调度**(与 MNIST 同构:`npu_busy`
+占比低、`array_util` 低)。→ 后续优化杠杆是 descriptor 驱动 DMA,不是加算力。
 
 ---
 
-## Phase 0：可行性与尺寸分析(纯分析,不动 RTL)——门控
+## 验证方法论(贯穿全程)
 
-**目的**：用数字确认 640×640 的存储/计算需求,定下空间分块方案,再投入 RTL。
-
-- [ ] **0.1 逐层尺寸表**：对子集涉及的每层(见 Phase 3 选层),列 IC/OC/H/W/KH/KW/stride/pad、
-  激活字节数(H×W×ceil(C/16)×16)、权重字节数、im2col 中间字节数;对比 Act/Wgt/Out SRAM 容量
-  (256KB/?/128KB,以 `rtl/sram_models.v` 实际为准)。脚本可直接读 `yolov8n_layers.h`。
-- [ ] **0.2 标记超容层**:哪些层单层激活就放不下 SRAM → 必须空间分块。预计 conv0..浅层全部超容。
-- [ ] **0.3 定空间分块方案**:行条带(row-strip)还是 tile;条带高度/重叠 halo 行数(3×3 conv 需
-  上下各 1 行 halo,stride/pad 相关);DDR↔Act SRAM 的 streaming 顺序。给出每方案的 SRAM 占用 +
-  DDR 往返估算 + 仿真 cycle 量级估算。
-- [ ] **0.4 仿真时间评估**:640×640 在 cycle-accurate ModelSim 上单层就可能极慢。估算子集总
-  cycle,决定是否需要先用更小的代表性输入(如 160×160 的真图)做功能对齐、再单独验证一层 640 分块。
-
-**门控**:产出 `docs/notes/yolov8n-deploy-sizing.md`(尺寸表 + 分块决策 + 仿真预算)。确认可行、
-方案选定后才进入 Phase 1。**若 0.3 表明 640 分块在仿真上不可承受**,回到用户讨论是否退守
-320×320 跑通流程、只在一层上验证 640 分块。
+**C 引擎逐层 int8 输出 = 黄金**。每个 NPU 层/算子上线后 dump 其 Out-SRAM int8 结果,与 C 引擎
+对应层**逐元素比对,bit-exact 或 ≤±1 LSB**。**不允许只看"有框",必须逐层对数。**
 
 ---
 
-## Phase 1：NPU 算子扩展(RTL,每个独立 TB + C 黄金对齐)
+## Phase 0：尺寸与仿真预算分析(纯分析,门控)
 
-每个算子默认 OFF(CTRL bit 关时 FSM 字节级不变,沿用 CLAUDE.md 的 opt-in 惯例),独立 directed TB。
+**目的**:算清 SRAM 要放多大、整网 cyc 量级,确认仿真可承受。
 
-- [ ] **1.1 SiLU LUT**(`rtl/post_process_top.v` / `vector_alu.v`)：256 项 int8→int8 查表,新增
-  CTRL bit(如 `silu_en`)+ 寄存器装表。表内容 = 对每个 int8 输入 q,算 dequant→SiLU→requant→int8
-  (离线用 C 同公式生成 LUT 初值)。TB:对全 256 个输入值,RTL 输出 == C 的 SiLU epilogue。
-  寄存器/CTRL 改动同步 `rtl/param_regfile.v` + `firmware/firmware.h` + `axi_sys.f`。
-- [ ] **1.2 最近邻 2× 上采样引擎**(`rtl/upsample2x.v`,新文件)：仿 `img_expand`/`sram_copy`,
-  Act/Out SRAM Port B → Act SRAM,每像素复制成 2×2,scale/zp 不变。`NPU_DMA_*_TRIG` 风格触发 +
-  `NPU_DMA_STATUS` 完成位。TB:小图上采样结果 == C `upsample2x`。新文件加 `axi_sys.f`。
-- [ ] **1.3 Concat 聚合**(扩展 `rtl/sram_copy.v` 或新增):把 N 个源块按目标 conv 的 in_scale
-  做 requant(dequant→requant)再聚到连续 Act 区域。TB:两源 concat 结果 == C `concat2_to_conv`/
-  C2f 内 concat。**注意 C 参考里 concat 目标 scale = 下游 conv 的 in_scale**(不查 glue 表)。
-- [ ] **1.4 残差 Add 复核**:C2f 残差用现有 `NPU_SKIP_BASE`。确认它能做"两路 int8 各 dequant→相加
-  →requant 到 Add 自己 calibrated scale"(C 参考用 `yolo_glue_quant[add_idx]`)。若现有 skip 只支持
-  同 scale 相加,需扩展。TB 对齐 C 的 backbone C2f Add。
+- [ ] **0.1 逐层尺寸表**:脚本读 `yolov8n_layers.h`,对全 64 层列 IC/OC/H/W/KH/KW/stride/pad、
+  激活字节(H×W×ceil(C/16)×16)、权重字节、im2col 字节。
+- [ ] **0.2 峰值工作集**:求"前一层激活(ping)+ 当前层激活(pong)+ Out + im2col + 当前层权重"的
+  峰值 → 定 **Act/Out/Wgt SRAM 各放多大**(预计 Act 需 ~3–4MB,Out ~2MB,Wgt 看是否全网驻留 3.2MB
+  还是按层换入)。
+- [ ] **0.3 仿真 cyc 预算**:理想计算 4.35GMAC/4096 ≈ 1.06M cyc;按 MNIST 利用率经验放大估总 cyc
+  (可能 5–30M)。评估 ModelSim 跑得动否;若太慢,先用**子集**(Phase 3)而非整网做主要验证。
+
+**门控**:产出 `docs/notes/yolov8n-deploy-sizing.md`(尺寸表 + SRAM 目标大小 + cyc 预算)。
 
 ---
 
-## Phase 2：大特征图空间分块数据通路(核心新能力)——门控
+## Phase 1：放大片上 SRAM(仿真),保住 MNIST 基线
 
-- [ ] **2.1 单卷积 spike**:先只做"一个 3×3 conv(stride1,pad1)对 640×640 输入按行条带分块",
-  从 DDR 流式读条带(含 halo 行)→ Act SRAM → im2col → array → Out SRAM → 写回 DDR。**先在一层上
-  把分块/halo/边界 padding 跑对**,与 C 该层输出逐元素对齐。
-- [ ] **2.2 扩展 FSM/DMA**(`rtl/top_controller_fsm.v`,`rtl/axi_dma.v`):把分块循环固化进调度,
-  支持任意 H/W 的条带遍历 + 跨条带 halo 复用 + tile 边界 padding(复用 `hw_pad`)。
-- [ ] **2.3 stride-2 conv 分块**(conv0 等下采样层)的边界对齐。
+- [ ] **1.1 放大 `rtl/sram_models.v`** 的 Act/Wgt/Out 深度到 Phase 0.2 的目标(整网驻留)。
+- [ ] **1.2 保持 `COMB_B=1`**(组合读)——仿真约定,**报告里标注为非 FPGA 现实**(见顶部声明)。
+- [ ] **1.3 回归保护**:`bash run_all.sh sim` 确认 **MNIST 仍 10/10**(地址/位宽/驻留逻辑没被放大
+  破坏)。SRAM 基址常量同步检查 `firmware.h` / `param_regfile.v`。
 
-**门控**:单卷积 640 分块与 C bit 对齐通过,才扩展到多层。这是整份计划风险最高的一步,**务必先
-spike 再泛化**(见 CLAUDE.md "为有风险的 RTL 时序改动先写 directed TB")。
+**门控**:SRAM 放大后 MNIST 基线不回归。
 
 ---
 
-## Phase 3：代表性子集 bring-up on RTL 仿真
+## Phase 2：NPU 算子扩展(RTL,每个独立 TB + C 黄金对齐)
 
-- [ ] **3.1 选子集**(建议):stem `conv0,conv1` + 一个 C2f(`model.2`=conv2..5,含 1×1+3×3+残差+
-  concat)+ SPPF 的一段 maxpool + **一个检测尺度**(如 P5)的 head 特征卷积(cv2/cv3 各几层)+
-  DFL conv63。覆盖:3×3、1×1(pw)、SiLU、残差、concat、maxpool、空间分块、检测头卷积。
-- [ ] **3.2 固件调度**(新 `firmware/yolov8n_deploy.c`,参考 `deepnet_deploy.c` 的逐层 NPU/DMA
-  寄存器编程 + IRQ 协作):CPU 按层 program NPU,层间用 `sram_copy`/DDR streaming。检测头之后 CPU
-  跑 DFL softmax + box 解码 + sigmoid + NMS(浮点,照搬 C 参考逻辑)。
-- [ ] **3.3 逐层对齐**:每层 Out-SRAM 结果与 C 引擎对应层逐元素比对,≤±1 LSB。
-- [ ] **3.4 端到端子集结果**:子集前向 + CPU decode 在 RTL 仿真跑通,检测框与 C 引擎在同一张真图上
-  基本一致(类别/位置合理,不强求 NMS 逐框相同)。
+每个默认 OFF(CTRL bit 关时 FSM 字节级不变,沿用 opt-in 惯例)。寄存器/CTRL 改动同步
+`param_regfile.v` + `firmware.h` + `axi_sys.f`;新 RTL 文件进 `axi_sys.f`;TB 进 `tests/`。
 
-**门控**:子集逐层对齐 + 跑通,产出阶段报告(cycle 数、SRAM 占用、对齐结果、瓶颈)。
+- [ ] **2.1 SiLU LUT**(`post_process_top.v`/`vector_alu.v`):256 项 int8→int8 表 + `silu_en` CTRL +
+  装表寄存器。LUT 初值离线用 C 同公式(dequant→SiLU→requant)生成。TB:全 256 输入 == C SiLU epilogue。
+- [ ] **2.2 最近邻 2× 上采样**(`rtl/upsample2x.v`,新):仿 `img_expand`/`sram_copy`,每像素复制
+  2×2,scale/zp 不变,`NPU_DMA_*_TRIG` 触发 + `NPU_DMA_STATUS` 完成位。TB == C `upsample2x`。
+- [ ] **2.3 Concat 聚合**(扩展 `sram_copy.v` 或新):N 源按**下游 conv 的 in_scale**(C 参考就是这么
+  做,不查 glue 表)做 requant 后聚到连续 Act 区。TB == C `concat2_to_conv` / C2f 内 concat。
+- [ ] **2.4 残差 Add 复核**:C2f 残差。确认 `NPU_SKIP_BASE` 能"两路各 dequant→相加→requant 到 Add
+  自己 calibrated scale"(C 用 `yolo_glue_quant[add_idx]`);不够则扩展。TB == C backbone C2f Add。
 
 ---
 
-## Phase 4(stretch):扩展覆盖
+## Phase 3：代表性子集 bring-up(整网驻留,无分块)
 
-跑通子集后,逐步加:neck/FPN(用 1.2 上采样 + 1.3 concat)、其余两个检测尺度、完整 backbone,
-直到整网端到端。每加一块仍按"逐层对齐 C 黄金"推进。
+- [ ] **3.1 选子集**:stem `conv0,conv1` + 一个 C2f(`model.2`=conv2..5,覆盖 1×1+3×3+残差+concat+
+  SiLU)+ SPPF 一段 maxpool + **一个检测尺度**(如 P5)head 卷积 + DFL conv63。覆盖全部新算子。
+- [ ] **3.2 固件调度**(新 `firmware/yolov8n_deploy.c`,参考 `deepnet_deploy.c`):CPU 逐层 program
+  NPU/DMA,层间 `sram_copy` 片上驻留(SRAM 已够大,无 DDR 往返)。检测头后 CPU 跑 DFL softmax +
+  box 解码 + sigmoid + NMS(浮点,照搬 C 逻辑)。
+- [ ] **3.3 逐层对齐**:每层 Out-SRAM == C 引擎对应层,≤±1 LSB。
+- [ ] **3.4 子集端到端**:RTL 仿真前向 + CPU decode 跑通,检测框与 C 引擎在同一真图上类别/位置
+  一致;读 perf 计数器(cyc_total / npu_busy / array_util / rd_beats / wr_beats)。
+
+**门控**:子集逐层对齐 + 跑通,产出阶段报告。
+
+---
+
+## Phase 4：扩到整网端到端(本路径下可达)
+
+没有空间分块阻碍后,逐步加 backbone 其余层、SPPF 全段、neck/FPN(用 2.2 上采样 + 2.3 concat)、
+三个检测尺度,直到整网 640×640 在 RTL 仿真端到端跑通,**整网逐层对齐 C 黄金**,出最终仿真报告:
+功能正确 + 数值对齐 + 性能计数器 + 顶部那段 FPGA 现实性声明。
 
 ---
 
@@ -135,26 +127,26 @@ spike 再泛化**(见 CLAUDE.md "为有风险的 RTL 时序改动先写 directed
 
 | 风险 | 缓解 |
 |------|------|
-| **640 片上存储不够**(最大) | Phase 0 先定空间分块;Phase 2 先单卷积 spike |
-| **640 cycle-accurate 仿真极慢** | Phase 0.4 评估;必要时小分辨率验功能 + 单层验 640 分块;`run.do` 避免 `log -r /*` |
-| tile 边界 halo/padding 错 | Phase 2.1 单卷积 spike 逐元素对齐后再泛化 |
-| SiLU LUT 精度 | LUT 离线用 C 同公式生成,TB 全 256 值对齐 |
-| FPGA BRAM 映射(COMB_B) | 沿用 CLAUDE.md 警告:Port-B 组合读是 sim 约定,上 FPGA 需整条读路径同步加一拍 |
-| 权重/激活 SRAM 容量(256+ 通道) | 现有 ic/oc 分块支持;Wgt SRAM 容量在 Phase 0 核对 |
+| 640 cycle-accurate 仿真慢 | Phase 0.3 估 cyc;主要验证用子集;`run.do` 避免 `log -r /*` |
+| 放大 SRAM 破坏 MNIST 基线(地址/位宽) | Phase 1.3 强制 MNIST 10/10 回归门控 |
+| SiLU LUT 精度 | LUT 离线 C 同公式生成,TB 全 256 值对齐 |
+| Concat/残差 scale 处理错 | 严格按 C 参考:concat 用下游 conv in_scale;Add 用 `yolo_glue_quant` |
+| 报告把仿真简化当 FPGA 结论 | 顶部"诚实声明"必须进报告:SRAM/COMB_B 是仿真约定,非 FPGA 现实 |
 
 ## 关键文件
 
 ```
 黄金参考: yolov8n_int8/yolov8n_infer.c (+ YOLO_DEBUG_DUMP), yolov8n_layers.h, weights/*.bin
-RTL 改动: rtl/post_process_top.v (SiLU LUT), rtl/upsample2x.v (新), rtl/sram_copy.v (concat扩展),
-          rtl/top_controller_fsm.v + rtl/axi_dma.v (空间分块), rtl/param_regfile.v (寄存器)
+RTL:      rtl/sram_models.v (放大), rtl/post_process_top.v (SiLU LUT), rtl/upsample2x.v (新),
+          rtl/sram_copy.v (concat扩展), rtl/param_regfile.v (寄存器)
 固件:     firmware/yolov8n_deploy.c (新, 参考 deepnet_deploy.c), firmware/firmware.h
-构建:     axi_sys.f (新 RTL 文件), run_all.sh (FW_C_SRCS 切换), 每个算子的 directed TB 进 tests/
-约定:     寄存器改动两边同步(param_regfile.v + firmware.h); 算子默认 OFF 保持 FSM 字节级不变
+构建:     axi_sys.f (新文件), run_all.sh (FW_C_SRCS 切换), tests/ (每算子 directed TB)
+约定:     寄存器两边同步; 算子默认 OFF 保持 FSM 字节级不变; 改 RTL 后先 run_all.sh clean
 ```
 
-## 与现有 SoC 工作的关系
+## 与现有工作的关系
 
-- 这是 `yolov8n_int8/` INT8 验证(已完成,mAP 0.352)的**下游硬件部署**,不影响现有 MNIST 10/10 基线。
-- 建议在**新分支**上做(如 `yolov8n-npu-deploy`),从 master,保持 MNIST 回归绿。
-- 复用现有 `npu-operator-generality` 分支的 pw/dw/pool/residual/ReLU6 成果(若尚未并入 master,先评估合并)。
+- 这是 `yolov8n_int8/` INT8 验证(已完成,mAP 0.352)的**下游硬件仿真部署**。
+- **新分支**(如 `yolov8n-npu-deploy`)从 master 做,保持 MNIST 10/10 绿。
+- 复用 `npu-operator-generality` 的 pw/pool/residual/ReLU6 成果(若未并入 master,先评估合并)。
+- **空间分块 / FPGA 资源优化是本次明确的非目标**,留作后续真正上板的工作。
