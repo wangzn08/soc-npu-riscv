@@ -43,14 +43,17 @@ def ensure_extracted():
     return imgs
 
 
-def run_model(model_path, imgs, device, tag):
+def run_model(model_path, src_dir, device, tag):
     print(f"\n[{tag}] predicting with {model_path} on {device} ...")
     model = YOLO(model_path, task="detect")
     dets = []
-    results = model.predict(imgs, imgsz=640, conf=0.001, iou=0.7, max_det=300,
+    # Stream from the directory so ultralytics yields ONE image at a time
+    # (passing a list batches them -> CUDA OOM for fp32, and a batch>1 fails the
+    # fixed-batch-1 int8 onnx). r.path is the real file path for directory source.
+    results = model.predict(src_dir, imgsz=640, conf=0.001, iou=0.7, max_det=300,
                             device=device, stream=True, verbose=False)
-    for img_path, r in zip(imgs, results):
-        image_id = int(os.path.splitext(os.path.basename(img_path))[0])
+    for r in results:
+        image_id = int(os.path.splitext(os.path.basename(r.path))[0])
         b = r.boxes
         if b is None or len(b) == 0:
             continue
@@ -82,8 +85,8 @@ def main():
     imgs = ensure_extracted()
     coco_gt = COCO(ANN)
     # restrict to images that have annotations entries (standard: all val2017)
-    fp32 = run_model("yolov8n.pt", imgs, 0, "FP32")
-    int8 = run_model("yolov8n_int8.onnx", imgs, "cpu", "INT8")
+    fp32 = run_model("yolov8n.pt", VAL_DIR, 0, "FP32")
+    int8 = run_model("yolov8n_int8.onnx", VAL_DIR, "cpu", "INT8")
 
     json.dump(fp32, open(os.path.join(OUT_DIR, "dets_fp32.json"), "w"))
     json.dump(int8, open(os.path.join(OUT_DIR, "dets_int8.json"), "w"))
