@@ -608,17 +608,26 @@ int yolo_infer(const uint8_t *image_rgb, YoloDet *dets, int max_dets,
     Tensor *bbox_scales[3] = {&d0_bbox, &d1_bbox, &d2_bbox};
     Tensor *cls_scales[3] = {&d0_cls, &d1_cls, &d2_cls};
     int areas[3] = {a0, a1, a2};
-    int boff = 0, coff = 0;
+    /* Assemble into GLOBAL channel-major [C, num_anchors] (matching the ONNX
+     * output layout [84, 8400]): each channel spans all 8400 anchors, and the
+     * 3 scales' anchors are concatenated (P3 6400, P4 1600, P5 400). The source
+     * conv tensors are channel-major per scale: data[c*A + hw]. */
+    int anchor_off = 0;
     for (int s = 0; s < 3; s++) {
+        int A = areas[s];
         Tensor *bt = bbox_scales[s];
-        for (long long i = 0; i < 64LL * areas[s]; i++)
-            bbox_raw[boff + i] = (bt->data[i] - bt->zero_point) * bt->scale;
-        boff += 64 * areas[s];
+        for (int c = 0; c < 64; c++)
+            for (int hw = 0; hw < A; hw++)
+                bbox_raw[(long long)c * num_anchors + (anchor_off + hw)] =
+                    (bt->data[(long long)c * A + hw] - bt->zero_point) * bt->scale;
 
         Tensor *ct = cls_scales[s];
-        for (long long i = 0; i < 80LL * areas[s]; i++)
-            cls_raw[coff + i] = (ct->data[i] - ct->zero_point) * ct->scale;
-        coff += 80 * areas[s];
+        for (int c = 0; c < 80; c++)
+            for (int hw = 0; hw < A; hw++)
+                cls_raw[(long long)c * num_anchors + (anchor_off + hw)] =
+                    (ct->data[(long long)c * A + hw] - ct->zero_point) * ct->scale;
+
+        anchor_off += A;
     }
 
     /* === DFL: bbox [64, 8400] -> [4, 8400] ===

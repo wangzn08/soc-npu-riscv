@@ -47,12 +47,22 @@ def main():
         lines.append('    {"%s", %.10ff, %d},' % (safe_name, g["out_scale"], g["out_zp"]))
     lines.append("};\n")
 
-    insertion_point = original.rindex("#endif")
-    new_content = original[:insertion_point] + "\n".join(lines) + "\n" + original[insertion_point:]
+    # Idempotent: strip any previously-generated block so re-running does not
+    # stack duplicate definitions. The generated block always starts with the
+    # YoloActQuant typedef; that exact text never appears in the hand-authored
+    # part of the header.
+    marker = "\ntypedef struct {\n    float in_scale, out_scale;"
+    cut = original.find(marker)
+    if cut != -1:
+        base = original[:cut].rstrip()
+    else:
+        base = original[:original.rindex("#endif")].rstrip()
+
+    new_content = base + "\n\n" + "\n".join(lines) + "\n\n#endif\n"
 
     with open(LAYERS_H_PATH, "w") as f:
         f.write(new_content)
-    print(f"Appended YoloActQuant[64] and YoloGlueQuant[{len(glue)}] to {LAYERS_H_PATH}")
+    print(f"Wrote YoloActQuant[64] and YoloGlueQuant[{len(glue)}] to {LAYERS_H_PATH} (idempotent)")
 
 
 if __name__ == "__main__":
