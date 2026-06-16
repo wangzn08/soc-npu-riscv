@@ -69,19 +69,25 @@ def main():
             f"conv{idx} input is not fed by DequantizeLinear: {conv.input[0]}")
         in_scale, in_zp = get_quant_param(dq_in, init_map)
 
+        # In this QDQ graph a conv output is ALWAYS first consumed by a
+        # QuantizeLinear (Q1). SiLU, if present, sits AFTER the matching
+        # DequantizeLinear: Conv -> Q1 -> DQ1 -> {Sigmoid, Mul} -> Q2.
         out_name = conv.output[0]
-        consumers = nodes_by_input.get(out_name, [])
-        has_silu = any(c.op_type == "Sigmoid" for c in consumers)
+        q1 = next((c for c in nodes_by_input.get(out_name, [])
+                   if c.op_type == "QuantizeLinear"), None)
+        assert q1 is not None, f"conv{idx} output not consumed by QuantizeLinear"
+        dq1 = next((c for c in nodes_by_input.get(q1.output[0], [])
+                    if c.op_type == "DequantizeLinear"), None)
+        post = nodes_by_input.get(dq1.output[0], []) if dq1 is not None else []
+        has_silu = any(c.op_type == "Sigmoid" for c in post)
 
         if has_silu:
-            sigmoid_node = next(c for c in consumers if c.op_type == "Sigmoid")
-            mul_node = nodes_by_input[sigmoid_node.output[0]][0]
-            assert mul_node.op_type == "Mul"
-            q_out = nodes_by_input[mul_node.output[0]][0]
+            # post-SiLU output quantizer = QuantizeLinear consuming the Mul output
+            mul_node = next(c for c in post if c.op_type == "Mul")
+            q_out = next(c for c in nodes_by_input[mul_node.output[0]]
+                         if c.op_type == "QuantizeLinear")
         else:
-            q_out = consumers[0]
-        assert q_out.op_type == "QuantizeLinear", (
-            f"conv{idx} output consumer is not QuantizeLinear: {q_out.op_type}")
+            q_out = q1
         out_scale, out_zp = get_quant_param(q_out, init_map)
 
         meta.append({
@@ -92,6 +98,13 @@ def main():
             "has_silu": has_silu,
         })
         print(f"  conv{idx}: in=({in_scale:.6f},{in_zp}) out=({out_scale:.6f},{out_zp}) silu={has_silu}")
+
+    for a, b in [(0, 1), (1, 2)]:
+        if abs(meta[a]["out_scale"] - meta[b]["in_scale"]) > 1e-9 or meta[a]["out_zp"] != meta[b]["in_zp"]:
+            print(f"  WARNING adjacency: conv{a}.out=({meta[a]['out_scale']:.6f},{meta[a]['out_zp']}) "
+                  f"!= conv{b}.in=({meta[b]['in_scale']:.6f},{meta[b]['in_zp']})")
+        else:
+            print(f"  OK adjacency conv{a}.out == conv{b}.in")
 
     with open(os.path.join(OUT_DIR, "act_quant_meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
