@@ -1,0 +1,99 @@
+Found 64 Conv nodes in ONNX graph
+  conv0: in=(0.003922,-128) out=(0.222938,-127) silu=True
+  conv1: in=(0.222938,-127) out=(0.525441,-127) silu=True
+  conv2: in=(0.525441,-127) out=(0.111946,-126) silu=True
+  conv3: in=(0.111946,-126) out=(0.099742,-125) silu=True
+  conv4: in=(0.099742,-125) out=(0.111740,-126) silu=True
+  conv5: in=(0.125745,-124) out=(0.062345,-124) silu=True
+  conv6: in=(0.062345,-124) out=(0.029479,-119) silu=True
+  conv7: in=(0.029479,-119) out=(0.028845,-118) silu=True
+  conv8: in=(0.028845,-118) out=(0.017803,-112) silu=True
+  conv9: in=(0.017803,-112) out=(0.020304,-114) silu=True
+  conv10: in=(0.027245,-108) out=(0.014850,-109) silu=True
+  conv11: in=(0.014850,-109) out=(0.039461,-121) silu=True
+  conv12: in=(0.044528,-109) out=(0.026360,-117) silu=True
+  conv13: in=(0.026360,-117) out=(0.021407,-115) silu=True
+  conv14: in=(0.021407,-115) out=(0.026892,-118) silu=True
+  conv15: in=(0.026892,-118) out=(0.024189,-116) silu=True
+  conv16: in=(0.024189,-116) out=(0.033239,-120) silu=True
+  conv17: in=(0.033278,-111) out=(0.020642,-115) silu=True
+  conv18: in=(0.020642,-115) out=(0.033037,-120) silu=True
+  conv19: in=(0.037603,-106) out=(0.026626,-118) silu=True
+  conv20: in=(0.026626,-118) out=(0.023875,-116) silu=True
+  conv21: in=(0.023875,-116) out=(0.037192,-121) silu=True
+  conv22: in=(0.037192,-121) out=(0.023014,-116) silu=True
+  conv23: in=(0.023014,-116) out=(0.032075,-119) silu=True
+  conv24: in=(0.038284,-113) out=(0.025124,-117) silu=True
+  conv25: in=(0.025124,-117) out=(0.027375,-118) silu=True
+  conv26: in=(0.027375,-118) out=(0.017261,-112) silu=True
+  conv27: in=(0.026626,-118) out=(0.023049,-116) silu=True
+  conv28: in=(0.023049,-116) out=(0.015771,-110) silu=True
+  conv29: in=(0.015771,-110) out=(0.026943,-118) silu=True
+  conv30: in=(0.026943,-118) out=(0.027275,-118) silu=True
+  conv31: in=(0.027275,-118) out=(0.013457,-107) silu=True
+  conv32: in=(0.013457,-107) out=(0.014295,-109) silu=True
+  conv33: in=(0.014295,-109) out=(0.020035,-114) silu=True
+  conv34: in=(0.020035,-114) out=(0.017540,-112) silu=True
+  conv35: in=(0.017540,-112) out=(0.025006,-117) silu=True
+  conv36: in=(0.017540,-112) out=(0.023288,-116) silu=True
+  conv37: in=(0.017540,-112) out=(0.021626,-115) silu=True
+  conv38: in=(0.023288,-116) out=(0.156210,-126) silu=True
+  conv39: in=(0.021626,-115) out=(0.167339,-126) silu=True
+  conv40: in=(0.027275,-118) out=(0.025068,-117) silu=True
+  conv41: in=(0.156210,-126) out=(0.095465,-56) silu=False
+  conv42: in=(0.167339,-126) out=(0.088187,127) silu=False
+  conv43: in=(0.025068,-117) out=(0.013361,-107) silu=True
+  conv44: in=(0.013361,-107) out=(0.027237,-118) silu=True
+  conv45: in=(0.027237,-118) out=(0.022130,-115) silu=True
+  conv46: in=(0.022130,-115) out=(0.025811,-117) silu=True
+  conv47: in=(0.022130,-115) out=(0.033172,-120) silu=True
+  conv48: in=(0.022130,-115) out=(0.030552,-119) silu=True
+  conv49: in=(0.033172,-120) out=(0.110054,-125) silu=True
+  conv50: in=(0.030552,-119) out=(0.161544,-126) silu=True
+  conv51: in=(0.025811,-117) out=(0.024604,-117) silu=True
+  conv52: in=(0.110054,-125) out=(0.075955,-71) silu=False
+  conv53: in=(0.161544,-126) out=(0.105776,119) silu=False
+  conv54: in=(0.024604,-117) out=(0.024117,-116) silu=True
+  conv55: in=(0.024117,-116) out=(0.032910,-120) silu=True
+  conv56: in=(0.032910,-120) out=(0.028116,-118) silu=True
+  conv57: in=(0.028116,-118) out=(0.048510,-122) silu=True
+  conv58: in=(0.028116,-118) out=(0.033726,-120) silu=True
+  conv59: in=(0.048510,-122) out=(0.167017,-126) silu=True
+  conv60: in=(0.033726,-120) out=(0.219780,-127) silu=True
+  conv61: in=(0.167017,-126) out=(0.071414,-33) silu=False
+  conv62: in=(0.219780,-127) out=(0.153569,113) silu=False
+  conv63: in=(0.003922,-128) out=(0.054218,-128) silu=False
+  OK adjacency conv0.out == conv1.in
+  OK adjacency conv1.out == conv2.in
+  Add /model.2/m.0/Add: in=[(0.11194601655006409, -126), (0.11174000799655914, -126)] out=(0.125745,-124) [RESCALE NEEDED]
+  Concat /model.2/Concat: in=[(0.11194601655006409, -126), (0.11194601655006409, -126), (0.12574459612369537, -124)] out=(0.125745,-124) [RESCALE NEEDED]
+  Add /model.4/m.0/Add: in=[(0.028845053166151047, -118), (0.020303718745708466, -114)] out=(0.027245,-108) [RESCALE NEEDED]
+  Add /model.4/m.1/Add: in=[(0.027245042845606804, -108), (0.03946113586425781, -121)] out=(0.044528,-109) [RESCALE NEEDED]
+  Concat /model.4/Concat: in=[(0.028845053166151047, -118), (0.028845053166151047, -118), (0.027245042845606804, -108), (0.044527992606163025, -109)] out=(0.044528,-109) [RESCALE NEEDED]
+  Add /model.6/m.0/Add: in=[(0.02689223177731037, -118), (0.03323879837989807, -120)] out=(0.033278,-111) [RESCALE NEEDED]
+  Add /model.6/m.1/Add: in=[(0.03327840939164162, -111), (0.03303663805127144, -120)] out=(0.037603,-106) [RESCALE NEEDED]
+  Concat /model.6/Concat: in=[(0.02689223177731037, -118), (0.02689223177731037, -118), (0.03327840939164162, -111), (0.0376032330095768, -106)] out=(0.037603,-106) [RESCALE NEEDED]
+  Add /model.8/m.0/Add: in=[(0.03719153627753258, -121), (0.03207457810640335, -119)] out=(0.032873,-111) [RESCALE NEEDED]
+  Concat /model.8/Concat: in=[(0.03719153627753258, -121), (0.03719153627753258, -121), (0.03287258371710777, -111)] out=(0.038284,-113) [RESCALE NEEDED]
+  MaxPool /model.9/m/MaxPool: in=[(0.027374736964702606, -118)] out=(0.027375,-118) [SAME AS INPUT]
+  MaxPool /model.9/m_1/MaxPool: in=[(0.027374736964702606, -118)] out=(0.027375,-118) [SAME AS INPUT]
+  MaxPool /model.9/m_2/MaxPool: in=[(0.027374736964702606, -118)] out=(0.027375,-118) [SAME AS INPUT]
+  Concat /model.9/Concat: in=[(0.027374736964702606, -118), (0.027374736964702606, -118), (0.027374736964702606, -118), (0.027374736964702606, -118)] out=(0.027375,-118) [SAME AS INPUT]
+  Resize /model.10/Resize: in=[(0.01726129651069641, -112)] out=(0.017261,-112) [SAME AS INPUT]
+  Concat /model.11/Concat: in=[(0.01726129651069641, -112), (0.026626141741871834, -118)] out=(0.026626,-118) [RESCALE NEEDED]
+  Concat /model.12/Concat: in=[(0.02304893173277378, -116), (0.02304893173277378, -116), (0.026942770928144455, -118)] out=(0.026943,-118) [RESCALE NEEDED]
+  Resize /model.13/Resize: in=[(0.027275454252958298, -118)] out=(0.027275,-118) [SAME AS INPUT]
+  Concat /model.14/Concat: in=[(0.027275454252958298, -118), (0.026359617710113525, -117)] out=(0.027275,-118) [RESCALE NEEDED]
+  Concat /model.15/Concat: in=[(0.01345695648342371, -107), (0.01345695648342371, -107), (0.020035015419125557, -114)] out=(0.020035,-114) [RESCALE NEEDED]
+  Concat /model.17/Concat: in=[(0.025006311014294624, -117), (0.027275454252958298, -118)] out=(0.027275,-118) [RESCALE NEEDED]
+  Concat /model.18/Concat: in=[(0.025067947804927826, -117), (0.025067947804927826, -117), (0.027236996218562126, -118)] out=(0.027237,-118) [RESCALE NEEDED]
+  Concat /model.20/Concat: in=[(0.02581142820417881, -117), (0.01726129651069641, -112)] out=(0.025811,-117) [RESCALE NEEDED]
+  Concat /model.21/Concat: in=[(0.024604206904768944, -117), (0.024604206904768944, -117), (0.032909516245126724, -120)] out=(0.032910,-120) [RESCALE NEEDED]
+  Concat /model.22/Concat: in=[(0.09546520560979843, -56), (0.07595544308423996, -71), (0.07141441851854324, -33)] out=(0.095465,-56) [RESCALE NEEDED]
+  Concat /model.22/Concat_1: in=[(0.08818711340427399, 127), (0.10577578097581863, 119), (0.15356852114200592, 113)] out=(0.153569,113) [RESCALE NEEDED]
+  Add /model.22/Add_1: in=[(0.3117647171020508, -128), (0.05421752855181694, -128)] out=(0.318770,-128) [RESCALE NEEDED]
+  Add /model.22/Add_2: in=[(0.3159268796443939, -124), (0.31876999139785767, -128)] out=(0.624866,-128) [RESCALE NEEDED]
+  Concat /model.22/Concat_2: in=[(0.31243303418159485, -128), (0.09538742899894714, -128)] out=(0.312433,-128) [RESCALE NEEDED]
+  Concat /model.22/Concat_3: in=[(2.500044584274292, -128), (0.0035130283795297146, -128)] out=(2.500045,-128) [RESCALE NEEDED]
+
+Wrote act_quant_meta.json with 64 conv entries, 30 glue op entries

@@ -106,9 +106,35 @@ def main():
         else:
             print(f"  OK adjacency conv{a}.out == conv{b}.in")
 
+    glue_ops = []
+    for n in model.graph.node:
+        if n.op_type not in ("Add", "Concat", "MaxPool", "Resize"):
+            continue
+        out_name = n.output[0]
+        consumers = nodes_by_input.get(out_name, [])
+        q_out = next((c for c in consumers if c.op_type == "QuantizeLinear"), None)
+        if q_out is None:
+            continue  # output feeds straight into something else (e.g. final reshape), skip
+        out_scale, out_zp = get_quant_param(q_out, init_map)
+
+        in_scales = []
+        for inp in n.input:
+            dq = nodes_by_output.get(inp)
+            if dq is not None and dq.op_type == "DequantizeLinear":
+                s, z = get_quant_param(dq, init_map)
+                in_scales.append((s, z))
+        glue_ops.append({
+            "name": n.name, "op_type": n.op_type,
+            "out_scale": out_scale, "out_zp": out_zp,
+            "in_scales": in_scales,
+        })
+        same_as_input = len(in_scales) > 0 and all(s == in_scales[0] for s in in_scales) and (out_scale, out_zp) == in_scales[0]
+        print(f"  {n.op_type} {n.name}: in={in_scales} out=({out_scale:.6f},{out_zp}) "
+              f"{'[SAME AS INPUT]' if same_as_input else '[RESCALE NEEDED]'}")
+
     with open(os.path.join(OUT_DIR, "act_quant_meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"\nWrote act_quant_meta.json with {len(meta)} entries")
+        json.dump({"convs": meta, "glue_ops": glue_ops}, f, indent=2)
+    print(f"\nWrote act_quant_meta.json with {len(meta)} conv entries, {len(glue_ops)} glue op entries")
 
 
 if __name__ == "__main__":
