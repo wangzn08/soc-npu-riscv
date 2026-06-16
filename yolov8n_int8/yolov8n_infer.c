@@ -30,13 +30,13 @@ static inline int8_t *t_at(const Tensor *t, int ch, int row, int col) {
 /* Simple arena allocator                                          */
 /* ================================================================ */
 static char arena[128 * 1024 * 1024];  /* 128 MB */
-static int arena_off = 0;
+static size_t arena_off = 0;
 
-static void *arena_alloc(int bytes) {
+static void *arena_alloc(size_t bytes) {
     bytes = (bytes + 15) & ~15;  /* 16-byte align */
     void *p = arena + arena_off;
     arena_off += bytes;
-    if (arena_off > (int)sizeof(arena)) {
+    if (arena_off > sizeof(arena)) {
         fprintf(stderr, "arena overflow\n");
         exit(1);
     }
@@ -82,19 +82,31 @@ void load_weights(const char *dir) {
         int ws = c->oc * c->ic * c->kh * c->kw;
 
         conv_w[i].w = (const int8_t *)malloc(ws);
+        if (!conv_w[i].w) { fprintf(stderr, "malloc failed for %s\n", c->w_file); exit(1); }
         FILE *f = fopen(c->w_file, "rb");
         if (!f) { fprintf(stderr, "Cannot open %s\n", c->w_file); exit(1); }
-        fread((void *)conv_w[i].w, 1, ws, f); fclose(f);
+        if (fread((void *)conv_w[i].w, 1, ws, f) != (size_t)ws) {
+            fprintf(stderr, "short read on %s\n", c->w_file); exit(1);
+        }
+        fclose(f);
 
         conv_w[i].b = (float *)malloc(c->oc * sizeof(float));
+        if (!conv_w[i].b) { fprintf(stderr, "malloc failed for %s\n", c->b_file); exit(1); }
         f = fopen(c->b_file, "rb");
         if (!f) { fprintf(stderr, "Cannot open %s\n", c->b_file); exit(1); }
-        fread(conv_w[i].b, sizeof(float), c->oc, f); fclose(f);
+        if (fread(conv_w[i].b, sizeof(float), c->oc, f) != (size_t)c->oc) {
+            fprintf(stderr, "short read on %s\n", c->b_file); exit(1);
+        }
+        fclose(f);
 
         conv_w[i].wscale = (float *)malloc(c->oc * sizeof(float));
+        if (!conv_w[i].wscale) { fprintf(stderr, "malloc failed for %s\n", c->s_file); exit(1); }
         f = fopen(c->s_file, "rb");
         if (!f) { fprintf(stderr, "Cannot open %s\n", c->s_file); exit(1); }
-        fread(conv_w[i].wscale, sizeof(float), c->oc, f); fclose(f);
+        if (fread(conv_w[i].wscale, sizeof(float), c->oc, f) != (size_t)c->oc) {
+            fprintf(stderr, "short read on %s\n", c->s_file); exit(1);
+        }
+        fclose(f);
 
         conv_w[i].oc = c->oc;
         conv_w[i].ic = c->ic;
@@ -112,6 +124,7 @@ void load_weights(const char *dir) {
          * (weight zero_point is verified 0 / symmetric for all 64 convs,
          * so no weight-zp term is needed here) */
         conv_w[i].wsum = (int32_t *)malloc(c->oc * sizeof(int32_t));
+        if (!conv_w[i].wsum) { fprintf(stderr, "malloc failed for wsum (conv %d)\n", i); exit(1); }
         int per_oc = c->ic * c->kh * c->kw;
         for (int oc = 0; oc < c->oc; oc++) {
             int32_t s = 0;
@@ -177,6 +190,9 @@ static Tensor conv_int8(int ci, const Tensor *in) {
 /* target (out_scale, out_zp). No-op when already matching.        */
 /* ================================================================ */
 static void requant_inplace(Tensor *t, float out_scale, int out_zp) {
+    /* Exact float == is deliberate: scales come from the same calibration
+     * constant table and are bit-identical, so this is a real no-op fast-path.
+     * Do NOT "fix" this into an epsilon compare. */
     if (t->scale == out_scale && t->zero_point == out_zp) return;  /* no-op */
     int n = t_size(t);
     for (int i = 0; i < n; i++) {
@@ -572,6 +588,9 @@ int yolo_infer(const uint8_t *image_rgb, YoloDet *dets, int max_dets,
      * For each (coord, anchor): softmax over 16 bins, then weighted sum
      * with dequantized conv63 weights (IC=16, OC=1). */
     float *bbox_dfl = (float *)arena_alloc(4LL * num_anchors * sizeof(float));
+    /* conv63 (the DFL conv) is bias-free, and its input zero-point is
+     * intentionally not applied here: standard YOLOv8 DFL is a softmax-
+     * expectation projection (softmax over 16 bins, then weighted sum). */
     const ConvW *dfl_cw = &conv_w[63];
 
     for (int a = 0; a < num_anchors; a++) {
