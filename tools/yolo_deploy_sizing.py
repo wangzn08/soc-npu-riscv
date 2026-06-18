@@ -29,6 +29,8 @@ class LayerShape:
     layer: Layer
     role: str
     source: str
+    input_name: str
+    output_name: str
     in_c: int
     in_h: int
     in_w: int
@@ -48,8 +50,32 @@ class YoloGraph:
     by_idx: dict[int, LayerShape]
 
 
+@dataclass(frozen=True)
+class BlockPlan:
+    idx: int
+    source: str
+    input_name: str
+    output_name: str
+    input_ddr: int
+    output_ddr: int
+    weight_ddr: int
+    act_base: int
+    wgt_base: int
+    out_base: int
+    strip_rows: int
+    strip_count: int
+    input_words: int
+    output_words: int
+    weight_words: int
+    ctrl_flags: tuple[str, ...]
+
+
 def align16(value: int) -> int:
     return ((value + 15) // 16) * 16
+
+
+def align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
 
 
 def conv_out_dim(size: int, kernel: int, stride: int, pad: int) -> int:
@@ -90,6 +116,8 @@ def build_yolov8n_graph(layers: list[Layer], input_h: int, input_w: int) -> Yolo
                 layer=layer,
                 role=role,
                 source=source,
+                input_name=src.name,
+                output_name=out.name,
                 in_c=src.c,
                 in_h=src.h,
                 in_w=src.w,
@@ -206,6 +234,8 @@ def build_yolov8n_graph(layers: list[Layer], input_h: int, input_w: int) -> Yolo
             layer=dfl,
             role="cpu_dfl",
             source="cpu.decode.dfl",
+            input_name="detect.bbox_logits",
+            output_name="decode.dfl",
             in_c=dfl.ic,
             in_h=1,
             in_w=dfl_sites,
@@ -268,8 +298,84 @@ def summarize(shapes: list[LayerShape]) -> dict[str, int]:
     }
 
 
+def build_block_plan(
+    graph: YoloGraph,
+    input_ddr_base: int = 0x40000000,
+    activation_ddr_base: int = 0x41000000,
+    weight_ddr_base: int = 0x48000000,
+    act_base: int = 0,
+    wgt_base: int = 0,
+    out_base: int = 0,
+    act_sram_bytes: int = 256 * 1024,
+) -> list[BlockPlan]:
+    """Build a deterministic CPU/NPU block schedule skeleton.
+
+    The plan is still per-layer, not a fused whole-network runtime. It assigns
+    DDR tensor slots and SRAM bases so firmware can later iterate over strips
+    without hand-writing addresses per YOLO layer.
+    """
+
+    tensor_ddr: dict[str, int] = {"input": input_ddr_base}
+    next_act_ddr = activation_ddr_base
+    next_weight_ddr = weight_ddr_base
+    plans: list[BlockPlan] = []
+
+    for shape in sorted(graph.shapes, key=lambda item: item.layer.idx):
+        if shape.role != "npu_conv":
+            continue
+
+        if shape.input_name not in tensor_ddr:
+            next_act_ddr = align_up(next_act_ddr, 16)
+            tensor_ddr[shape.input_name] = next_act_ddr
+            next_act_ddr += shape.act_in_bytes
+
+        next_act_ddr = align_up(next_act_ddr, 16)
+        output_ddr = next_act_ddr
+        tensor_ddr[shape.output_name] = output_ddr
+        next_act_ddr += shape.act_out_bytes
+
+        next_weight_ddr = align_up(next_weight_ddr, 16)
+        weight_ddr = next_weight_ddr
+        next_weight_ddr += shape.weight_bytes_aligned
+
+        ctrl_flags: list[str] = []
+        if shape.layer.kh == 1 and shape.layer.kw == 1:
+            ctrl_flags.append("PW_EN")
+        if shape.layer.pad != 0:
+            ctrl_flags.append("HW_PAD")
+        if shape.out_c > 16:
+            ctrl_flags.append("OC_SINGLE")
+        ctrl_flags.extend(["SILU", "SILU_REQUANT"])
+
+        strip_rows = choose_strip_rows(shape, act_sram_bytes=act_sram_bytes)
+        strip_count = (shape.out_h + strip_rows - 1) // strip_rows
+        plans.append(
+            BlockPlan(
+                idx=shape.layer.idx,
+                source=shape.source,
+                input_name=shape.input_name,
+                output_name=shape.output_name,
+                input_ddr=tensor_ddr[shape.input_name],
+                output_ddr=output_ddr,
+                weight_ddr=weight_ddr,
+                act_base=act_base,
+                wgt_base=wgt_base,
+                out_base=out_base,
+                strip_rows=strip_rows,
+                strip_count=strip_count,
+                input_words=shape.act_in_bytes // 16,
+                output_words=shape.act_out_bytes // 16,
+                weight_words=shape.weight_bytes_aligned // 16,
+                ctrl_flags=tuple(ctrl_flags),
+            )
+        )
+
+    return plans
+
+
 def render_report(graph: YoloGraph) -> str:
     summary = summarize(graph.shapes)
+    block_plan = build_block_plan(graph)
     lines = [
         "# YOLOv8n RTL Deploy Sizing",
         "",
@@ -304,6 +410,27 @@ def render_report(graph: YoloGraph) -> str:
             f"{shape.out_h}x{shape.out_w}x{shape.out_c} | "
             f"{shape.layer.kh}x{shape.layer.kw}/{shape.layer.stride}/{shape.layer.pad} | "
             f"{shape.macs:,} | {rows} | {strip_bytes:,} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Block Plan Preview",
+            "",
+            "This is the first deterministic CPU scheduler skeleton. It assigns DDR",
+            "tensor slots, weight slots, SRAM bases, strip rows, and control flags for",
+            "each NPU conv layer. It is intentionally conservative: tensors are kept",
+            "in separate DDR ranges first, then later firmware work can add reuse or",
+            "fusion once correctness is stable.",
+            "",
+            "| idx | input tensor | output tensor | input DDR | output DDR | weight DDR | strips | flags |",
+            "|---:|:---|:---|---:|---:|---:|---:|:---|",
+        ]
+    )
+    for plan in block_plan:
+        lines.append(
+            f"| {plan.idx} | {plan.input_name} | {plan.output_name} | "
+            f"0x{plan.input_ddr:08X} | 0x{plan.output_ddr:08X} | 0x{plan.weight_ddr:08X} | "
+            f"{plan.strip_count}x{plan.strip_rows} | {'+'.join(plan.ctrl_flags)} |"
         )
     lines.extend(
         [

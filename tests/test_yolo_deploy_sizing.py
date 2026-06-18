@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.yolo_deploy_sizing import (  # noqa: E402
+    build_block_plan,
     build_yolov8n_graph,
     choose_strip_rows,
     parse_layers,
@@ -49,8 +50,38 @@ def test_strip_budget_and_summary_are_plausible():
     assert summary["total_weight_bytes_aligned"] > 3_000_000
 
 
+def test_block_plan_emits_scheduler_addresses_and_flags():
+    layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
+    graph = build_yolov8n_graph(layers, input_h=640, input_w=640)
+    plan = build_block_plan(graph)
+    by_idx = {item.idx: item for item in plan}
+
+    assert len(plan) == 63
+    assert by_idx[0].input_ddr == 0x40000000
+    assert by_idx[0].strip_rows == 8
+    assert by_idx[0].strip_count == 40
+    assert "HW_PAD" in by_idx[0].ctrl_flags
+
+    assert by_idx[5].input_name == "c2f_2.concat"
+    assert by_idx[5].output_name == "conv5"
+    assert by_idx[5].input_words == (160 * 160 * 48) // 16
+    assert by_idx[5].output_words == (160 * 160 * 32) // 16
+    assert by_idx[5].weight_words == (32 * 48) // 16
+    assert "PW_EN" in by_idx[5].ctrl_flags
+    assert "OC_SINGLE" in by_idx[5].ctrl_flags
+
+    output_ranges = [
+        (item.output_ddr, item.output_ddr + item.output_words * 16)
+        for item in plan
+    ]
+    assert output_ranges == sorted(output_ranges)
+    for prev, curr in zip(output_ranges, output_ranges[1:]):
+        assert prev[1] <= curr[0]
+
+
 if __name__ == "__main__":
     test_parse_yolov8n_layer_table()
     test_builds_graph_aware_feature_shapes()
     test_strip_budget_and_summary_are_plausible()
+    test_block_plan_emits_scheduler_addresses_and_flags()
     print("PASS: yolo_deploy_sizing")
