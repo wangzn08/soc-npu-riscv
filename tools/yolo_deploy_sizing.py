@@ -17,6 +17,15 @@ class Layer:
 
 
 @dataclass(frozen=True)
+class ActQuant:
+    in_scale: str
+    out_scale: str
+    in_zp: int
+    out_zp: int
+    has_silu: int
+
+
+@dataclass(frozen=True)
 class TensorShape:
     c: int
     h: int
@@ -107,6 +116,35 @@ def parse_layers(path: Path) -> list[Layer]:
             raise ValueError(f"conv row order mismatch: row {row_idx} names conv{conv_idx}")
         layers.append(Layer(row_idx, oc, ic, kh, kw, stride, pad))
     return layers
+
+
+def parse_act_quant(path: Path) -> list[ActQuant]:
+    text = path.read_text(encoding="utf-8")
+    table_match = re.search(
+        r"static const YoloActQuant yolo_act_quant\[64\] = \{(.*?)\};",
+        text,
+        re.S,
+    )
+    if table_match is None:
+        raise ValueError("missing yolo_act_quant table")
+    pattern = re.compile(
+        r"\{([0-9.]+f),\s*([0-9.]+f),\s*(-?\d+),\s*(-?\d+),\s*(\d+)\}"
+    )
+    quant: list[ActQuant] = []
+    for match in pattern.finditer(table_match.group(1)):
+        in_scale, out_scale, in_zp, out_zp, has_silu = match.groups()
+        quant.append(
+            ActQuant(
+                in_scale=in_scale,
+                out_scale=out_scale,
+                in_zp=int(in_zp),
+                out_zp=int(out_zp),
+                has_silu=int(has_silu),
+            )
+        )
+    if len(quant) != 64:
+        raise ValueError(f"expected 64 quant rows, got {len(quant)}")
+    return quant
 
 
 def build_yolov8n_graph(layers: list[Layer], input_h: int, input_w: int) -> YoloGraph:
@@ -451,6 +489,8 @@ def encode_ctrl_flags(flags: tuple[str, ...]) -> int:
 
 
 def render_block_plan_header(graph: YoloGraph) -> str:
+    root = Path(__file__).resolve().parents[1]
+    quant = parse_act_quant(root / "yolov8n_int8" / "yolov8n_layers.h")
     plans = build_block_plan(graph)
     strip_plan = build_strip_plan(graph)
     strip_offsets: dict[int, int] = {}
@@ -466,6 +506,7 @@ def render_block_plan_header(graph: YoloGraph) -> str:
         "",
         "#define YOLO_BLOCK_PLAN_COUNT 63u",
         f"#define YOLO_STRIP_PLAN_COUNT {len(flat_strips)}u",
+        "#define YOLO_ACT_QUANT_COUNT 64u",
         "#define YOLO_PLAN_FLAG_PW_EN 0x00000001u",
         "#define YOLO_PLAN_FLAG_HW_PAD 0x00000002u",
         "#define YOLO_PLAN_FLAG_OC_SINGLE 0x00000004u",
@@ -507,6 +548,14 @@ def render_block_plan_header(graph: YoloGraph) -> str:
         "    uint8_t bottom_pad_rows;",
         "} yolo_strip_plan_entry_t;",
         "",
+        "typedef struct {",
+        "    float in_scale;",
+        "    float out_scale;",
+        "    int16_t in_zp;",
+        "    int16_t out_zp;",
+        "    uint8_t has_silu;",
+        "} yolo_act_quant_entry_t;",
+        "",
         "static const yolo_block_plan_entry_t yolo_block_plan[YOLO_BLOCK_PLAN_COUNT] = {",
     ]
     for plan in plans:
@@ -521,6 +570,18 @@ def render_block_plan_header(graph: YoloGraph) -> str:
             f"0x{plan.input_ddr:08X}u, 0x{plan.output_ddr:08X}u, 0x{plan.weight_ddr:08X}u, "
             f"{plan.input_words}u, {plan.output_words}u, {plan.weight_words}u, "
             f"0x{flags:08X}u}},"
+        )
+    lines.extend(
+        [
+            "};",
+            "",
+            "static const yolo_act_quant_entry_t yolo_act_quant_plan[YOLO_ACT_QUANT_COUNT] = {",
+        ]
+    )
+    for item in quant:
+        lines.append(
+            "    "
+            f"{{{item.in_scale}, {item.out_scale}, {item.in_zp}, {item.out_zp}, {item.has_silu}u}},"
         )
     lines.extend(
         [

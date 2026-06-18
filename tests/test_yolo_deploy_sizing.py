@@ -10,6 +10,7 @@ from tools.yolo_deploy_sizing import (  # noqa: E402
     build_yolov8n_graph,
     choose_strip_rows,
     encode_ctrl_flags,
+    parse_act_quant,
     parse_layers,
     render_block_plan_header,
     summarize,
@@ -18,11 +19,18 @@ from tools.yolo_deploy_sizing import (  # noqa: E402
 
 def test_parse_yolov8n_layer_table():
     layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
+    quant = parse_act_quant(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
 
     assert len(layers) == 64
+    assert len(quant) == 64
     assert layers[0].idx == 0
     assert (layers[0].oc, layers[0].ic, layers[0].kh, layers[0].kw) == (16, 3, 3, 3)
     assert (layers[0].stride, layers[0].pad) == (2, 1)
+    assert quant[0].in_zp == -128
+    assert quant[0].out_zp == -127
+    assert quant[0].has_silu == 1
+    assert quant[5].in_zp == -125
+    assert quant[5].out_zp == -124
     assert layers[63].idx == 63
     assert (layers[63].oc, layers[63].ic, layers[63].kh, layers[63].kw) == (1, 16, 1, 1)
 
@@ -119,6 +127,17 @@ def test_block_plan_header_exports_conv0_strip_table():
     assert "{39u, 312u, 8u, 623u, 17u, 0u, 0u}," in header
 
 
+def test_block_plan_header_exports_quant_table():
+    layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
+    graph = build_yolov8n_graph(layers, input_h=640, input_w=640)
+    header = render_block_plan_header(graph)
+
+    assert "#define YOLO_ACT_QUANT_COUNT 64u" in header
+    assert "static const yolo_act_quant_entry_t yolo_act_quant_plan" in header
+    assert "{0.0039215689f, 0.2352971584f, -128, -127, 1u}," in header
+    assert "{0.1612435579f, 0.0763198882f, -125, -124, 1u}," in header
+
+
 def test_strip_plan_tracks_conv0_halo_rows():
     layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
     graph = build_yolov8n_graph(layers, input_h=640, input_w=640)
@@ -151,5 +170,6 @@ if __name__ == "__main__":
     test_block_plan_emits_scheduler_addresses_and_flags()
     test_block_plan_header_is_firmware_consumable()
     test_block_plan_header_exports_conv0_strip_table()
+    test_block_plan_header_exports_quant_table()
     test_strip_plan_tracks_conv0_halo_rows()
     print("PASS: yolo_deploy_sizing")

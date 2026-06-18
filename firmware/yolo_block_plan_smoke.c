@@ -18,6 +18,8 @@ void usercode7(void)
     const yolo_strip_plan_entry_t *strip0 = &yolo_conv0_strip_plan[0];
     const yolo_strip_plan_entry_t *strip1 = &yolo_conv0_strip_plan[1];
     const yolo_strip_plan_entry_t *strip39 = &yolo_conv0_strip_plan[39];
+    const yolo_act_quant_entry_t *q0 = &yolo_act_quant_plan[0];
+    const yolo_act_quant_entry_t *q5 = &yolo_act_quant_plan[5];
 
     print_str("YOLO BLOCK PLAN CPU SMOKE\n");
 
@@ -51,6 +53,12 @@ void usercode7(void)
         !check_flag(conv5->flags, YOLO_PLAN_FLAG_OC_SINGLE) ||
         !check_flag(conv5->flags, YOLO_PLAN_FLAG_SILU_REQUANT)) {
         print_str("  bad conv5 concat-channel plan\n");
+        errors++;
+    }
+    if (YOLO_ACT_QUANT_COUNT != 64u ||
+        q0->in_zp != -128 || q0->out_zp != -127 || q0->has_silu != 1u ||
+        q5->in_zp != -125 || q5->out_zp != -124 || q5->has_silu != 1u) {
+        print_str("  bad activation quant table\n");
         errors++;
     }
 
