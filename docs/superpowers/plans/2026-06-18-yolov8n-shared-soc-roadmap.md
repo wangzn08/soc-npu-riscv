@@ -84,7 +84,7 @@
 
 ## Milestone 4: YOLO Conv Block Scheduler
 
-**Status:** In progress. Synthetic and tiny real-weight CPU-scheduled 1x1 pointwise conv blocks are complete. Tiny real YOLO 3x3 stride-1, stride-2, and multi-tile OC32/IC32 padded blocks also run with C-reference qparam/SiLU/requant semantics after adding configurable hardware pad fill. A concat-channel pointwise block (real conv5, IC48/OC32) now runs through the same shared NPU path with `oc_single`. Full per-layer strip/block-plan integration is still pending.
+**Status:** In progress. Synthetic and tiny real-weight CPU-scheduled 1x1 pointwise conv blocks are complete. Tiny real YOLO 3x3 stride-1, stride-2, and multi-tile OC32/IC32 padded blocks also run with C-reference qparam/SiLU/requant semantics after adding configurable hardware pad fill. A concat-channel pointwise block (real conv5, IC48/OC32) now runs through the same shared NPU path with `oc_single`, and the first reusable firmware conv descriptor runner can launch it. Full per-layer strip/block-plan integration is still pending.
 
 **Deliverable:** CPU firmware can run one YOLO conv layer by strips using the existing systolic array and post-process path.
 
@@ -99,6 +99,7 @@
 - [x] Run one real YOLOv8n `conv1` 3x3 stride-2 padded OC tile through CPU -> DMA -> shared NPU im2col conv -> DMA -> C-reference tolerance compare.
 - [x] Run one real YOLOv8n `conv8` OC32/IC32 3x3 padded block through CPU -> DMA -> shared NPU `oc_single` conv -> DMA -> C-reference tolerance compare.
 - [x] Run one real YOLOv8n `conv5` concat-channel IC48/OC32 1x1 block through CPU -> DMA -> shared NPU `oc_single` pointwise conv -> DMA -> C-reference tolerance compare.
+- [x] Add a reusable firmware conv descriptor runner and convert the conv5 smoke to call it.
 - [x] Run MNIST regression.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke

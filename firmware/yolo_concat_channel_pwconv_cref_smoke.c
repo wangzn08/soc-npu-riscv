@@ -3,6 +3,7 @@
 
 #include "firmware.h"
 #include "yolo_ops.h"
+#include "yolo_plan.h"
 #include "yolo_concat_channel_real_data.h"
 #include <stdint.h>
 
@@ -61,24 +62,40 @@ void usercode7(void)
         write_ddr_word128(OUT_DDR, i, zero);
     }
 
-    yolo_set_silu_requant(YOLO_CONCAT_CH_REQUANT_MUL,
-                          YOLO_CONCAT_CH_REQUANT_SHIFT,
-                          YOLO_CONCAT_CH_REQUANT_ZP);
+    {
+        const yolo_conv_desc_t desc = {
+            ACT_DDR,
+            WGT_DDR,
+            OUT_DDR,
+            ACT_BASE,
+            WGT_BASE,
+            OUT_BASE,
+            0u,
+            YOLO_CONCAT_CH_IN_W,
+            YOLO_CONCAT_CH_IN_H,
+            YOLO_CONCAT_CH_IC,
+            YOLO_CONCAT_CH_OC,
+            1u,
+            1u,
+            1u,
+            0u,
+            (uint32_t)YOLO_CONCAT_CH_IN_ZP,
+            YOLO_CONCAT_CH_ACT_WORDS,
+            YOLO_CONCAT_CH_WGT_WORDS,
+            YOLO_CONCAT_CH_OUT_WORDS,
+            yolo_concat_ch_bias_q,
+            yolo_concat_ch_scale_mul,
+            yolo_concat_ch_scale_shift,
+            YOLO_CONCAT_CH_REQUANT_MUL,
+            YOLO_CONCAT_CH_REQUANT_SHIFT,
+            YOLO_CONCAT_CH_REQUANT_ZP,
+            NPU_CTRL_OC_SINGLE | NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN
+        };
 
-    if (!yolo_dma_ddr_to_act(ACT_DDR, ACT_BASE, YOLO_CONCAT_CH_ACT_WORDS) ||
-        !yolo_dma_ddr_to_wgt(WGT_DDR, WGT_BASE, YOLO_CONCAT_CH_WGT_WORDS) ||
-        !yolo_run_pw_conv1x1_qparams(ACT_BASE, WGT_BASE, OUT_BASE,
-                                     YOLO_CONCAT_CH_IN_W, YOLO_CONCAT_CH_IN_H,
-                                     YOLO_CONCAT_CH_IC, YOLO_CONCAT_CH_OC,
-                                     yolo_concat_ch_bias_q,
-                                     yolo_concat_ch_scale_mul,
-                                     yolo_concat_ch_scale_shift,
-                                     NPU_CTRL_OC_SINGLE |
-                                     NPU_CTRL_SILU_EN |
-                                     NPU_CTRL_SILU_REQUANT_EN) ||
-        !yolo_dma_out_to_ddr(OUT_DDR, OUT_BASE, YOLO_CONCAT_CH_OUT_WORDS, 0u)) {
-        print_str("  concat-channel pwconv path failed\n");
-        errors++;
+        if (!yolo_run_conv_desc(&desc)) {
+            print_str("  concat-channel pwconv path failed\n");
+            errors++;
+        }
     }
 
     for (pos = 0u; pos < YOLO_CONCAT_CH_OUT_SPATIAL; pos++) {
