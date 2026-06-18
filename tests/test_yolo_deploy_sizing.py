@@ -8,7 +8,9 @@ from tools.yolo_deploy_sizing import (  # noqa: E402
     build_block_plan,
     build_yolov8n_graph,
     choose_strip_rows,
+    encode_ctrl_flags,
     parse_layers,
+    render_block_plan_header,
     summarize,
 )
 
@@ -79,9 +81,27 @@ def test_block_plan_emits_scheduler_addresses_and_flags():
         assert prev[1] <= curr[0]
 
 
+def test_block_plan_header_is_firmware_consumable():
+    layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
+    graph = build_yolov8n_graph(layers, input_h=640, input_w=640)
+    plan = build_block_plan(graph)
+    by_idx = {item.idx: item for item in plan}
+    header = render_block_plan_header(graph)
+
+    assert "#define YOLO_BLOCK_PLAN_COUNT 63u" in header
+    assert "typedef struct" in header
+    assert "static const yolo_block_plan_entry_t yolo_block_plan" in header
+    assert encode_ctrl_flags(by_idx[5].ctrl_flags) == 0x0000001D
+    assert (
+        "{5u, 160u, 160u, 48u, 160u, 160u, 32u, 1u, 1u, 1u, 0u,"
+        in header
+    )
+
+
 if __name__ == "__main__":
     test_parse_yolov8n_layer_table()
     test_builds_graph_aware_feature_shapes()
     test_strip_budget_and_summary_are_plausible()
     test_block_plan_emits_scheduler_addresses_and_flags()
+    test_block_plan_header_is_firmware_consumable()
     print("PASS: yolo_deploy_sizing")

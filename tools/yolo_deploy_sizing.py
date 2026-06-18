@@ -373,6 +373,95 @@ def build_block_plan(
     return plans
 
 
+PLAN_FLAG_PW_EN = 1 << 0
+PLAN_FLAG_HW_PAD = 1 << 1
+PLAN_FLAG_OC_SINGLE = 1 << 2
+PLAN_FLAG_SILU = 1 << 3
+PLAN_FLAG_SILU_REQUANT = 1 << 4
+
+
+def encode_ctrl_flags(flags: tuple[str, ...]) -> int:
+    value = 0
+    for flag in flags:
+        if flag == "PW_EN":
+            value |= PLAN_FLAG_PW_EN
+        elif flag == "HW_PAD":
+            value |= PLAN_FLAG_HW_PAD
+        elif flag == "OC_SINGLE":
+            value |= PLAN_FLAG_OC_SINGLE
+        elif flag == "SILU":
+            value |= PLAN_FLAG_SILU
+        elif flag == "SILU_REQUANT":
+            value |= PLAN_FLAG_SILU_REQUANT
+        else:
+            raise ValueError(f"unknown block-plan flag: {flag}")
+    return value
+
+
+def render_block_plan_header(graph: YoloGraph) -> str:
+    plans = build_block_plan(graph)
+    lines = [
+        "#ifndef YOLO_BLOCK_PLAN_H",
+        "#define YOLO_BLOCK_PLAN_H",
+        "",
+        "#include <stdint.h>",
+        "",
+        "#define YOLO_BLOCK_PLAN_COUNT 63u",
+        "#define YOLO_PLAN_FLAG_PW_EN 0x00000001u",
+        "#define YOLO_PLAN_FLAG_HW_PAD 0x00000002u",
+        "#define YOLO_PLAN_FLAG_OC_SINGLE 0x00000004u",
+        "#define YOLO_PLAN_FLAG_SILU 0x00000008u",
+        "#define YOLO_PLAN_FLAG_SILU_REQUANT 0x00000010u",
+        "",
+        "typedef struct {",
+        "    uint8_t idx;",
+        "    uint16_t in_w;",
+        "    uint16_t in_h;",
+        "    uint16_t in_c;",
+        "    uint16_t out_w;",
+        "    uint16_t out_h;",
+        "    uint16_t out_c;",
+        "    uint8_t kernel_h;",
+        "    uint8_t kernel_w;",
+        "    uint8_t stride;",
+        "    uint8_t pad;",
+        "    uint16_t strip_rows;",
+        "    uint16_t strip_count;",
+        "    uint32_t input_ddr;",
+        "    uint32_t output_ddr;",
+        "    uint32_t weight_ddr;",
+        "    uint32_t input_words;",
+        "    uint32_t output_words;",
+        "    uint32_t weight_words;",
+        "    uint32_t flags;",
+        "} yolo_block_plan_entry_t;",
+        "",
+        "static const yolo_block_plan_entry_t yolo_block_plan[YOLO_BLOCK_PLAN_COUNT] = {",
+    ]
+    for plan in plans:
+        shape = graph.by_idx[plan.idx]
+        flags = encode_ctrl_flags(plan.ctrl_flags)
+        lines.append(
+            "    "
+            f"{{{plan.idx}u, {shape.in_w}u, {shape.in_h}u, {shape.in_c}u, "
+            f"{shape.out_w}u, {shape.out_h}u, {shape.out_c}u, "
+            f"{shape.layer.kh}u, {shape.layer.kw}u, {shape.layer.stride}u, {shape.layer.pad}u, "
+            f"{plan.strip_rows}u, {plan.strip_count}u, "
+            f"0x{plan.input_ddr:08X}u, 0x{plan.output_ddr:08X}u, 0x{plan.weight_ddr:08X}u, "
+            f"{plan.input_words}u, {plan.output_words}u, {plan.weight_words}u, "
+            f"0x{flags:08X}u}},"
+        )
+    lines.extend(
+        [
+            "};",
+            "",
+            "#endif",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def render_report(graph: YoloGraph) -> str:
     summary = summarize(graph.shapes)
     block_plan = build_block_plan(graph)
@@ -453,6 +542,9 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_report(graph), encoding="utf-8")
     print(f"wrote {out}")
+    header = root / "firmware" / "yolo_block_plan.h"
+    header.write_text(render_block_plan_header(graph), encoding="utf-8")
+    print(f"wrote {header}")
 
 
 if __name__ == "__main__":
