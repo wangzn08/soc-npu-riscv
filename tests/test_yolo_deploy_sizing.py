@@ -6,6 +6,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools.yolo_deploy_sizing import (  # noqa: E402
     build_block_plan,
+    build_strip_plan,
     build_yolov8n_graph,
     choose_strip_rows,
     encode_ctrl_flags,
@@ -98,10 +99,36 @@ def test_block_plan_header_is_firmware_consumable():
     )
 
 
+def test_strip_plan_tracks_conv0_halo_rows():
+    layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
+    graph = build_yolov8n_graph(layers, input_h=640, input_w=640)
+    strips = build_strip_plan(graph)[0]
+
+    assert len(strips) == 40
+    assert strips[0].out_y == 0
+    assert strips[0].out_rows == 8
+    assert strips[0].in_y == 0
+    assert strips[0].in_rows == 16
+    assert strips[0].top_pad_rows == 1
+    assert strips[0].bottom_pad_rows == 0
+
+    assert strips[1].out_y == 8
+    assert strips[1].in_y == 15
+    assert strips[1].in_rows == 17
+    assert strips[1].top_pad_rows == 0
+
+    assert strips[-1].out_y == 312
+    assert strips[-1].out_rows == 8
+    assert strips[-1].in_y == 623
+    assert strips[-1].in_rows == 17
+    assert strips[-1].bottom_pad_rows == 0
+
+
 if __name__ == "__main__":
     test_parse_yolov8n_layer_table()
     test_builds_graph_aware_feature_shapes()
     test_strip_budget_and_summary_are_plausible()
     test_block_plan_emits_scheduler_addresses_and_flags()
     test_block_plan_header_is_firmware_consumable()
+    test_strip_plan_tracks_conv0_halo_rows()
     print("PASS: yolo_deploy_sizing")

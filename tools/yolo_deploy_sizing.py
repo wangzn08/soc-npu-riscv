@@ -70,6 +70,18 @@ class BlockPlan:
     ctrl_flags: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class StripPlan:
+    idx: int
+    strip_idx: int
+    out_y: int
+    out_rows: int
+    in_y: int
+    in_rows: int
+    top_pad_rows: int
+    bottom_pad_rows: int
+
+
 def align16(value: int) -> int:
     return ((value + 15) // 16) * 16
 
@@ -373,6 +385,46 @@ def build_block_plan(
     return plans
 
 
+def build_layer_strip_plan(shape: LayerShape, strip_rows: int) -> list[StripPlan]:
+    if shape.role != "npu_conv":
+        return []
+    if strip_rows <= 0:
+        raise ValueError("strip_rows must be positive")
+
+    strips: list[StripPlan] = []
+    strip_idx = 0
+    out_y = 0
+    while out_y < shape.out_h:
+        out_rows = min(strip_rows, shape.out_h - out_y)
+        raw_in_y0 = out_y * shape.layer.stride - shape.layer.pad
+        raw_in_y1 = (out_y + out_rows - 1) * shape.layer.stride - shape.layer.pad + shape.layer.kh
+        in_y0 = max(0, raw_in_y0)
+        in_y1 = min(shape.in_h, raw_in_y1)
+        strips.append(
+            StripPlan(
+                idx=shape.layer.idx,
+                strip_idx=strip_idx,
+                out_y=out_y,
+                out_rows=out_rows,
+                in_y=in_y0,
+                in_rows=max(0, in_y1 - in_y0),
+                top_pad_rows=max(0, -raw_in_y0),
+                bottom_pad_rows=max(0, raw_in_y1 - shape.in_h),
+            )
+        )
+        strip_idx += 1
+        out_y += out_rows
+    return strips
+
+
+def build_strip_plan(graph: YoloGraph) -> dict[int, list[StripPlan]]:
+    plans = build_block_plan(graph)
+    return {
+        plan.idx: build_layer_strip_plan(graph.by_idx[plan.idx], plan.strip_rows)
+        for plan in plans
+    }
+
+
 PLAN_FLAG_PW_EN = 1 << 0
 PLAN_FLAG_HW_PAD = 1 << 1
 PLAN_FLAG_OC_SINGLE = 1 << 2
@@ -520,6 +572,22 @@ def render_report(graph: YoloGraph) -> str:
             f"| {plan.idx} | {plan.input_name} | {plan.output_name} | "
             f"0x{plan.input_ddr:08X} | 0x{plan.output_ddr:08X} | 0x{plan.weight_ddr:08X} | "
             f"{plan.strip_count}x{plan.strip_rows} | {'+'.join(plan.ctrl_flags)} |"
+        )
+    strip_plan = build_strip_plan(graph)
+    conv0_strips = strip_plan[0]
+    lines.extend(
+        [
+            "",
+            "### Conv0 Strip/Halo Example",
+            "",
+            "| strip | out_y | out_rows | input_y | input_rows | top_pad | bottom_pad |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for strip in conv0_strips[:4]:
+        lines.append(
+            f"| {strip.strip_idx} | {strip.out_y} | {strip.out_rows} | "
+            f"{strip.in_y} | {strip.in_rows} | {strip.top_pad_rows} | {strip.bottom_pad_rows} |"
         )
     lines.extend(
         [

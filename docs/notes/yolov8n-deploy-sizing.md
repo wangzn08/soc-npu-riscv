@@ -160,6 +160,15 @@ fusion once correctness is stable.
 | 61 | conv59 | conv61 | 0x425F4500 | 0x42602600 | 0x482FE000 | 2x16 | PW_EN+OC_SINGLE+SILU+SILU_REQUANT |
 | 62 | conv60 | conv62 | 0x425FA900 | 0x42608A00 | 0x482FF000 | 2x16 | PW_EN+OC_SINGLE+SILU+SILU_REQUANT |
 
+### Conv0 Strip/Halo Example
+
+| strip | out_y | out_rows | input_y | input_rows | top_pad | bottom_pad |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 8 | 0 | 16 | 1 | 0 |
+| 1 | 8 | 8 | 15 | 17 | 0 | 0 |
+| 2 | 16 | 8 | 31 | 17 | 0 | 0 |
+| 3 | 24 | 8 | 47 | 17 | 0 | 0 |
+
 ## Gate For RTL Work
 
 - The next RTL change must start with a directed test for the single-conv strip path.
