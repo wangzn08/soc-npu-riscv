@@ -34,6 +34,7 @@ typedef struct {
 } yolo_conv_desc_t;
 
 int yolo_run_conv_desc(const yolo_conv_desc_t *desc);
+uint32_t yolo_ctrl_from_plan_flags(uint32_t plan_flags);
 int yolo_run_conv0_strip_from_plan(const yolo_strip_plan_entry_t *strip,
                                    uint32_t act_ddr,
                                    uint32_t wgt_ddr,

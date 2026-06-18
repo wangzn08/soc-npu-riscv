@@ -9,6 +9,24 @@
 #define YOLO_CONV0_STRIDE 2u
 #define YOLO_CONV0_PAD_VALUE (-128)
 
+uint32_t yolo_ctrl_from_plan_flags(uint32_t plan_flags)
+{
+    uint32_t ctrl = 0u;
+
+    if ((plan_flags & YOLO_PLAN_FLAG_PW_EN) != 0u)
+        ctrl |= NPU_CTRL_PW_EN;
+    if ((plan_flags & YOLO_PLAN_FLAG_HW_PAD) != 0u)
+        ctrl |= NPU_CTRL_HW_PAD;
+    if ((plan_flags & YOLO_PLAN_FLAG_OC_SINGLE) != 0u)
+        ctrl |= NPU_CTRL_OC_SINGLE;
+    if ((plan_flags & YOLO_PLAN_FLAG_SILU) != 0u)
+        ctrl |= NPU_CTRL_SILU_EN;
+    if ((plan_flags & YOLO_PLAN_FLAG_SILU_REQUANT) != 0u)
+        ctrl |= NPU_CTRL_SILU_REQUANT_EN;
+
+    return ctrl;
+}
+
 int yolo_run_conv_desc(const yolo_conv_desc_t *desc)
 {
     if (desc == (const yolo_conv_desc_t *)0)

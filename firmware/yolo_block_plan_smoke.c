@@ -2,6 +2,7 @@
 
 #include "firmware.h"
 #include "yolo_block_plan.h"
+#include "yolo_plan.h"
 #include <stdint.h>
 
 static int check_flag(uint32_t flags, uint32_t flag)
@@ -53,6 +54,13 @@ void usercode7(void)
         !check_flag(conv5->flags, YOLO_PLAN_FLAG_OC_SINGLE) ||
         !check_flag(conv5->flags, YOLO_PLAN_FLAG_SILU_REQUANT)) {
         print_str("  bad conv5 concat-channel plan\n");
+        errors++;
+    }
+    if ((yolo_ctrl_from_plan_flags(conv0->flags) & NPU_CTRL_HW_PAD) == 0u ||
+        (yolo_ctrl_from_plan_flags(conv5->flags) & NPU_CTRL_PW_EN) == 0u ||
+        (yolo_ctrl_from_plan_flags(conv5->flags) & NPU_CTRL_OC_SINGLE) == 0u ||
+        (yolo_ctrl_from_plan_flags(conv5->flags) & NPU_CTRL_SILU_REQUANT_EN) == 0u) {
+        print_str("  bad plan flag to NPU ctrl mapping\n");
         errors++;
     }
     if (YOLO_ACT_QUANT_COUNT != 64u ||

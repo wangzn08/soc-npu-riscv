@@ -72,7 +72,7 @@
 
 ## Milestone 3: YOLO Tensor Layout And Concat
 
-**Status:** In progress. The CPU/DMA block-concat primitive is complete, and the sizing tool now emits a deterministic per-layer block-plan skeleton with DDR tensor/weight slots, SRAM bases, strip rows, strip counts, NPU control flags, per-strip halo/input-row metadata, and activation quantization metadata. The generated firmware-visible C header now includes a flat strip table for all 63 NPU conv layers plus a 64-row activation quant table, and CPU smokes verify the tables under RTL. Full firmware execution of the generated plan is still pending.
+**Status:** In progress. The CPU/DMA block-concat primitive is complete, and the sizing tool now emits a deterministic per-layer block-plan skeleton with DDR tensor/weight slots, SRAM bases, strip rows, strip counts, NPU control flags, per-strip halo/input-row metadata, and activation quantization metadata. The generated firmware-visible C header now includes a flat strip table for all 63 NPU conv layers plus a 64-row activation quant table, and CPU smokes verify the tables and flag-to-NPU-control mapping under RTL. Full firmware execution of the generated plan is still pending.
 
 **Deliverable:** A block-level tensor layout contract and concat path for FPN/PAN without whole-feature-map SRAM residency.
 
@@ -83,6 +83,7 @@
 - [x] Export conv0 strip/halo metadata into generated firmware tables and verify CPU consumption.
 - [x] Generalize firmware strip metadata into a flat table for all NPU conv layers with per-layer offsets.
 - [x] Export per-layer activation quantization metadata for firmware scheduling.
+- [x] Add firmware mapping from generated plan flags to real `NPU_CTRL_*` bits.
 - [x] Add a CPU/NPU smoke for block concat: two source tensors with different channel-group ranges produce one concatenated tile-major tensor.
 - [x] Add firmware helpers in `firmware/yolo_ops.c` that DMA-load two DDR blocks into one Act-SRAM concat layout, DMA-drain the result, and compare in software from `firmware/yolo_concat_smoke.c`.
 - [x] Run MNIST regression after the concat path is added.
