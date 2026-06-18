@@ -102,12 +102,19 @@ def test_block_plan_header_is_firmware_consumable():
 def test_block_plan_header_exports_conv0_strip_table():
     layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
     graph = build_yolov8n_graph(layers, input_h=640, input_w=640)
+    strip_plan = build_strip_plan(graph)
     header = render_block_plan_header(graph)
 
+    assert sum(len(items) for items in strip_plan.values()) == 241
+    assert "#define YOLO_STRIP_PLAN_COUNT 241u" in header
     assert "#define YOLO_CONV0_STRIP_PLAN_COUNT 40u" in header
     assert "typedef struct" in header
-    assert "static const yolo_strip_plan_entry_t yolo_conv0_strip_plan" in header
+    assert "uint16_t strip_offset;" in header
+    assert "static const yolo_strip_plan_entry_t yolo_strip_plan[YOLO_STRIP_PLAN_COUNT]" in header
+    assert "#define yolo_conv0_strip_plan (&yolo_strip_plan[0])" in header
     assert "{0u, 0u, 8u, 0u, 16u, 1u, 0u}," in header
+    assert "{1u, 320u, 320u, 16u, 160u, 160u, 32u, 3u, 3u, 2u, 1u, 16u, 10u, 40u," in header
+    assert "{0u, 0u, 16u, 0u, 32u, 1u, 0u}," in header
     assert "{1u, 8u, 8u, 15u, 17u, 0u, 0u}," in header
     assert "{39u, 312u, 8u, 623u, 17u, 0u, 0u}," in header
 

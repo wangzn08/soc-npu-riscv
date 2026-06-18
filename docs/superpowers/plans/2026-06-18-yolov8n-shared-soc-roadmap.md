@@ -72,7 +72,7 @@
 
 ## Milestone 3: YOLO Tensor Layout And Concat
 
-**Status:** In progress. The CPU/DMA block-concat primitive is complete, and the sizing tool now emits a deterministic per-layer block-plan skeleton with DDR tensor/weight slots, SRAM bases, strip rows, strip counts, NPU control flags, and per-strip halo/input-row metadata. The generated firmware-visible C header now includes a conv0 strip table, and a CPU smoke verifies the block and strip tables under RTL. Full firmware execution of the generated plan is still pending.
+**Status:** In progress. The CPU/DMA block-concat primitive is complete, and the sizing tool now emits a deterministic per-layer block-plan skeleton with DDR tensor/weight slots, SRAM bases, strip rows, strip counts, NPU control flags, and per-strip halo/input-row metadata. The generated firmware-visible C header now includes a flat strip table for all 63 NPU conv layers, and CPU smokes verify the block and strip tables under RTL. Full firmware execution of the generated plan is still pending.
 
 **Deliverable:** A block-level tensor layout contract and concat path for FPN/PAN without whole-feature-map SRAM residency.
 
@@ -81,6 +81,7 @@
 - [x] Generate `firmware/yolo_block_plan.h` and verify PicoRV32 firmware can consume it.
 - [x] Add per-strip halo/input-row planning for strip DMA scheduling.
 - [x] Export conv0 strip/halo metadata into generated firmware tables and verify CPU consumption.
+- [x] Generalize firmware strip metadata into a flat table for all NPU conv layers with per-layer offsets.
 - [x] Add a CPU/NPU smoke for block concat: two source tensors with different channel-group ranges produce one concatenated tile-major tensor.
 - [x] Add firmware helpers in `firmware/yolo_ops.c` that DMA-load two DDR blocks into one Act-SRAM concat layout, DMA-drain the result, and compare in software from `firmware/yolo_concat_smoke.c`.
 - [x] Run MNIST regression after the concat path is added.

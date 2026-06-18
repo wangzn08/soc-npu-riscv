@@ -452,7 +452,12 @@ def encode_ctrl_flags(flags: tuple[str, ...]) -> int:
 
 def render_block_plan_header(graph: YoloGraph) -> str:
     plans = build_block_plan(graph)
-    conv0_strips = build_strip_plan(graph)[0]
+    strip_plan = build_strip_plan(graph)
+    strip_offsets: dict[int, int] = {}
+    flat_strips: list[StripPlan] = []
+    for plan in plans:
+        strip_offsets[plan.idx] = len(flat_strips)
+        flat_strips.extend(strip_plan[plan.idx])
     lines = [
         "#ifndef YOLO_BLOCK_PLAN_H",
         "#define YOLO_BLOCK_PLAN_H",
@@ -460,6 +465,7 @@ def render_block_plan_header(graph: YoloGraph) -> str:
         "#include <stdint.h>",
         "",
         "#define YOLO_BLOCK_PLAN_COUNT 63u",
+        f"#define YOLO_STRIP_PLAN_COUNT {len(flat_strips)}u",
         "#define YOLO_PLAN_FLAG_PW_EN 0x00000001u",
         "#define YOLO_PLAN_FLAG_HW_PAD 0x00000002u",
         "#define YOLO_PLAN_FLAG_OC_SINGLE 0x00000004u",
@@ -481,6 +487,7 @@ def render_block_plan_header(graph: YoloGraph) -> str:
         "    uint8_t pad;",
         "    uint16_t strip_rows;",
         "    uint16_t strip_count;",
+        "    uint16_t strip_offset;",
         "    uint32_t input_ddr;",
         "    uint32_t output_ddr;",
         "    uint32_t weight_ddr;",
@@ -510,7 +517,7 @@ def render_block_plan_header(graph: YoloGraph) -> str:
             f"{{{plan.idx}u, {shape.in_w}u, {shape.in_h}u, {shape.in_c}u, "
             f"{shape.out_w}u, {shape.out_h}u, {shape.out_c}u, "
             f"{shape.layer.kh}u, {shape.layer.kw}u, {shape.layer.stride}u, {shape.layer.pad}u, "
-            f"{plan.strip_rows}u, {plan.strip_count}u, "
+            f"{plan.strip_rows}u, {plan.strip_count}u, {strip_offsets[plan.idx]}u, "
             f"0x{plan.input_ddr:08X}u, 0x{plan.output_ddr:08X}u, 0x{plan.weight_ddr:08X}u, "
             f"{plan.input_words}u, {plan.output_words}u, {plan.weight_words}u, "
             f"0x{flags:08X}u}},"
@@ -519,10 +526,10 @@ def render_block_plan_header(graph: YoloGraph) -> str:
         [
             "};",
             "",
-            "static const yolo_strip_plan_entry_t yolo_conv0_strip_plan[YOLO_CONV0_STRIP_PLAN_COUNT] = {",
+            "static const yolo_strip_plan_entry_t yolo_strip_plan[YOLO_STRIP_PLAN_COUNT] = {",
         ]
     )
-    for strip in conv0_strips:
+    for strip in flat_strips:
         lines.append(
             "    "
             f"{{{strip.strip_idx}u, {strip.out_y}u, {strip.out_rows}u, "
@@ -532,6 +539,8 @@ def render_block_plan_header(graph: YoloGraph) -> str:
     lines.extend(
         [
             "};",
+            "",
+            "#define yolo_conv0_strip_plan (&yolo_strip_plan[0])",
             "",
             "#endif",
             "",
