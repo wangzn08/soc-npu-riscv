@@ -225,7 +225,9 @@ static int run_pw_conv1x1_common(uint32_t act_base,
 {
     uint32_t ch;
 
-    if (in_w == 0u || in_h == 0u || in_c == 0u || out_c == 0u || out_c > 16u)
+    if (in_w == 0u || in_h == 0u || in_c == 0u || out_c == 0u || out_c > 64u)
+        return 0;
+    if (out_c > 16u && (ctrl_flags & NPU_CTRL_OC_SINGLE) == 0u)
         return 0;
 
     npu_wr(NPU_IN_W, in_w);
@@ -239,14 +241,13 @@ static int run_pw_conv1x1_common(uint32_t act_base,
     npu_wr(NPU_WGT_ADDR_A, wgt_base);
     npu_wr(NPU_OUT_ADDR_A, out_base);
 
-    for (ch = 0u; ch < 16u; ch++) {
-        uint32_t active = ch < out_c;
-        int32_t b = (active != 0u && bias != (const int32_t *)0) ? bias[ch] : 0;
+    for (ch = 0u; ch < out_c; ch++) {
+        int32_t b = bias != (const int32_t *)0 ? bias[ch] : 0;
         uint32_t mul = use_per_channel != 0u ? scale_mul[ch] : uniform_scale_mul;
         uint32_t sh = use_per_channel != 0u ? scale_shift[ch] : uniform_scale_shift;
         npu_wr(NPU_BIAS(ch), (uint32_t)b);
-        npu_wr(NPU_SCALE(ch), active != 0u ? mul : 0u);
-        npu_wr(NPU_SHIFT(ch), active != 0u ? sh : 0u);
+        npu_wr(NPU_SCALE(ch), mul);
+        npu_wr(NPU_SHIFT(ch), sh);
     }
 
     npu_irq_flag = 0u;
