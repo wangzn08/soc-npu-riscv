@@ -92,12 +92,18 @@ void usercode7(void);
 #define NPU_DMA_PING_SEL     (NPU_BASE + 0x14C)  // [0]=Act ping, [1]=Wgt ping, [2]=Out ping
 #define NPU_DMA_COPY_TRIG    (NPU_BASE + 0x154)  // write any value: trigger on-chip Out->Act copy (sram_copy)
 #define NPU_DMA_EXPAND_TRIG  (NPU_BASE + 0x158)  // write any value: trigger img_expand
+#define NPU_UPSAMPLE_CFG0    (NPU_BASE + 0x3C0)  // [31:16]in_h [15:0]in_w for shared Act-SRAM 2x upsample
+#define NPU_UPSAMPLE_CFG1    (NPU_BASE + 0x3C4)  // [15:0]ic_groups for shared Act-SRAM 2x upsample
+#define NPU_DMA_UPSAMPLE_TRIG (NPU_BASE + 0x3C8) // write any value: trigger upsample2x
+#define NPU_SILU_REQUANT_CFG (NPU_BASE + 0x3CC)  // [31:24]zp [21:16]shift [15:0]mul; optional SiLU output requant
+#define NPU_PAD_VALUE         (NPU_BASE + 0x3D0)  // [7:0] hardware padding fill byte, default 0
 
 // NPU_DMA_STATUS bits
 #define NPU_DMA_STATUS_RD_DONE     (1 << 0)
 #define NPU_DMA_STATUS_WR_DONE     (1 << 1)
 #define NPU_DMA_STATUS_COPY_DONE   (1 << 2)
 #define NPU_DMA_STATUS_EXPAND_DONE (1 << 3)
+#define NPU_DMA_STATUS_UPSAMPLE_DONE (1 << 4)
 
 // CTRL bits
 #define NPU_CTRL_START      (1 << 0)
@@ -118,6 +124,8 @@ void usercode7(void);
 #define NPU_CTRL_DW_EN       (1 << 15) // depthwise conv (channel-parallel MAC, array bypassed)
 #define NPU_CTRL_POOL_AVG    (1 << 16) // 2x2 average pooling (vs max); needs POOL_EN
 #define NPU_CTRL_GPOOL_EN    (1 << 17) // global average pooling (one mean word per OC tile)
+#define NPU_CTRL_SILU_EN     (1 << 18) // shared post-process SiLU LUT activation (default off)
+#define NPU_CTRL_SILU_REQUANT_EN (1 << 19) // optional SiLU Q4.4 -> output INT8 requant
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)

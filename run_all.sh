@@ -11,6 +11,13 @@
 #   bash run_all.sh waves    — 编译 + 仿真 + 波形
 #   bash run_all.sh clean    — 清理仿真产物
 #   bash run_all.sh distclean— 清理所有产物
+#
+# 可选:
+#   FW_USER_C=upsample2x_smoke.c bash run_all.sh sim
+#   bash run_all.sh sim upsample2x_smoke.c
+#       — 临时链接一个 CPU/NPU 协同 smoke 固件，默认仍为 deepnet_deploy.c
+#   bash run_all.sh sim yolo_concat_smoke.c yolo_ops.c
+#       — 用户入口后面的额外 C 文件会追加进固件链接
 # ============================================================
 
 set -e
@@ -40,12 +47,21 @@ export TMPDIR="$ROOT_DIR/tmp"
 mkdir -p "$TEMP"
 
 # ---- 固件源文件 ----
+# Optional second argument overrides the C file that defines usercode7().
+FW_USER_C="${2:-${FW_USER_C:-deepnet_deploy.c}}"
 FW_C_SRCS=(
     "$FW_DIR/irq.c"
     "$FW_DIR/print.c"
     "$FW_DIR/libgcc_stub.c"
-    "$FW_DIR/deepnet_deploy.c"
+    "$FW_DIR/$FW_USER_C"
 )
+FW_EXTRA_C_SRCS=()
+if [ "$#" -gt 2 ]; then
+    for extra_src in "${@:3}"; do
+        FW_EXTRA_C_SRCS+=("$extra_src")
+        FW_C_SRCS+=("$FW_DIR/$extra_src")
+    done
+fi
 FW_S_SRCS=(
     "$FW_DIR/start7.S"
 )
@@ -74,6 +90,10 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 # ============================================================
 compile_fw() {
     info "========== 编译固件 =========="
+    info "用户固件入口: $FW_USER_C"
+    if [ "${#FW_EXTRA_C_SRCS[@]}" -gt 0 ]; then
+        info "附加固件源: ${FW_EXTRA_C_SRCS[*]}"
+    fi
     mkdir -p "$BUILD_DIR"
 
     # CFLAGS

@@ -28,9 +28,17 @@ module tb_post_process_pool;
     reg [NUM_OC-1:0][31:0] i_scale_mul;
     reg [NUM_OC-1:0][5:0]  i_scale_shift;
     reg [15:0]             i_width;
-    reg                    i_pool_en, i_relu_en, i_start, i_in_drain, i_in_post;
+    reg                    i_pool_en, i_pool_avg, i_relu_en, i_silu_en, i_start, i_in_drain, i_in_post;
+    reg                    i_row_par_en;
+    reg [15:0]             i_group_size;
+    reg [3:0]              i_rows_per_grp;
+    reg [1:0]              i_oc_tile;
+    reg [7:0]              i_clip_max;
     wire [127:0]           o_feat;
     wire                   o_feat_vld;
+    wire [NUM_OC*32-1:0]   o_feat32;
+    wire [1:0]             o_pool_tile;
+    wire                   o_rp_pool_done;
 
     integer p, j, k, cap_idx = 0, feed_pulses = 0;
     reg [7:0] cap [0:63];
@@ -49,9 +57,16 @@ module tb_post_process_pool;
         .clk(clk), .rst_n(rst_n),
         .i_psum(i_psum), .i_psum_vld(i_psum_vld),
         .i_bias(i_bias), .i_scale_mul(i_scale_mul), .i_scale_shift(i_scale_shift),
-        .i_width(i_width), .i_pool_en(i_pool_en), .i_relu_en(i_relu_en),
+        .i_width(i_width), .i_pool_en(i_pool_en), .i_pool_avg(i_pool_avg),
+        .i_relu_en(i_relu_en), .i_silu_en(i_silu_en),
+        .i_silu_requant_en(1'b0), .i_silu_requant_mul(16'd0),
+        .i_silu_requant_shift(6'd0), .i_silu_requant_zp(8'd0),
+        .i_clip_max(i_clip_max),
         .i_start(i_start), .i_in_drain(i_in_drain), .i_in_post(i_in_post),
-        .o_feat(o_feat), .o_feat_vld(o_feat_vld)
+        .i_row_par_en(i_row_par_en), .i_group_size(i_group_size),
+        .i_rows_per_grp(i_rows_per_grp), .i_oc_tile(i_oc_tile),
+        .o_pool_tile(o_pool_tile), .o_rp_pool_done(o_rp_pool_done),
+        .o_feat(o_feat), .o_feat_vld(o_feat_vld), .o_feat32(o_feat32)
     );
 
     always @(posedge clk) if (rst_n && o_feat_vld && cap_idx < 64) begin
@@ -85,7 +100,8 @@ module tb_post_process_pool;
     initial begin
         for (p = 0; p < 16; p = p + 1) mapA[p] = p + 1;
         i_psum_vld = 0; i_in_drain = 0; i_in_post = 0; i_start = 0;
-        i_pool_en = 1; i_relu_en = 1; i_width = 16'd4;
+        i_pool_en = 1; i_pool_avg = 0; i_relu_en = 1; i_silu_en = 0; i_width = 16'd4;
+        i_row_par_en = 0; i_group_size = 1; i_rows_per_grp = 1; i_oc_tile = 0; i_clip_max = 8'd127;
         for (k = 0; k < NUM_OC; k = k + 1) begin
             i_bias[k] = 0; i_scale_mul[k] = 32'd1048576; i_scale_shift[k] = 6'd20; i_psum[k] = 0;
         end

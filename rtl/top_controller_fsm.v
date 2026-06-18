@@ -239,10 +239,14 @@ module top_controller_fsm #(
     assign gemm_act_addr = act_base_addr + {{(SRAM_ADDR_W-12){1'b0}}, ic_tile[15:4]};
 
     // Pointwise (1x1): read the pixel at (cur_oy, cur_ox) for the current IC tile
-    // directly from tile-major Act SRAM (no im2col). For 1x1, out_w==in_w.
-    wire [SRAM_ADDR_W-1:0] pw_pix_off = (cur_oy * i_dim_in_w + cur_ox) * ic_groups;
-    wire [SRAM_ADDR_W-1:0] pw_act_addr = act_base_addr + pw_pix_off
-                         + {{(SRAM_ADDR_W-12){1'b0}}, ic_tile[15:4]};
+    // directly from the same tile-major Act SRAM layout produced by conv/sram_copy:
+    //   addr = ic_group * spatial + pixel.
+    // IC=16 also worked with the old pixel-major formula, but IC>16 did not.
+    wire [SRAM_ADDR_W-1:0] pw_spatial = i_dim_in_w * i_dim_in_h;
+    wire [SRAM_ADDR_W-1:0] pw_pixel   = cur_oy * i_dim_in_w + cur_ox;
+    wire [SRAM_ADDR_W-1:0] pw_act_addr = act_base_addr
+                         + {{(SRAM_ADDR_W-12){1'b0}}, ic_tile[15:4]} * pw_spatial
+                         + pw_pixel;
 
     // Hardware padding: read the previous layer's UNPADDED output tile-major and
     // inject border zeros, so im2col sees the same padded stream as before but no
@@ -521,7 +525,12 @@ module top_controller_fsm #(
                         if (ic_tile + 16'd16 < i_dim_in_c) begin
                             // More IC tiles: accumulate across tiles, skip drain
                             ic_tile <= ic_tile + 16'd16;
-                            if (reuse_mode) begin
+                            if (i_pw_en) begin
+                                // Pointwise reads Act SRAM directly; each IC group
+                                // needs a fresh SRAM read even though weights are resident.
+                                state       <= S_PREFETCH_WGT;
+                                pf_wait_cnt <= 16'd0;
+                            end else if (reuse_mode) begin
                                 // Next ic_group already in wgt_buf; o_wgt_ic_sel
                                 // follows ic_tile — recompute directly, no prefetch.
                                 state <= S_CALC_KERNEL;

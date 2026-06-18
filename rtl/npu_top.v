@@ -130,6 +130,11 @@ module npu_top #(
     wire                            cfg_pw_en;
     wire                            cfg_dw_en;
     wire                            cfg_gpool_en;
+    wire                            cfg_silu_en;
+    wire                            cfg_silu_requant_en;
+    wire [15:0]                     cfg_silu_requant_mul;
+    wire [5:0]                      cfg_silu_requant_shift;
+    wire [7:0]                      cfg_silu_requant_zp;
     wire [31:0]                     cfg_gavg_mul;
     wire [5:0]                      cfg_gavg_shift;
     wire                            fsm_last_spatial;
@@ -147,12 +152,22 @@ module npu_top #(
     wire [3:0]                       fsm_rows_per_grp;   // #4: R output rows packed
     wire                            cfg_copy_trig;      // 0x154: on-chip copy trigger pulse
     wire                            cfg_expand_trig;    // 0x158: img_expand trigger pulse
+    wire                            cfg_upsample_trig;  // 0x3C8: upsample2x trigger pulse
+    wire [15:0]                     cfg_upsample_in_w;
+    wire [15:0]                     cfg_upsample_in_h;
+    wire [15:0]                     cfg_upsample_ic_groups;
     wire                            expand_done;
     wire                            expand_busy;
     wire [SRAM_ADDR_W-1:0]          expand_addr;
     wire                            expand_en;
     wire                            expand_we;
     wire [ACT_DATA_W-1:0]           expand_wdata;
+    wire                            upsample_done;
+    wire                            upsample_busy;
+    wire [SRAM_ADDR_W-1:0]          upsample_addr;
+    wire                            upsample_en;
+    wire                            upsample_we;
+    wire [ACT_DATA_W-1:0]           upsample_wdata;
     wire                            copy_done;
     wire                            copy_busy;
     wire [SRAM_ADDR_W-1:0]          copy_out_rd_addr;
@@ -162,6 +177,7 @@ module npu_top #(
     wire [ACT_DATA_W-1:0]           copy_act_wr_data;
     wire [7:0]                      cfg_pad_w;          // NPU_PAD[7:0]
     wire [7:0]                      cfg_pad_h;          // NPU_PAD[15:8]
+    wire [7:0]                      cfg_pad_value;      // NPU_PAD_VALUE[7:0]
     wire                            status_done_irq;
     wire                            status_busy;
     wire                            npu_done_irq;
@@ -300,10 +316,16 @@ module npu_top #(
         .o_pw_en          (cfg_pw_en),
         .o_dw_en          (cfg_dw_en),
         .o_gpool_en       (cfg_gpool_en),
+        .o_silu_en        (cfg_silu_en),
+        .o_silu_requant_en(cfg_silu_requant_en),
+        .o_silu_requant_mul(cfg_silu_requant_mul),
+        .o_silu_requant_shift(cfg_silu_requant_shift),
+        .o_silu_requant_zp(cfg_silu_requant_zp),
         .o_gavg_mul       (cfg_gavg_mul),
         .o_gavg_shift     (cfg_gavg_shift),
         .o_pad_w          (cfg_pad_w),
         .o_pad_h          (cfg_pad_h),
+        .o_pad_value      (cfg_pad_value),
         .o_clip_max       (cfg_clip_max),
         .o_skip_base      (cfg_skip_base),
         .i_done_irq       (status_done_irq),
@@ -358,6 +380,11 @@ module npu_top #(
         .i_copy_done       (copy_done),
         .o_expand_trig     (cfg_expand_trig),
         .i_expand_done     (expand_done),
+        .o_upsample_trig   (cfg_upsample_trig),
+        .i_upsample_done   (upsample_done),
+        .o_upsample_in_w   (cfg_upsample_in_w),
+        .o_upsample_in_h   (cfg_upsample_in_h),
+        .o_upsample_ic_groups(cfg_upsample_ic_groups),
         .i_perf_busy       (fsm_busy),
         .i_perf_arr_active (fsm_array_vld),
         .i_perf_rd_beat    (perf_rd_beat),
@@ -734,9 +761,9 @@ module npu_top #(
         end
     end
 
-    // hw-pad: inject zero for border pixels (aligned with the delayed pixel data)
+    // hw-pad: inject configured border byte (default 0, YOLO uses input zero-point).
     wire [ACT_DATA_W-1:0] im2col_pixel_data_mux =
-        fsm_border_d ? {ACT_DATA_W{1'b0}} : fsm_im2col_pixel_data;
+        fsm_border_d ? {16{cfg_pad_value}} : fsm_im2col_pixel_data;
 
     im2col_line_buffer #(
         .MAX_WIDTH   (MAX_WIDTH),
@@ -951,6 +978,11 @@ module npu_top #(
         .i_pool_en     (cfg_pool_en),
         .i_pool_avg    (cfg_pool_avg),
         .i_relu_en     (cfg_relu_en),
+        .i_silu_en     (cfg_silu_en),
+        .i_silu_requant_en(cfg_silu_requant_en),
+        .i_silu_requant_mul(cfg_silu_requant_mul),
+        .i_silu_requant_shift(cfg_silu_requant_shift),
+        .i_silu_requant_zp(cfg_silu_requant_zp),
         .i_clip_max    (cfg_clip_max),
         .i_in_drain    (fsm_in_drain),
         .i_in_post     (fsm_in_post),
@@ -1229,16 +1261,20 @@ module npu_top #(
     wire act_dma_wr_active = dma_sram_wr_en & ~cfg_dma_sram_sel;
     wire act_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd1);
 
-    // img_expand / sram_copy take Act Port B while busy; else DMA muxes.
+    // img_expand / upsample2x / sram_copy take Act Port B while busy; else DMA muxes.
     assign act_sram_addrb = expand_busy ? expand_addr
+                          : upsample_busy ? upsample_addr
                           : copy_busy ? copy_act_wr_addr
                           : act_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
     assign act_sram_enb   = expand_busy ? expand_en
+                          : upsample_busy ? upsample_en
                           : copy_busy ? copy_act_wr_en
                           : (act_dma_wr_active | act_dma_rd_active);
     assign act_sram_dib   = expand_busy ? expand_wdata
+                          : upsample_busy ? upsample_wdata
                           : copy_busy ? copy_act_wr_data : dma_sram_wr_data;
     assign act_sram_web   = expand_busy ? expand_we
+                          : upsample_busy ? upsample_we
                           : copy_busy ? copy_act_wr_en : act_dma_wr_active;
 
     // Wgt SRAM Port B: DMA writes (sel=1) or DMA reads (rd_sram_sel=2)
@@ -1336,6 +1372,32 @@ module npu_top #(
         .i_rdata    (act_sram_dob),
         .o_busy     (expand_busy),
         .o_done     (expand_done)
+    );
+
+    // ===================================================================
+    // Shared Act-SRAM 2x nearest-neighbor upsample engine for YOLO FPN/PAN.
+    // Source/destination bases reuse the DMA SRAM-base registers; dimensions
+    // come from NPU_UPSAMPLE_CFG*. Same hardware path, default idle for MNIST.
+    // ===================================================================
+    upsample2x #(
+        .ADDR_W (SRAM_ADDR_W),
+        .DATA_W (ACT_DATA_W)
+    ) u_upsample2x (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .i_trig      (cfg_upsample_trig),
+        .i_src_base  (cfg_dma_rd_sram_base),
+        .i_dst_base  (cfg_dma_wr_sram_base),
+        .i_in_w      (cfg_upsample_in_w),
+        .i_in_h      (cfg_upsample_in_h),
+        .i_ic_groups (cfg_upsample_ic_groups),
+        .o_addr      (upsample_addr),
+        .o_en        (upsample_en),
+        .o_we        (upsample_we),
+        .o_wdata     (upsample_wdata),
+        .i_rdata     (act_sram_dob),
+        .o_busy      (upsample_busy),
+        .o_done      (upsample_done)
     );
 
     // ===================================================================

@@ -35,6 +35,11 @@ module post_process_top #(
     input  wire                             i_pool_en,
     input  wire                             i_pool_avg,   // 0=max pool (legacy), 1=2x2 average pool
     input  wire                             i_relu_en,
+    input  wire                             i_silu_en,    // YOLO SiLU LUT path (default-off via CTRL[18])
+    input  wire                             i_silu_requant_en, // optional SiLU Q4.4 -> output INT8 requant
+    input  wire [15:0]                      i_silu_requant_mul,
+    input  wire [5:0]                       i_silu_requant_shift,
+    input  wire [7:0]                       i_silu_requant_zp,
     input  wire [7:0]                       i_clip_max,   // upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
 
     // Pooling state control (from FSM)
@@ -121,8 +126,16 @@ module post_process_top #(
     end
 
     // -------------------------------------------------------------------
-    // Stage 3: ReLU + clamp to [0, 127]
+    // Stage 3: activation (legacy ReLU/clip or YOLO SiLU LUT)
     // -------------------------------------------------------------------
+    localparam signed [PSUM_WIDTH-1:0] SILU_IN_MIN = -128;
+    localparam signed [PSUM_WIDTH-1:0] SILU_IN_MAX =  127;
+
+    reg [ACT_WIDTH-1:0] silu_lut [0:255];
+    initial begin
+        $readmemh("rtl/silu_lut_q4_4.hex", silu_lut);
+    end
+
     reg [DATA_W-1:0] s3_act;
     reg              s3_vld;
 
@@ -131,12 +144,28 @@ module post_process_top #(
             wire [PSUM_WIDTH-1:0] s2_val = s2_quant[gi];
             wire is_neg  = s2_val[PSUM_WIDTH-1];  // sign bit
             wire is_gt   = (s2_val > {24'd0, i_clip_max});  // exceeds configurable upper clamp
+            wire signed [PSUM_WIDTH-1:0] s2_signed = $signed(s2_quant[gi]);
+            wire signed [7:0] silu_sat = (s2_signed < SILU_IN_MIN) ? 8'sh80 :
+                                         (s2_signed > SILU_IN_MAX) ? 8'sh7f :
+                                                                     s2_signed[7:0];
+            wire [ACT_WIDTH-1:0] silu_val = silu_lut[silu_sat[7:0]];
+            wire signed [7:0] silu_signed = $signed(silu_val);
+            wire signed [31:0] silu_rq_prod = $signed({{24{silu_signed[7]}}, silu_signed})
+                                            * $signed({16'd0, i_silu_requant_mul});
+            wire signed [31:0] silu_rq_shifted = silu_rq_prod >>> i_silu_requant_shift;
+            wire signed [31:0] silu_rq_biased = silu_rq_shifted + $signed({{24{i_silu_requant_zp[7]}}, i_silu_requant_zp});
+            wire [ACT_WIDTH-1:0] silu_requant_val =
+                (silu_rq_biased < -32'sd128) ? 8'h80 :
+                (silu_rq_biased >  32'sd127) ? 8'h7f :
+                                                silu_rq_biased[7:0];
 
             wire [ACT_WIDTH-1:0] act_val;
             // When relu_en: negative→0, >clip_max→clip_max, else pass through
             // When !relu_en: only clamp >clip_max→clip_max, keep negative values
             // clip_max defaults to 127 (legacy ReLU); set lower for ReLU6.
-            assign act_val = (i_relu_en && is_neg) ? {ACT_WIDTH{1'b0}} :
+            assign act_val = (i_silu_en && i_silu_requant_en) ? silu_requant_val :
+                             i_silu_en             ? silu_val :
+                             (i_relu_en && is_neg) ? {ACT_WIDTH{1'b0}} :
                              is_gt                 ? i_clip_max :
                                                      s2_val[ACT_WIDTH-1:0];
 
