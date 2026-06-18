@@ -9,6 +9,7 @@
 #define YOLO_PLAN_FLAG_OC_SINGLE 0x00000004u
 #define YOLO_PLAN_FLAG_SILU 0x00000008u
 #define YOLO_PLAN_FLAG_SILU_REQUANT 0x00000010u
+#define YOLO_CONV0_STRIP_PLAN_COUNT 40u
 
 typedef struct {
     uint8_t idx;
@@ -32,6 +33,16 @@ typedef struct {
     uint32_t weight_words;
     uint32_t flags;
 } yolo_block_plan_entry_t;
+
+typedef struct {
+    uint16_t strip_idx;
+    uint16_t out_y;
+    uint16_t out_rows;
+    uint16_t in_y;
+    uint16_t in_rows;
+    uint8_t top_pad_rows;
+    uint8_t bottom_pad_rows;
+} yolo_strip_plan_entry_t;
 
 static const yolo_block_plan_entry_t yolo_block_plan[YOLO_BLOCK_PLAN_COUNT] = {
     {0u, 640u, 640u, 3u, 320u, 320u, 16u, 3u, 3u, 2u, 1u, 8u, 40u, 0x40000000u, 0x41000000u, 0x48000000u, 409600u, 102400u, 144u, 0x0000001Au},
@@ -97,6 +108,49 @@ static const yolo_block_plan_entry_t yolo_block_plan[YOLO_BLOCK_PLAN_COUNT] = {
     {60u, 20u, 20u, 80u, 20u, 20u, 80u, 3u, 3u, 1u, 1u, 16u, 2u, 0x425EC800u, 0x425FA900u, 0x482EFF00u, 2000u, 2000u, 3600u, 0x0000001Eu},
     {61u, 20u, 20u, 64u, 20u, 20u, 64u, 1u, 1u, 1u, 0u, 16u, 2u, 0x425F4500u, 0x42602600u, 0x482FE000u, 1600u, 1600u, 256u, 0x0000001Du},
     {62u, 20u, 20u, 80u, 20u, 20u, 80u, 1u, 1u, 1u, 0u, 16u, 2u, 0x425FA900u, 0x42608A00u, 0x482FF000u, 2000u, 2000u, 400u, 0x0000001Du},
+};
+
+static const yolo_strip_plan_entry_t yolo_conv0_strip_plan[YOLO_CONV0_STRIP_PLAN_COUNT] = {
+    {0u, 0u, 8u, 0u, 16u, 1u, 0u},
+    {1u, 8u, 8u, 15u, 17u, 0u, 0u},
+    {2u, 16u, 8u, 31u, 17u, 0u, 0u},
+    {3u, 24u, 8u, 47u, 17u, 0u, 0u},
+    {4u, 32u, 8u, 63u, 17u, 0u, 0u},
+    {5u, 40u, 8u, 79u, 17u, 0u, 0u},
+    {6u, 48u, 8u, 95u, 17u, 0u, 0u},
+    {7u, 56u, 8u, 111u, 17u, 0u, 0u},
+    {8u, 64u, 8u, 127u, 17u, 0u, 0u},
+    {9u, 72u, 8u, 143u, 17u, 0u, 0u},
+    {10u, 80u, 8u, 159u, 17u, 0u, 0u},
+    {11u, 88u, 8u, 175u, 17u, 0u, 0u},
+    {12u, 96u, 8u, 191u, 17u, 0u, 0u},
+    {13u, 104u, 8u, 207u, 17u, 0u, 0u},
+    {14u, 112u, 8u, 223u, 17u, 0u, 0u},
+    {15u, 120u, 8u, 239u, 17u, 0u, 0u},
+    {16u, 128u, 8u, 255u, 17u, 0u, 0u},
+    {17u, 136u, 8u, 271u, 17u, 0u, 0u},
+    {18u, 144u, 8u, 287u, 17u, 0u, 0u},
+    {19u, 152u, 8u, 303u, 17u, 0u, 0u},
+    {20u, 160u, 8u, 319u, 17u, 0u, 0u},
+    {21u, 168u, 8u, 335u, 17u, 0u, 0u},
+    {22u, 176u, 8u, 351u, 17u, 0u, 0u},
+    {23u, 184u, 8u, 367u, 17u, 0u, 0u},
+    {24u, 192u, 8u, 383u, 17u, 0u, 0u},
+    {25u, 200u, 8u, 399u, 17u, 0u, 0u},
+    {26u, 208u, 8u, 415u, 17u, 0u, 0u},
+    {27u, 216u, 8u, 431u, 17u, 0u, 0u},
+    {28u, 224u, 8u, 447u, 17u, 0u, 0u},
+    {29u, 232u, 8u, 463u, 17u, 0u, 0u},
+    {30u, 240u, 8u, 479u, 17u, 0u, 0u},
+    {31u, 248u, 8u, 495u, 17u, 0u, 0u},
+    {32u, 256u, 8u, 511u, 17u, 0u, 0u},
+    {33u, 264u, 8u, 527u, 17u, 0u, 0u},
+    {34u, 272u, 8u, 543u, 17u, 0u, 0u},
+    {35u, 280u, 8u, 559u, 17u, 0u, 0u},
+    {36u, 288u, 8u, 575u, 17u, 0u, 0u},
+    {37u, 296u, 8u, 591u, 17u, 0u, 0u},
+    {38u, 304u, 8u, 607u, 17u, 0u, 0u},
+    {39u, 312u, 8u, 623u, 17u, 0u, 0u},
 };
 
 #endif

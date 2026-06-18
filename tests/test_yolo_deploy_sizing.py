@@ -99,6 +99,19 @@ def test_block_plan_header_is_firmware_consumable():
     )
 
 
+def test_block_plan_header_exports_conv0_strip_table():
+    layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
+    graph = build_yolov8n_graph(layers, input_h=640, input_w=640)
+    header = render_block_plan_header(graph)
+
+    assert "#define YOLO_CONV0_STRIP_PLAN_COUNT 40u" in header
+    assert "typedef struct" in header
+    assert "static const yolo_strip_plan_entry_t yolo_conv0_strip_plan" in header
+    assert "{0u, 0u, 8u, 0u, 16u, 1u, 0u}," in header
+    assert "{1u, 8u, 8u, 15u, 17u, 0u, 0u}," in header
+    assert "{39u, 312u, 8u, 623u, 17u, 0u, 0u}," in header
+
+
 def test_strip_plan_tracks_conv0_halo_rows():
     layers = parse_layers(ROOT / "yolov8n_int8" / "yolov8n_layers.h")
     graph = build_yolov8n_graph(layers, input_h=640, input_w=640)
@@ -130,5 +143,6 @@ if __name__ == "__main__":
     test_strip_budget_and_summary_are_plausible()
     test_block_plan_emits_scheduler_addresses_and_flags()
     test_block_plan_header_is_firmware_consumable()
+    test_block_plan_header_exports_conv0_strip_table()
     test_strip_plan_tracks_conv0_halo_rows()
     print("PASS: yolo_deploy_sizing")

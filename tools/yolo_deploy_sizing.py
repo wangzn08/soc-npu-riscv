@@ -452,6 +452,7 @@ def encode_ctrl_flags(flags: tuple[str, ...]) -> int:
 
 def render_block_plan_header(graph: YoloGraph) -> str:
     plans = build_block_plan(graph)
+    conv0_strips = build_strip_plan(graph)[0]
     lines = [
         "#ifndef YOLO_BLOCK_PLAN_H",
         "#define YOLO_BLOCK_PLAN_H",
@@ -464,6 +465,7 @@ def render_block_plan_header(graph: YoloGraph) -> str:
         "#define YOLO_PLAN_FLAG_OC_SINGLE 0x00000004u",
         "#define YOLO_PLAN_FLAG_SILU 0x00000008u",
         "#define YOLO_PLAN_FLAG_SILU_REQUANT 0x00000010u",
+        "#define YOLO_CONV0_STRIP_PLAN_COUNT 40u",
         "",
         "typedef struct {",
         "    uint8_t idx;",
@@ -488,6 +490,16 @@ def render_block_plan_header(graph: YoloGraph) -> str:
         "    uint32_t flags;",
         "} yolo_block_plan_entry_t;",
         "",
+        "typedef struct {",
+        "    uint16_t strip_idx;",
+        "    uint16_t out_y;",
+        "    uint16_t out_rows;",
+        "    uint16_t in_y;",
+        "    uint16_t in_rows;",
+        "    uint8_t top_pad_rows;",
+        "    uint8_t bottom_pad_rows;",
+        "} yolo_strip_plan_entry_t;",
+        "",
         "static const yolo_block_plan_entry_t yolo_block_plan[YOLO_BLOCK_PLAN_COUNT] = {",
     ]
     for plan in plans:
@@ -502,6 +514,20 @@ def render_block_plan_header(graph: YoloGraph) -> str:
             f"0x{plan.input_ddr:08X}u, 0x{plan.output_ddr:08X}u, 0x{plan.weight_ddr:08X}u, "
             f"{plan.input_words}u, {plan.output_words}u, {plan.weight_words}u, "
             f"0x{flags:08X}u}},"
+        )
+    lines.extend(
+        [
+            "};",
+            "",
+            "static const yolo_strip_plan_entry_t yolo_conv0_strip_plan[YOLO_CONV0_STRIP_PLAN_COUNT] = {",
+        ]
+    )
+    for strip in conv0_strips:
+        lines.append(
+            "    "
+            f"{{{strip.strip_idx}u, {strip.out_y}u, {strip.out_rows}u, "
+            f"{strip.in_y}u, {strip.in_rows}u, "
+            f"{strip.top_pad_rows}u, {strip.bottom_pad_rows}u}},"
         )
     lines.extend(
         [
