@@ -310,9 +310,34 @@ int yolo_run_conv2d_qparams(uint32_t act_base,
                             const uint32_t *scale_shift,
                             uint32_t ctrl_flags)
 {
+    return yolo_run_conv2d_qparams_pads(act_base, wgt_base, out_base,
+                                        in_w, in_h, in_c, out_c,
+                                        kernel_h, kernel_w, stride,
+                                        pad, pad,
+                                        bias, scale_mul, scale_shift,
+                                        ctrl_flags);
+}
+
+int yolo_run_conv2d_qparams_pads(uint32_t act_base,
+                                 uint32_t wgt_base,
+                                 uint32_t out_base,
+                                 uint32_t in_w,
+                                 uint32_t in_h,
+                                 uint32_t in_c,
+                                 uint32_t out_c,
+                                 uint32_t kernel_h,
+                                 uint32_t kernel_w,
+                                 uint32_t stride,
+                                 uint32_t pad_h,
+                                 uint32_t pad_w,
+                                 const int32_t *bias,
+                                 const uint32_t *scale_mul,
+                                 const uint32_t *scale_shift,
+                                 uint32_t ctrl_flags)
+{
     uint32_t ch;
-    uint32_t cfg_w = in_w + pad * 2u;
-    uint32_t cfg_h = in_h + pad * 2u;
+    uint32_t cfg_w = in_w + pad_w * 2u;
+    uint32_t cfg_h = in_h + pad_h * 2u;
 
     if (in_w == 0u || in_h == 0u || in_c == 0u || out_c == 0u ||
         out_c > 64u || kernel_h == 0u || kernel_w == 0u ||
@@ -329,7 +354,7 @@ int yolo_run_conv2d_qparams(uint32_t act_base,
     npu_wr(NPU_OC, out_c);
     npu_wr(NPU_KERNEL, (kernel_h << 8) | kernel_w);
     npu_wr(NPU_STRIDE, (stride << 8) | stride);
-    npu_wr(NPU_PAD, (pad << 8) | pad);
+    npu_wr(NPU_PAD, (pad_h << 8) | pad_w);
     npu_wr(NPU_ACT_ADDR_A, act_base);
     npu_wr(NPU_WGT_ADDR_A, wgt_base);
     npu_wr(NPU_OUT_ADDR_A, out_base);
