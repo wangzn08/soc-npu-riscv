@@ -211,6 +211,12 @@ void yolo_set_pad_value(int32_t pad_value)
     npu_wr(NPU_PAD_VALUE, (uint32_t)pad_value & 0xFFu);
 }
 
+void yolo_set_eltwise(int32_t zp, uint32_t skip_base)
+{
+    npu_wr(NPU_ELTWISE_ZP, (uint32_t)zp & 0xFFu);
+    npu_wr(NPU_SKIP_BASE, skip_base);
+}
+
 static int wait_npu_done(void)
 {
     uint32_t timeout = YOLO_NPU_TIMEOUT;

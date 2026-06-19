@@ -127,6 +127,8 @@ module npu_top #(
     wire [7:0]                      cfg_clip_max;
     wire                            cfg_pool_avg;
     wire [SRAM_ADDR_W-1:0]          cfg_skip_base;
+    wire                            cfg_elt_signed;
+    wire [7:0]                      cfg_elt_zp;
     wire                            cfg_pw_en;
     wire                            cfg_dw_en;
     wire                            cfg_gpool_en;
@@ -328,6 +330,8 @@ module npu_top #(
         .o_pad_value      (cfg_pad_value),
         .o_clip_max       (cfg_clip_max),
         .o_skip_base      (cfg_skip_base),
+        .o_elt_signed     (cfg_elt_signed),
+        .o_elt_zp         (cfg_elt_zp),
         .i_done_irq       (status_done_irq),
         .i_busy           (status_busy),
         .i_dma_rd_err     (dma_rd_err),
@@ -1012,6 +1016,8 @@ module npu_top #(
         .i_conv_res    (pp_feat),
         .i_skip_res    (out_sram_dob),         // Skip data from Out SRAM Port B
         .i_eltwise_en  (cfg_eltwise_en),
+        .i_signed_mode (cfg_elt_signed),
+        .i_elt_zp      (cfg_elt_zp),
         .i_vld         (pp_feat_vld),
         .o_res         (alu_res),
         .o_vld         (alu_vld)

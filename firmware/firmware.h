@@ -97,6 +97,7 @@ void usercode7(void);
 #define NPU_DMA_UPSAMPLE_TRIG (NPU_BASE + 0x3C8) // write any value: trigger upsample2x
 #define NPU_SILU_REQUANT_CFG (NPU_BASE + 0x3CC)  // [31:24]zp [21:16]shift [15:0]mul; optional SiLU output requant
 #define NPU_PAD_VALUE         (NPU_BASE + 0x3D0)  // [7:0] hardware padding fill byte, default 0
+#define NPU_ELTWISE_ZP        (NPU_BASE + 0x3D4)  // [7:0] glue zero-point for signed eltwise add (CTRL[20])
 
 // NPU_DMA_STATUS bits
 #define NPU_DMA_STATUS_RD_DONE     (1 << 0)
@@ -126,6 +127,7 @@ void usercode7(void);
 #define NPU_CTRL_GPOOL_EN    (1 << 17) // global average pooling (one mean word per OC tile)
 #define NPU_CTRL_SILU_EN     (1 << 18) // shared post-process SiLU LUT activation (default off)
 #define NPU_CTRL_SILU_REQUANT_EN (1 << 19) // optional SiLU Q4.4 -> output INT8 requant
+#define NPU_CTRL_ELT_SIGNED  (1 << 20) // signed INT8 + zero-point eltwise add (YOLO C2f residual)
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)

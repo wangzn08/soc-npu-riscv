@@ -28,6 +28,7 @@ int yolo_run_upsample2x(uint32_t src_act_base,
                         uint32_t ic_groups);
 void yolo_set_silu_requant(uint32_t mul, uint32_t shift, int32_t zp);
 void yolo_set_pad_value(int32_t pad_value);
+void yolo_set_eltwise(int32_t zp, uint32_t skip_base);
 int yolo_run_conv2d_qparams(uint32_t act_base,
                             uint32_t wgt_base,
                             uint32_t out_base,

@@ -105,6 +105,8 @@ module param_regfile #(
     output wire [7:0]                   o_pad_value,     // NPU_PAD_VALUE: border fill byte, default 0
     output wire [7:0]                   o_clip_max,      // NPU_CLIP_MAX (0x118): post-process upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
     output wire [SRAM_ADDR_W-1:0]       o_skip_base,     // NPU_SKIP_BASE (0x11C): residual skip source Out-SRAM base (0 = same-addr legacy)
+    output wire                         o_elt_signed,    // CTRL[20]: signed INT8 + zero-point eltwise add (YOLO C2f residual)
+    output wire [7:0]                   o_elt_zp,        // NPU_ELTWISE_ZP (0x3D4): glue zero-point for signed eltwise add
 
     // Status
     input  wire                         i_done_irq,
@@ -231,6 +233,8 @@ module param_regfile #(
     reg [7:0]  pad_value;       // NPU_PAD_VALUE: hardware padding fill byte
     reg [7:0]  clip_max;        // NPU_CLIP_MAX: post-process upper clamp value
     reg [SRAM_ADDR_W-1:0] skip_base;  // NPU_SKIP_BASE: residual skip source base
+    reg        ctrl_elt_signed;       // CTRL[20]: signed INT8 + zero-point eltwise add
+    reg [7:0]  elt_zp;                // NPU_ELTWISE_ZP: glue zero-point for signed eltwise
 
     // Status
     wire       status_done;
@@ -366,6 +370,8 @@ module param_regfile #(
             pad_value       <= 8'd0;
             clip_max        <= 8'd127;   // default = legacy ReLU clamp [0,127]
             skip_base       <= {SRAM_ADDR_W{1'b0}};  // default 0 = same-addr legacy residual
+            ctrl_elt_signed <= 1'b0;   // default 0 = legacy unsigned eltwise (MNIST byte-identical)
+            elt_zp          <= 8'd0;
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
             act_addr_pong   <= {SRAM_ADDR_W{1'b0}};
             wgt_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -454,6 +460,7 @@ module param_regfile #(
                         ctrl_gpool_en    <= s_axi_wdata[17];
                         ctrl_silu_en     <= s_axi_wdata[18];
                         ctrl_silu_requant_en <= s_axi_wdata[19];
+                        ctrl_elt_signed  <= s_axi_wdata[20];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -555,6 +562,7 @@ module param_regfile #(
                         silu_requant_zp    <= s_axi_wdata[31:24];
                     end
                     10'h3D0: pad_value <= s_axi_wdata[7:0];   // NPU_PAD_VALUE
+                    10'h3D4: elt_zp    <= s_axi_wdata[7:0];   // NPU_ELTWISE_ZP
 
                     default: ; // Ignore unmapped addresses
                 endcase
@@ -620,7 +628,7 @@ module param_regfile #(
             if (s_axi_arvalid && s_axi_arready && !rvalid) begin
                 rvalid <= 1'b1;
                 case (s_axi_araddr[ADDR_W-1:0])
-                    10'h00: rdata <= {12'd0, ctrl_silu_requant_en, ctrl_silu_en, ctrl_gpool_en, ctrl_pool_avg, ctrl_dw_en, ctrl_pw_en, ctrl_int32_out, ctrl_oc_single, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
+                    10'h00: rdata <= {11'd0, ctrl_elt_signed, ctrl_silu_requant_en, ctrl_silu_en, ctrl_gpool_en, ctrl_pool_avg, ctrl_dw_en, ctrl_pw_en, ctrl_int32_out, ctrl_oc_single, ctrl_row_block, ctrl_gemm_reduce, ctrl_row_par, ctrl_hw_pad, ctrl_gemm_en, ctrl_out_ping, ctrl_relu_en, ctrl_clear_done, ctrl_eltwise_en, ctrl_pool_en, ctrl_ping_pong, ctrl_start};
                     10'h04: rdata <= {28'd0, i_dma_wr_err, i_dma_rd_err, i_busy, done_irq_latched};
                     10'h08: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_ping};
                     10'h0C: rdata <= {{(32-SRAM_ADDR_W){1'b0}}, act_addr_pong};
@@ -686,6 +694,7 @@ module param_regfile #(
                     10'h3C4: rdata <= {16'd0, upsample_ic_groups};
                     10'h3CC: rdata <= {silu_requant_zp, 2'd0, silu_requant_shift, silu_requant_mul};
                     10'h3D0: rdata <= {24'd0, pad_value};
+                    10'h3D4: rdata <= {24'd0, elt_zp};
 
                     default: rdata <= 32'd0;
                 endcase
@@ -747,6 +756,8 @@ module param_regfile #(
     assign o_pad_value    = pad_value;
     assign o_clip_max     = clip_max;
     assign o_skip_base    = skip_base;
+    assign o_elt_signed   = ctrl_elt_signed;
+    assign o_elt_zp       = elt_zp;
     assign o_clear_done   = ctrl_clear_done;
 
     assign o_act_addr_ping = act_addr_ping;

@@ -112,6 +112,19 @@
 - [x] Run conv0 first four strips into a real conv1 strip, then feed conv1 output into real conv2 1x1 pointwise through the shared NPU path.
 - [x] Add CPU/DMA channel-group slicing and run `conv0 -> conv1 -> conv2 -> slice(s1) -> conv3`, matching the first C2f branch.
 - [x] Run `conv0 -> conv1 -> conv2 -> slice(s1) -> conv3 -> conv4`, closing the first C2f bottleneck branch.
+- [x] Add shared HW signed+zero-point eltwise residual add (`vector_alu`
+  `i_signed_mode`/`i_elt_zp`, `CTRL[20] elt_signed`, `NPU_ELTWISE_ZP` 0x3D4) for
+  the C2f shortcut; directed `tb_vector_alu_signed` 8/8, MNIST byte-identical.
+  See `plans/2026-06-19-yolov8n-c2f-residual-add-m5u.md`.
+- [x] M5u: stage `s1` requantized to the glue scale into Out SRAM (extra conv2
+  group-1 SiLU-requant pass), run conv4's eltwise residual pass, and compare
+  `s1 + conv4` against the `/model.2/m.0/Add` golden. Smoke PASS, MNIST 10/10
+  preserved.
+- [x] M5v: `concat(s0, s1, add_out) -> conv5` fully closes the first C2f block.
+  Three pieces integer-requantized (CPU) to conv5 in-scale (/model.2/Concat),
+  concatenated tile-major, conv5 (1x1, 48->32) on the shared NPU. Smoke
+  `yolo_c2f_close_m5v_smoke.c` PASS (TRAP 41,787,525); no RTL change so MNIST
+  10/10 preserved. tools/gen_yolo_c2f_close_m5v_smoke.py.
 - [x] Run MNIST regression.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
