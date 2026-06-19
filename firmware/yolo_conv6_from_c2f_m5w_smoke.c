@@ -71,99 +71,20 @@ void usercode7(void)
         errors++;
     }
 
-    // DIAGNOSTIC: global error histogram across all (pos,oc).
-    {
-        uint32_t n0 = 0u, n5 = 0u, n10 = 0u, n30 = 0u, n60 = 0u, ntot = 0u;
+    for (pos = 0u; pos < YOLO_CONV6_OUT_SPATIAL && errors <= 16u; pos++) {
         for (oc = 0u; oc < YOLO_CONV6_OC; oc++) {
-            for (pos = 0u; pos < YOLO_CONV6_OUT_SPATIAL; pos++) {
-                int32_t got = read_ddr_s8(C6_OUT_DDR, (oc >> 4) * YOLO_CONV6_OUT_SPATIAL + pos, oc & 15u);
-                int32_t expect = s8(yolo_conv6_expected_rtl[pos][oc]);
-                uint32_t d = abs_diff(got, expect);
-                ntot++;
-                if (d == 0u) n0++;
-                else if (d <= 5u) n5++;
-                else if (d <= 10u) n10++;
-                else if (d <= 30u) n30++;
-                else if (d <= 60u) n60++;
-                else errors++;  // >60
+            // tile-major: word = (oc/16)*OUT_SPATIAL + pos, byte = oc%16
+            int32_t got = read_ddr_s8(C6_OUT_DDR, (oc >> 4) * YOLO_CONV6_OUT_SPATIAL + pos, oc & 15u);
+            int32_t expect = s8(yolo_conv6_expected_rtl[pos][oc]);
+            if (abs_diff(got, expect) > YOLO_CONV6_RTL_TOL) {
+                errors++;
+                print_str("  mismatch pos="); print_dec(pos);
+                print_str(" oc="); print_dec(oc);
+                print_str(" got="); print_dec(got);
+                print_str(" exp="); print_dec(expect); print_str("\n");
+                if (errors > 16u) break;
             }
         }
-        print_str("HIST total="); print_dec(ntot);
-        print_str(" eq0="); print_dec(n0);
-        print_str(" le5="); print_dec(n5);
-        print_str(" le10="); print_dec(n10);
-        print_str(" le30="); print_dec(n30);
-        print_str(" le60="); print_dec(n60);
-        print_str(" gt60="); print_dec(errors); print_str("\n");
-    }
-
-    // DIAGNOSTIC: exact-rate per output row (probe vertical stride bug).
-    {
-        uint32_t oy;
-        for (oy = 0u; oy < YOLO_CONV6_OUT_H; oy++) {
-            uint32_t eq = 0u, tot = 0u;
-            for (oc = 0u; oc < YOLO_CONV6_OC; oc++) {
-                uint32_t ox;
-                for (ox = 0u; ox < YOLO_CONV6_OUT_W; ox++) {
-                    uint32_t p = oy * YOLO_CONV6_OUT_W + ox;
-                    int32_t got = read_ddr_s8(C6_OUT_DDR, (oc >> 4) * YOLO_CONV6_OUT_SPATIAL + p, oc & 15u);
-                    int32_t e = s8(yolo_conv6_expected_rtl[p][oc]);
-                    tot++;
-                    if (abs_diff(got, e) <= 2u) eq++;
-                }
-            }
-            print_str("row "); print_dec(oy);
-            print_str(" exact<=2: "); print_dec(eq);
-            print_str("/"); print_dec(tot); print_str("\n");
-        }
-    }
-
-    // DIAGNOSTIC: exact-rate per output COLUMN ox=0..15 (probe horizontal stride).
-    {
-        uint32_t ox;
-        for (ox = 0u; ox < 16u; ox++) {
-            uint32_t eq = 0u, tot = 0u, oy;
-            for (oc = 0u; oc < YOLO_CONV6_OC; oc++) {
-                for (oy = 0u; oy < YOLO_CONV6_OUT_H; oy++) {
-                    uint32_t p = oy * YOLO_CONV6_OUT_W + ox;
-                    int32_t got = read_ddr_s8(C6_OUT_DDR, (oc >> 4) * YOLO_CONV6_OUT_SPATIAL + p, oc & 15u);
-                    int32_t e = s8(yolo_conv6_expected_rtl[p][oc]);
-                    tot++;
-                    if (abs_diff(got, e) <= 2u) eq++;
-                }
-            }
-            print_str("col "); print_dec(ox);
-            print_str(" exact<=2: "); print_dec(eq);
-            print_str("/"); print_dec(tot); print_str("\n");
-        }
-    }
-
-    // DIAGNOSTIC: read back stored params for oc 37/38/39 vs golden.
-    {
-        uint32_t c;
-        for (c = 37u; c <= 39u; c++) {
-            uint32_t hb = *(volatile uint32_t *)NPU_BIAS(c);
-            uint32_t hs = *(volatile uint32_t *)NPU_SCALE(c);
-            uint32_t hh = *(volatile uint32_t *)NPU_SHIFT(c);
-            print_str("oc="); print_dec(c);
-            print_str(" biasHW="); print_dec(hb);
-            print_str(" biasGD="); print_dec((uint32_t)yolo_conv6_bias_q[c]);
-            print_str(" sclHW="); print_dec(hs);
-            print_str(" sclGD="); print_dec(yolo_conv6_scale_mul[c]);
-            print_str(" shHW="); print_dec(hh);
-            print_str(" shGD="); print_dec(yolo_conv6_scale_shift[c]);
-            print_str("\n");
-        }
-    }
-
-    // DIAGNOSTIC: raw oc=38 got/exp for positions 0..31.
-    print_str("oc38 raw (pos got exp):\n");
-    for (pos = 0u; pos < 32u; pos++) {
-        int32_t got = read_ddr_s8(C6_OUT_DDR, 2u * YOLO_CONV6_OUT_SPATIAL + pos, 6u);
-        int32_t expect = s8(yolo_conv6_expected_rtl[pos][38]);
-        print_str("  "); print_dec(pos);
-        print_str(" "); print_dec((uint32_t)got);
-        print_str(" "); print_dec((uint32_t)expect); print_str("\n");
     }
 
     if (errors == 0u) {

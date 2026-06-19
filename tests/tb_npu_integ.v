@@ -239,6 +239,53 @@ module tb_npu_integ;
           end
         if (errors == 0) $display("  [PASS] DW_3x3: depthwise per-channel taps");
 
+        // ================= TEST: 3x3 STRIDE-2 conv (tap-picking) =================
+        // in 5x5 (no pad), IC=16, OC=16, stride 2 => out 2x2.
+        // act[pixel(y,x)][all ic] = y*5+x+1.
+        // wgt[oc]: only ic0, tap (oc%9) = 1  => out[oy][ox][oc] = act value at the
+        //   (oc%9) tap of the window whose top-left is (oy*2, ox*2):
+        //   exp = (oy*2 + tap/3)*5 + (ox*2 + tap%3) + 1.
+        // Any deviation reveals exactly which input pixel the HW window actually used.
+        for (p = 0; p < 25; p = p + 1) begin
+            actw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1) actw[ic*8 +: 8] = p + 1; // V=y*5+x+1
+            act_poke(p, actw);
+        end
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            wgtw = 128'd0;
+            // ic0 lane only; tap = oc%9
+            wgt_poke(oc*9 + (oc % 9), 128'd0); // clear then set below
+            for (t = 0; t < 9; t = t + 1) begin
+                wgtw = 128'd0;
+                if (t == (oc % 9)) wgtw[0 +: 8] = 8'd1;  // ic0 = 1 at the chosen tap
+                wgt_poke(oc*9 + t, wgtw);
+            end
+        end
+        reg_write(R_INW, 5);  reg_write(R_INH, 5);
+        reg_write(R_IC, 16);  reg_write(R_OC, 16);
+        reg_write(R_KERN, (3<<8)|3); reg_write(R_STR, (2<<8)|2); reg_write(R_PAD, 0);
+        reg_write(R_ACTA, 0); reg_write(R_WGTA, 0); reg_write(R_OUTA, 0);
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            reg_write(R_BIAS(oc), 0); reg_write(R_SCALE(oc), 1); reg_write(R_SHIFT(oc), 0);
+        end
+        reg_write(R_CTRL, C_START | C_RELU);
+        wait_done(40000);
+        repeat (5) @(negedge clk);
+        for (oy = 0; oy < 2; oy = oy + 1)
+          for (ox = 0; ox < 2; ox = ox + 1) begin
+            outw = dut.u_out_sram.u_bram.mem[oy*2 + ox];
+            for (oc = 0; oc < 16; oc = oc + 1) begin
+                t   = oc % 9;
+                got = outw[oc*8 +: 8];
+                exp = (oy*2 + t/3)*5 + (ox*2 + (t%3)) + 1;
+                if (got !== exp) begin
+                    $display("  [FAIL] S2 out[oy%0d,ox%0d][oc%0d tap%0d]=%0d exp=%0d", oy, ox, oc, t, got, exp);
+                    errors = errors + 1;
+                end
+            end
+          end
+        if (errors == 0) $display("  [PASS] S2_3x3: stride-2 window positions");
+
         if (errors == 0) $display("TB_NPU_INTEG PASS");
         else $display("TB_NPU_INTEG FAIL errors=%0d", errors);
         $finish;

@@ -1,7 +1,40 @@
 # BUG: stride-2 convolution is inaccurate (pervasive), found via conv6 (M5w)
 
-**Status:** Open. Localized, not yet fixed. Discovered 2026-06-19 during the
-YOLOv8n conv6 (model.3) bring-up.
+**Status:** FIXED 2026-06-19 (`top_controller_fsm.v`). conv6 (M5w) now matches its
+golden bit-exactly (40960/40960, RTL_TOL=8). MNIST 10/10 byte-identical
+(TRAP 941,155). Discovered during the YOLOv8n conv6 (model.3) bring-up.
+
+## Root cause (confirmed via tests/tb_npu_integ.v S2_3x3 tap-picking test)
+
+The conv window advanced by **1 per output position regardless of stride** — both
+axes:
+- **Horizontal:** `S_NEXT_TILE` issued a single `o_im2col_win_advance` pulse when
+  stepping to the next output column; stride-2 needs `stride_sx` pulses.
+- **Vertical:** on output-row advance the FSM jumped `cur_in_row += stride_sy` and
+  then `S_LOAD_ROW` loaded only one new row (stop `cur_in_row >= kh-1` was already
+  true), skipping intermediate rows; stride-2 needs `stride_sy` new rows loaded.
+
+So the HW computed a stride-1 convolution cropped to the stride-2 output size.
+
+## Fix (top_controller_fsm.v, stride==1 byte-identical)
+
+- Vertical: `lr_target` scaled by `i_stride_sy` (`cur_oy*stride_sy + rows_per_grp
+  + kh - 2`); `S_LOAD_ROW` always stops on `cur_in_row >= lr_target`; row advance
+  uses `cur_in_row += 1` (load contiguously up to the stride-scaled target).
+  stride_sy==1 reproduces the legacy `cur_oy + rows_per_grp + kh - 2` exactly.
+- Horizontal: new `S_WIN_STEP` state issues the remaining `stride_sx-1`
+  `win_advance` pulses per output column, **only when `!i_row_par_en &&
+  stride_sx>1`**. row_par (MNIST) and all stride-1 convs keep the legacy
+  single-pulse path => byte-identical.
+
+## Re-audit note
+
+conv0/conv1 (stride-2) strip smokes that "passed" before were tolerance-masked;
+with the fix they now compute correctly and pass with tighter margins.
+
+---
+
+## (Original investigation notes, kept for reference)
 
 ## Symptom
 

@@ -126,11 +126,13 @@
   `yolo_c2f_close_m5v_smoke.c` PASS (TRAP 41,787,525); no RTL change so MNIST
   10/10 preserved. tools/gen_yolo_c2f_close_m5v_smoke.py.
 - [x] Run MNIST regression.
-- [ ] M5w conv6 (model.3, 32->64 3x3 **stride 2**): BLOCKED by a real stride-2
-  conv accuracy defect (pervasive ~70% wrong elements; golden verified vs C-float
-  within 4 LSB). See `docs/notes/soc-npu-stride2-conv-bug.md`. Affects all YOLO
-  stride-2 layers; earlier conv0/conv1 strip "passes" were likely tolerance-masked.
-  Repro: `firmware/yolo_conv6_from_c2f_m5w_smoke.c` (kept as documented evidence).
+- [x] M5w conv6 (model.3, 32->64 3x3 **stride 2**): PASS after fixing a real
+  stride-2 conv defect (HW advanced the window by 1 per output regardless of
+  stride, on both axes). Fixed in `top_controller_fsm.v` (stride-scaled row load
+  + `S_WIN_STEP` extra horizontal advances; stride-1/row_par byte-identical).
+  conv6 now bit-exact (40960/40960, RTL_TOL=8); MNIST 10/10 TRAP 941,155
+  preserved. Directed `tests/tb_npu_integ.v` S2_3x3 tap-picking test added. See
+  `docs/notes/soc-npu-stride2-conv-bug.md`.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
 

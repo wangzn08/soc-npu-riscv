@@ -141,8 +141,10 @@ module top_controller_fsm #(
     localparam S_RDC_WLOAD    = 4'd10;   // GEMM-reduce: prefetch weight plane
     localparam S_RDC_ALOAD    = 4'd11;   // GEMM-reduce: load 16 act words
     localparam S_RDC_VLD      = 4'd12;   // GEMM-reduce: 1 accumulate cycle
+    localparam S_WIN_STEP     = 4'd13;   // stride>1: extra im2col window advances per output column
 
     reg [3:0] state, state_next;
+    reg [7:0] win_step_cnt;              // remaining extra win_advance pulses (stride_sx-1)
 
     // -------------------------------------------------------------------
     // Address & loop counters
@@ -220,7 +222,11 @@ module top_controller_fsm #(
     assign o_rows_per_grp = rows_per_grp;
     wire rb_active = (rows_per_grp > 4'd1);
     // Last input row to load for the current row-block: rows oy..oy+R+kh-2.
-    wire [15:0] lr_target = cur_oy + {12'd0, rows_per_grp} + {8'd0, i_kernel_kh} - 16'd2;
+    // Input row to load up to before the current output row's window is ready.
+    // Scaled by stride_sy so stride>1 loads stride_sy new rows per output row
+    // (stride_sy==1 => identical to the legacy cur_oy + rows_per_grp + kh - 2).
+    wire [15:0] lr_target = (cur_oy * {8'd0, i_stride_sy})
+                          + {12'd0, rows_per_grp} + {8'd0, i_kernel_kh} - 16'd2;
 
     // -------------------------------------------------------------------
     // Output assignments
@@ -332,7 +338,8 @@ module top_controller_fsm #(
                              (((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w)
                                      && !i_im2col_win_vld && (load_col_cnt > 16'd0)
                                      && (load_tile == (ic_groups[3:0] - 4'd1)))
-                             || ((state == S_NEXT_TILE) && (ko_cnt == 4'd0)));
+                             || ((state == S_NEXT_TILE) && (ko_cnt == 4'd0))
+                             || (state == S_WIN_STEP));
     assign o_im2col_offset_sel = ko_cnt;
     assign o_im2col_load_tile  = load_tile;
     assign o_im2col_group_base = cur_ox;
@@ -392,6 +399,7 @@ module top_controller_fsm #(
             pf_wait_cnt  <= 16'd0;
             row_base_in_row <= 16'd0;
             load_tile    <= 4'd0;
+            win_step_cnt <= 8'd0;
             wgt_loaded   <= 1'b0;
             oc_t         <= 3'd0;
             super_step   <= 4'd0;
@@ -475,8 +483,10 @@ module top_controller_fsm #(
                         // and push the SRAM address out of bounds.
                         // #4 row-block: load R+2 rows (up to lr_target) before a
                         // block's window; legacy loads kh rows (cur_in_row>=kh-1).
-                        if (rb_active ? (cur_in_row >= lr_target)
-                                      : (cur_in_row >= {8'd0, i_kernel_kh} - 16'd1)) begin
+                        // Stop once enough input rows are resident for this output
+                        // row's window. lr_target is stride-scaled; for cur_oy=0 it
+                        // equals kh-1 (legacy first-row behavior) for both strides.
+                        if (cur_in_row >= lr_target) begin
                             state <= S_WAIT_WIN;
                         end else if (cur_in_row < i_dim_in_h - 16'd1) begin
                             cur_in_row <= cur_in_row + 16'd1;
@@ -602,8 +612,17 @@ module top_controller_fsm #(
                         // Next group of output columns in current row
                         cur_ox <= cur_ox + group_size;
                         cur_in_col <= cur_in_col + group_size * {8'd0, i_stride_sx}; // slide by group*stride
-                        // Pre-fetch weights for IC tile 0 at new position
-                        state <= S_PREFETCH_WGT;
+                        // The window must shift stride_sx columns to the next output
+                        // position. S_NEXT_TILE already pulses one win_advance; for
+                        // non-row_par stride>1 issue the remaining (stride_sx-1) pulses
+                        // in S_WIN_STEP. row_par feeds its 16 windows during LOAD, so
+                        // it keeps the legacy single-pulse path (stride==1 only).
+                        if (!i_row_par_en && i_stride_sx > 8'd1) begin
+                            win_step_cnt <= i_stride_sx - 8'd1;
+                            state <= S_WIN_STEP;
+                        end else begin
+                            state <= S_PREFETCH_WGT;
+                        end
                         pf_wait_cnt <= 16'd0;
                     end else if (cur_oy + {12'd0, rows_per_grp} < out_h) begin
                         // Next row-block: advance cur_oy by R (=1 legacy).  The
@@ -612,7 +631,10 @@ module top_controller_fsm #(
                         cur_ox <= 16'd0;
                         cur_oy <= cur_oy + {12'd0, rows_per_grp};
                         cur_in_col <= 16'd0;
-                        cur_in_row <= cur_in_row + {8'd0, i_stride_sy};
+                        // Advance one row past the last-loaded; LOAD_ROW then loads
+                        // up to the stride-scaled lr_target (stride_sy new rows).
+                        // stride_sy==1 => +1, identical to legacy.
+                        cur_in_row <= cur_in_row + 16'd1;
                         // pointwise has no im2col rows to load; go straight to compute.
                         state <= i_pw_en ? S_PREFETCH_WGT : S_LOAD_ROW;
                         load_col_cnt <= 16'd0;
@@ -636,6 +658,19 @@ module top_controller_fsm #(
                             state <= S_DONE;
                         end
                     end
+                end
+
+                // -------------------------------------------------------
+                // WIN_STEP: stride>1 horizontal — issue the remaining
+                // (stride_sx-1) im2col window advances before computing the
+                // next output column. One pulse per cycle here (win_advance is
+                // asserted combinationally while in this state).
+                // -------------------------------------------------------
+                S_WIN_STEP: begin
+                    if (win_step_cnt <= 8'd1)
+                        state <= S_PREFETCH_WGT;
+                    else
+                        win_step_cnt <= win_step_cnt - 8'd1;
                 end
 
                 // -------------------------------------------------------

@@ -21,7 +21,7 @@
 #define YOLO_CONV6_REQUANT_SHIFT 12u
 #define YOLO_CONV6_REQUANT_ZP -120
 #define YOLO_CONV6_PAD_VALUE -124
-#define YOLO_CONV6_RTL_TOL 130u
+#define YOLO_CONV6_RTL_TOL 8u
 
 static const uint32_t yolo_conv6_act_words[5120][4] = {
     {0x80AE8284u, 0x80808AB1u, 0x80828385u, 0x8A8397AAu},

@@ -41,7 +41,7 @@ OUT_SCALE = 0.0334292874
 OUT_ZP = -120
 Q_SHIFT = 20
 REQUANT_SHIFT = 12
-RTL_TOL = 130
+RTL_TOL = 8
 
 
 def load_module(name: str, path: Path):
