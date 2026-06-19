@@ -90,7 +90,7 @@
 
 ## Milestone 4: YOLO Conv Block Scheduler
 
-**Status:** In progress. Synthetic and tiny real-weight CPU-scheduled 1x1 pointwise conv blocks are complete. Tiny real YOLO 3x3 stride-1, stride-2, and multi-tile OC32/IC32 padded blocks also run with C-reference qparam/SiLU/requant semantics after adding configurable hardware pad fill. A concat-channel pointwise block (real conv5, IC48/OC32) now runs through the same shared NPU path with `oc_single`, and the first reusable firmware conv descriptor runner can launch it. The first full-width generated strip shape (real conv0, 640x16 -> 320x8) also runs through RTL with an RTL-integer tolerance. Firmware can now run conv0 strip0/strip1 from generated strip-plan metadata. Full per-layer strip/block-plan integration is still pending.
+**Status:** In progress. Synthetic and tiny real-weight CPU-scheduled 1x1 pointwise conv blocks are complete. Tiny real YOLO 3x3 stride-1, stride-2, and multi-tile OC32/IC32 padded blocks also run with C-reference qparam/SiLU/requant semantics after adding configurable hardware pad fill. A concat-channel pointwise block (real conv5, IC48/OC32) now runs through the same shared NPU path with `oc_single`, and the first reusable firmware conv descriptor runner can launch it. The first full-width generated strip shape (real conv0, 640x16 -> 320x8) also runs through RTL with an RTL-integer tolerance. Firmware can now loop over the generated flat strip table for conv0, and a real `conv0 -> conv1` chain smoke passes through RTL. Full per-layer strip/block-plan integration is still pending.
 
 **Deliverable:** CPU firmware can run one YOLO conv layer by strips using the existing systolic array and post-process path.
 
@@ -108,6 +108,7 @@
 - [x] Add a reusable firmware conv descriptor runner and convert the conv5 smoke to call it.
 - [x] Run one real YOLOv8n `conv0` full-width top strip (640x16x3 -> 320x8x16) through CPU -> DMA -> shared NPU -> DMA -> RTL-integer tolerance compare.
 - [x] Add separate `pad_h/pad_w` firmware scheduling and run conv0 strip0/strip1 from generated strip-plan metadata.
+- [x] Run conv0 first four strips from the generated flat strip table and feed their DDR output into a real conv1 strip.
 - [x] Run MNIST regression.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
