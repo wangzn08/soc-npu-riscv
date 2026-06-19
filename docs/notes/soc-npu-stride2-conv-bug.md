@@ -48,6 +48,29 @@ selection is wrong on correctly-loaded rows. The exact interaction with
 - **MNIST is unaffected** (DeepConvNet uses only stride-1 convs), so the 10/10
   baseline does not exercise this path.
 
+## Spatial error pattern (black-box, conv6 stride-2)
+
+Per-output-row exact(<=2 LSB)-rate is **uniform ~28-35%** across all 8 rows
+(row 0, which loads input rows 0,1,2 correctly, is no better) => not the vertical
+row-load path. Per-output-column exact-rate is a **mild U-shape**: col0 ~44%,
+dropping to ~22% around col6-11, recovering to ~28% by col15. This is NOT a clean
+stride-2 alternating pattern (col0 ok / col1 bad / col2 ok...) and NOT a 16-wide
+row_par repeat — conv6 runs **without row_par** (group_size=1). So the horizontal
+window is pervasively mis-fed with a gentle positional drift, not a simple
+every-other-column miss.
+
+Black-box (DDR output) analysis is exhausted. Pinning the exact mechanism needs
+**white-box RTL tracing** (waveforms or a directed `tb_npu_integ` stride-2 case
+dumping `cur_in_col`, `o_im2col_win_x/win_y`, `o_im2col_win_advance`,
+`load_tile`, and the per-window array feed) to see which input window each output
+position actually convolves under stride 2.
+
+NOTE on the FSM flow worth tracing: `S_LOAD_ROW` loads the **entire** input row
+once (`cur_in_col < i_dim_in_w`), and groups then iterate output columns via
+`S_NEXT_TILE` **without** re-entering `S_LOAD_ROW` (it jumps to `S_PREFETCH_WGT`).
+So how the frozen/advanced im2col window is repositioned to `cur_in_col` for each
+group under stride>1 is the key thing to verify on a waveform.
+
 ## Not yet done (the final nail)
 
 A minimal `int32_out` (CTRL[13]) dump of the raw q44 (bypassing SiLU) compared

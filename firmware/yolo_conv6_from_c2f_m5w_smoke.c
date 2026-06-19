@@ -118,6 +118,26 @@ void usercode7(void)
         }
     }
 
+    // DIAGNOSTIC: exact-rate per output COLUMN ox=0..15 (probe horizontal stride).
+    {
+        uint32_t ox;
+        for (ox = 0u; ox < 16u; ox++) {
+            uint32_t eq = 0u, tot = 0u, oy;
+            for (oc = 0u; oc < YOLO_CONV6_OC; oc++) {
+                for (oy = 0u; oy < YOLO_CONV6_OUT_H; oy++) {
+                    uint32_t p = oy * YOLO_CONV6_OUT_W + ox;
+                    int32_t got = read_ddr_s8(C6_OUT_DDR, (oc >> 4) * YOLO_CONV6_OUT_SPATIAL + p, oc & 15u);
+                    int32_t e = s8(yolo_conv6_expected_rtl[p][oc]);
+                    tot++;
+                    if (abs_diff(got, e) <= 2u) eq++;
+                }
+            }
+            print_str("col "); print_dec(ox);
+            print_str(" exact<=2: "); print_dec(eq);
+            print_str("/"); print_dec(tot); print_str("\n");
+        }
+    }
+
     // DIAGNOSTIC: read back stored params for oc 37/38/39 vs golden.
     {
         uint32_t c;
