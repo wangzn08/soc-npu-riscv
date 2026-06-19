@@ -16,6 +16,11 @@ int yolo_concat2_ddr_to_act(uint32_t src0_ddr,
                             uint32_t spatial_words,
                             uint32_t src0_groups,
                             uint32_t src1_groups);
+int yolo_slice_ddr_to_act(uint32_t src_ddr,
+                          uint32_t dst_act_base,
+                          uint32_t spatial_words,
+                          uint32_t first_group,
+                          uint32_t group_count);
 int yolo_run_upsample2x(uint32_t src_act_base,
                         uint32_t dst_act_base,
                         uint32_t in_w,

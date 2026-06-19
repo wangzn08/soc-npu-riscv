@@ -162,6 +162,23 @@ int yolo_concat2_ddr_to_act(uint32_t src0_ddr,
     return 1;
 }
 
+int yolo_slice_ddr_to_act(uint32_t src_ddr,
+                          uint32_t dst_act_base,
+                          uint32_t spatial_words,
+                          uint32_t first_group,
+                          uint32_t group_count)
+{
+    uint32_t src_offset_words;
+
+    if (spatial_words == 0u || group_count == 0u)
+        return 0;
+
+    src_offset_words = first_group * spatial_words;
+    return yolo_dma_ddr_to_act(src_ddr + src_offset_words * 16u,
+                               dst_act_base,
+                               spatial_words * group_count);
+}
+
 int yolo_run_upsample2x(uint32_t src_act_base,
                         uint32_t dst_act_base,
                         uint32_t in_w,
