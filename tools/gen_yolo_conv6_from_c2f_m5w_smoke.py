@@ -79,6 +79,43 @@ def fmt_u8_mat(name, vals):
     return "\n".join(lines)
 
 
+def compute_conv6():
+    """Compute conv6 (model.3) output. Returns (conv0, expected[SP_OUT,64] int8)."""
+    m5v = load_module("m5v_gen", M5V_GEN)
+    conv0, _w, _b, _sm, _rq, conv5_out = m5v.compute_close()
+    lut = conv0.load_lut()
+    act = conv5_out.reshape(IN_H, IN_W, 32).transpose(2, 0, 1)
+    w = np.fromfile(WEIGHT_DIR / "conv6_w.bin", dtype=np.int8).reshape(OC, IC, KH, KW)
+    b = np.fromfile(WEIGHT_DIR / "conv6_b.bin", dtype=np.float32)
+    s = np.fromfile(WEIGHT_DIR / "conv6_s.bin", dtype=np.float32)
+    wsum = w.astype(np.int32).sum(axis=(1, 2, 3))
+    bias_q, scale_mul = [], []
+    for oc in range(OC):
+        mul = int(round(IN_SCALE * float(s[oc]) * 16.0 * (1 << Q_SHIFT)))
+        scale_mul.append(mul)
+        bias_equiv = int(round(float(b[oc]) * 16.0 * (1 << Q_SHIFT) / mul))
+        bias_q.append(int(bias_equiv - IN_ZP * int(wsum[oc])))
+    requant_mul = int(round((1 << REQUANT_SHIFT) / (16.0 * OUT_SCALE)))
+    expected = np.zeros((SP_OUT, OC), dtype=np.int8)
+    for oy in range(OUT_H):
+        for ox in range(OUT_W):
+            pos = oy * OUT_W + ox
+            for oc in range(OC):
+                acc = 0
+                for ic in range(IC):
+                    for ky in range(KH):
+                        for kx in range(KW):
+                            iy = oy * STRIDE + ky - PAD
+                            ix = ox * STRIDE + kx - PAD
+                            av = int(act[ic, iy, ix]) if 0 <= iy < IN_H and 0 <= ix < IN_W else IN_ZP
+                            acc += av * int(w[oc, ic, ky, kx])
+                q44 = ((acc + bias_q[oc]) * scale_mul[oc]) >> Q_SHIFT
+                silu = conv0.rtl_silu_byte(q44, lut)
+                rq = ((conv0.s8(silu) * requant_mul) >> REQUANT_SHIFT) + OUT_ZP
+                expected[pos, oc] = np.int8(conv0.s8(conv0.clamp_s8(rq)))
+    return conv0, expected
+
+
 def main() -> None:
     m5v = load_module("m5v_gen", M5V_GEN)
     conv0, _w, _b, _sm, _rq, conv5_out = m5v.compute_close()  # [SP_IN, 32] int8

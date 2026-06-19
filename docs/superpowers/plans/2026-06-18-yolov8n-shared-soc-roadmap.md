@@ -133,6 +133,9 @@
   conv6 now bit-exact (40960/40960, RTL_TOL=8); MNIST 10/10 TRAP 941,155
   preserved. Directed `tests/tb_npu_integ.v` S2_3x3 tap-picking test added. See
   `docs/notes/soc-npu-stride2-conv-bug.md`.
+- [x] M5x conv7 (model.4 cv1, 64->64 1x1 pointwise): PASS, bit-exact (RTL_TOL=8),
+  fed from conv6 output. Exercises IC=64 (4 ic-groups) OC=64 oc_single pointwise.
+  `firmware/yolo_conv7_from_conv6_m5x_smoke.c`, `tools/gen_yolo_conv7_from_conv6_m5x_smoke.py`.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
 
