@@ -158,6 +158,11 @@
   now fully verified** through the generic runner; only SPPF (model.9) remains in
   the backbone. `firmware/yolo_conv20_smoke.c`, `firmware/yolo_c2f8_smoke.c`,
   `tools/gen_yolo_conv20_smoke.py`, `tools/gen_yolo_c2f8_smoke.py`.
+- [x] m6e SPPF (model.9): conv25(256->128) -> 3x MaxPool5x5(s1,p2, CPU int8) ->
+  concat(512) -> conv26(512->256). conv25/26 on NPU (OC-chunked), maxpool+concat
+  on CPU (same scale => identity requant). Bit-exact (RTL_TOL=16). PASS.
+  **The entire YOLOv8n backbone (model.0..model.9) is now verified layer-by-layer
+  on the shared NPU.** `firmware/yolo_sppf_smoke.c`, `tools/gen_yolo_sppf_smoke.py`.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
 
