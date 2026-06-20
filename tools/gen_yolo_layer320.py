@@ -23,6 +23,7 @@ Q_SHIFT, REQ_SHIFT, RTL_TOL = 20, 12, 16
 
 # ci -> (feeder_ci, oc, ic, kh, kw, stride, pad)
 CFG = {
+    2:  (1,   32,  32, 1, 1, 1, 0),   # c2f_2 cv1 (1x1) on 160x160x32 -> tiled pointwise
     1:  (0,   32,  16, 3, 3, 2, 1),
     6:  (5,   64,  32, 3, 3, 2, 1),
     13: (12,  128, 64, 3, 3, 2, 1),
@@ -83,8 +84,8 @@ def main():
 
     act_words = [pack_i8_word(act[g*16:g*16+16, y, x])
                  for g in range(IC//16) for y in range(IN_H) for x in range(IN_W)]
-    wgt_words = [pack_i8_word(w[oc, :, ko//3, ko%3])
-                 for oc in range(OC) for ko in range(9)]
+    wgt_words = [pack_i8_word(w[oc, :, ko//KW, ko%KW])
+                 for oc in range(OC) for ko in range(KH*KW)]
 
     def u32a(name, words):
         L = [f"static const uint32_t {name}[{len(words)}][4] = {{"]
@@ -107,7 +108,7 @@ def main():
 #define LYR_OUT_W {OUT_W}u
 #define LYR_OUT_H {OUT_H}u
 #define LYR_OUT_SPATIAL {SP_OUT}u
-#define LYR_WGT_PER_OC {(IC//16)*9}u
+#define LYR_WGT_PER_OC {(IC//16)*KH*KW}u
 #define LYR_ACT_WORDS {len(act_words)}u
 #define LYR_WGT_WORDS {len(wgt_words)}u
 #define LYR_PAD_VALUE {in_zp}

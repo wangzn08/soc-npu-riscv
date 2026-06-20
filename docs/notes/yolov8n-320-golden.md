@@ -61,6 +61,16 @@ net is a mix; summing measured layers is the path to the real total (next: chain
 assembly). Naive full-net @320 still likely ~50-150M cycles -> sim is long; the
 on-chip residency + per-layer measurement-then-sum is the practical route.
 
+## OPEN: 1x1 pointwise tiling (blocks backbone C2f at 320)
+
+3x3 tiling is solid (conv1/13/20 PASS). 1x1 layers at 320 also exceed SRAM and
+need tiling, but routing 1x1 strips through the PW engine inside
+yolo_run_conv2d_tiled gives a per-channel mismatch (conv2 80x80x32: oc0 exact,
+oc1+ off by ~26, with AND without row_par). Root cause not yet found — the
+standalone conv7 @640 PW smoke passes, so it's specific to the tiled/strip PW
+feed. gen_yolo_layer320.py now kernel-aware (CFG has conv2) to drive the fix.
+**Next: debug PW-in-strip per-channel result, then 1x1 tiling unblocks C2f.**
+
 ## Phase 4 (on-SoC full inference) status
 
 Done: all per-op + tiled conv + DFL HW + sigmoid HW verified; C@320 golden above.
