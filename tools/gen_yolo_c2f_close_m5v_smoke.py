@@ -115,7 +115,9 @@ def pack_pw(conv0, weights):
     return words
 
 
-def main() -> None:
+def compute_close():
+    """Compute the closed C2f (model.2) conv5 output. Returns (conv0, weights,
+    bias_q, scale_mul, c5_requant_mul, expected[SP_OUT,32] int8)."""
     m5u = load_module("m5u_gen", M5U_GEN)
     conv0, conv2_out, _s1_glue, _conv4_glue, add_out, _stage = m5u.compute_pieces()
     lut = conv0.load_lut()
@@ -128,14 +130,12 @@ def main() -> None:
     s0_cat = requant_piece(conv0, s0, CONV2_ZP, mul_s0s1)
     s1_cat = requant_piece(conv0, s1, CONV2_ZP, mul_s0s1)
     add_cat = requant_piece(conv0, add_out, GLUE_ZP, mul_add)
-
-    # concat [s0, s1, add] -> [48, SP] (channel-major per group, position inner).
     concat = np.concatenate([s0_cat, s1_cat, add_cat], axis=1)  # [SP, 48]
 
     w = np.fromfile(WEIGHT_DIR / "conv5_w.bin", dtype=np.int8).reshape(32, 48, 1, 1)
     b = np.fromfile(WEIGHT_DIR / "conv5_b.bin", dtype=np.float32)
     s = np.fromfile(WEIGHT_DIR / "conv5_s.bin", dtype=np.float32)
-    bias_q, scale_mul, scale_shift = conv5_qparams(w, b, s)
+    bias_q, scale_mul, _shift = conv5_qparams(w, b, s)
     c5_requant_mul = int(round((1 << CONV5_REQUANT_SHIFT) / (16.0 * CONV5_OUT_SCALE)))
 
     expected = np.zeros((SP_OUT, 32), dtype=np.int8)
@@ -148,6 +148,14 @@ def main() -> None:
             silu = conv0.rtl_silu_byte(q44, lut)
             rq = ((conv0.s8(silu) * c5_requant_mul) >> CONV5_REQUANT_SHIFT) + CONV5_OUT_ZP
             expected[pos, oc] = np.int8(conv0.s8(conv0.clamp_s8(rq)))
+    return conv0, w, bias_q, scale_mul, c5_requant_mul, expected
+
+
+def main() -> None:
+    conv0, w, bias_q, scale_mul, c5_requant_mul, expected = compute_close()
+    mul_s0s1 = requant_mul(CONV2_SCALE)
+    mul_add = requant_mul(GLUE_SCALE)
+    scale_shift = [Q_SHIFT] * 32
     expected_u8 = expected.astype(np.uint8)
 
     body = f"""#ifndef YOLO_C2F_CLOSE_M5V_DATA_H
