@@ -29,6 +29,21 @@ int yolo_run_upsample2x(uint32_t src_act_base,
 void yolo_set_silu_requant(uint32_t mul, uint32_t shift, int32_t zp);
 void yolo_set_pad_value(int32_t pad_value);
 void yolo_set_eltwise(int32_t zp, uint32_t skip_base);
+
+// 3x3/1x1 conv with out_c > 64: loops 64-OC chunks (oc_single per chunk, params
+// reloaded), since the resident param regfile holds only 64 OCs. Act must already
+// be in Act SRAM (caller DMAs it + sets pad_value/silu_requant). Weights for all
+// out_c OCs live in DDR at wgt_all_ddr (tile-major, wgt_words_per_oc each); output
+// drained tile-major to out_ddr. out_c need not be a multiple of 64.
+int yolo_run_conv2d_oc_chunks(uint32_t act_base, uint32_t wgt_all_ddr, uint32_t wgt_base,
+                              uint32_t out_ddr, uint32_t in_w, uint32_t in_h,
+                              uint32_t in_c, uint32_t out_c,
+                              uint32_t kernel_h, uint32_t kernel_w,
+                              uint32_t stride, uint32_t pad,
+                              const int32_t *bias, const uint32_t *scale_mul,
+                              const uint32_t *scale_shift, uint32_t ctrl_flags,
+                              uint32_t wgt_words_per_oc, uint32_t out_spatial);
+
 int yolo_run_conv2d_qparams(uint32_t act_base,
                             uint32_t wgt_base,
                             uint32_t out_base,

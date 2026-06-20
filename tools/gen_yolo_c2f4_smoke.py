@@ -139,7 +139,7 @@ def pack_act(conv0, act):
     return out
 
 
-def main():
+def compute_c2f4():
     m5w = load("m5w", M5W_GEN)
     conv0, conv6_out = m5w.compute_conv6()   # [640,64] at conv6 out
     lut = conv0.load_lut()
@@ -284,6 +284,11 @@ def main():
 """
     OUT_PATH.write_text(body, encoding="utf-8")
     print(f"wrote {OUT_PATH}  ratios={ratio_mul} cat_mul=({cm_s},{cm_a0},{cm_a1})")
+    return conv0, golden   # golden = c2f_4 output [SP,64] int8
+
+
+def main():
+    compute_c2f4()
 
 
 if __name__ == "__main__":

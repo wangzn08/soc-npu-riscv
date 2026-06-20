@@ -141,6 +141,11 @@
   any per-bottleneck glue scale). Brought up c2f_4 (model.4, n=2) end-to-end from
   conv6 output, bit-exact (RTL_TOL=16). See
   `plans/2026-06-19-yolov8n-c2f-generic-runner-m6a.md`. Next: c2f_6/c2f_8 reuse it.
+- [x] m6b OC>64 chunked conv (`yolo_run_conv2d_oc_chunks`): loops 64-OC chunks
+  (oc_single per chunk, params reloaded) since the resident param regfile holds
+  only 64 OCs. Brought up conv13 (model.5, 64->128 3x3 stride2) bit-exact
+  (RTL_TOL=16). Unblocks all wide layers (conv13/20/26, neck, detect head).
+  `firmware/yolo_conv13_m6b_smoke.c`, `tools/gen_yolo_conv13_m6b_smoke.py`.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
 
