@@ -16,3 +16,4 @@ sim/axi_sys_tb.vcd
 Thumbs.db
 .tmp/
 tmp/
+firmware/yolo_conv1_320_data.h
