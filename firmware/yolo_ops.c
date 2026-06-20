@@ -317,6 +317,33 @@ int yolo_run_pw_conv1x1_qparams(uint32_t act_base,
                                  0u, 0u, 1u, ctrl_flags);
 }
 
+int yolo_run_pw_conv1x1_oc_chunks(uint32_t act_base, uint32_t wgt_all_ddr, uint32_t wgt_base,
+                                  uint32_t out_ddr, uint32_t in_w, uint32_t in_h,
+                                  uint32_t in_c, uint32_t out_c,
+                                  const int32_t *bias, const uint32_t *scale_mul,
+                                  const uint32_t *scale_shift, uint32_t ctrl_flags,
+                                  uint32_t out_spatial)
+{
+    uint32_t wpo = in_c / 16u;   // 1x1 weight words per OC
+    uint32_t done = 0u;
+    while (done < out_c) {
+        uint32_t chunk = out_c - done;
+        if (chunk > 64u) chunk = 64u;
+        if (!yolo_dma_ddr_to_wgt(wgt_all_ddr + done * wpo * 16u, wgt_base, chunk * wpo))
+            return 0;
+        if (!yolo_run_pw_conv1x1_qparams(act_base, wgt_base, 0u,
+                                         in_w, in_h, in_c, chunk,
+                                         bias + done, scale_mul + done, scale_shift + done,
+                                         ctrl_flags | NPU_CTRL_OC_SINGLE))
+            return 0;
+        if (!yolo_dma_out_to_ddr(out_ddr + (done / 16u) * out_spatial * 16u,
+                                 0u, (chunk / 16u) * out_spatial, 0u))
+            return 0;
+        done += chunk;
+    }
+    return 1;
+}
+
 int yolo_run_conv2d_oc_chunks(uint32_t act_base, uint32_t wgt_all_ddr, uint32_t wgt_base,
                               uint32_t out_ddr, uint32_t in_w, uint32_t in_h,
                               uint32_t in_c, uint32_t out_c,

@@ -70,18 +70,16 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
     if (cfg->n_bottleneck == 0u || cfg->n_bottleneck > YOLO_C2F_MAX_BN)
         return 0;
 
-    // ---------- cv1 (1x1): block input -> s0|s1 ----------
+    // ---------- cv1 (1x1): block input -> s0|s1 (OC-chunked, supports >64) ----------
     push_wgt(cfg->wgt_ddr, cfg->cv1_wgt, cfg->cv1_wgt_words);
     yolo_set_silu_requant(cfg->cv1_rq_mul, cfg->cv1_rq_shift, cfg->cv1_rq_zp);
     if (!yolo_dma_ddr_to_act(cfg->in_ddr, ACT_BASE, sp * (cfg->cv1_ic / 16u)) ||
-        !yolo_dma_ddr_to_wgt(cfg->wgt_ddr, WGT_BASE, cfg->cv1_wgt_words) ||
-        !yolo_run_pw_conv1x1_qparams(ACT_BASE, WGT_BASE, OUT_BASE,
-                                     cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
-                                     cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
-                                     NPU_CTRL_OC_SINGLE | NPU_CTRL_SILU_EN |
-                                     NPU_CTRL_SILU_REQUANT_EN) ||
-        !yolo_dma_out_to_ddr(cfg->cv1_out_ddr, OUT_BASE, sp * full_groups, 0u))
+        !yolo_run_pw_conv1x1_oc_chunks(ACT_BASE, cfg->wgt_ddr, WGT_BASE, cfg->cv1_out_ddr,
+                                       cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
+                                       cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
+                                       NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN, sp))
         return 0;
+    (void)full_groups;
 
     // ---------- bottleneck chain ----------
     for (i = 0u; i < cfg->n_bottleneck; i++) {
@@ -153,17 +151,14 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
                              cfg->cat_req_shift, cfg->cat_zp, cfg->concat_ddr, (dstg++)*sp+pos);
     }
 
-    // ---------- cv2 (1x1) ----------
+    // ---------- cv2 (1x1, OC-chunked, supports >64) ----------
     push_wgt(cfg->wgt_ddr, cfg->cv2_wgt, cfg->cv2_wgt_words);
     yolo_set_silu_requant(cfg->cv2_rq_mul, cfg->cv2_rq_shift, cfg->cv2_rq_zp);
     if (!yolo_dma_ddr_to_act(cfg->concat_ddr, ACT_BASE, sp * (cfg->cv2_ic / 16u)) ||
-        !yolo_dma_ddr_to_wgt(cfg->wgt_ddr, WGT_BASE, cfg->cv2_wgt_words) ||
-        !yolo_run_pw_conv1x1_qparams(ACT_BASE, WGT_BASE, OUT_BASE,
-                                     cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
-                                     cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,
-                                     NPU_CTRL_OC_SINGLE | NPU_CTRL_SILU_EN |
-                                     NPU_CTRL_SILU_REQUANT_EN) ||
-        !yolo_dma_out_to_ddr(cfg->out_ddr, OUT_BASE, sp * (cfg->cv2_oc / 16u), 0u))
+        !yolo_run_pw_conv1x1_oc_chunks(ACT_BASE, cfg->wgt_ddr, WGT_BASE, cfg->out_ddr,
+                                       cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
+                                       cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,
+                                       NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN, sp))
         return 0;
 
     return 1;

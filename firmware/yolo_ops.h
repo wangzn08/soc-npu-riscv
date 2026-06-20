@@ -35,6 +35,13 @@ void yolo_set_eltwise(int32_t zp, uint32_t skip_base);
 // be in Act SRAM (caller DMAs it + sets pad_value/silu_requant). Weights for all
 // out_c OCs live in DDR at wgt_all_ddr (tile-major, wgt_words_per_oc each); output
 // drained tile-major to out_ddr. out_c need not be a multiple of 64.
+int yolo_run_pw_conv1x1_oc_chunks(uint32_t act_base, uint32_t wgt_all_ddr, uint32_t wgt_base,
+                                  uint32_t out_ddr, uint32_t in_w, uint32_t in_h,
+                                  uint32_t in_c, uint32_t out_c,
+                                  const int32_t *bias, const uint32_t *scale_mul,
+                                  const uint32_t *scale_shift, uint32_t ctrl_flags,
+                                  uint32_t out_spatial);
+
 int yolo_run_conv2d_oc_chunks(uint32_t act_base, uint32_t wgt_all_ddr, uint32_t wgt_base,
                               uint32_t out_ddr, uint32_t in_w, uint32_t in_h,
                               uint32_t in_c, uint32_t out_c,

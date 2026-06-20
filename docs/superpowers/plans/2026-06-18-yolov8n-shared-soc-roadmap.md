@@ -146,6 +146,12 @@
   only 64 OCs. Brought up conv13 (model.5, 64->128 3x3 stride2) bit-exact
   (RTL_TOL=16). Unblocks all wide layers (conv13/20/26, neck, detect head).
   `firmware/yolo_conv13_m6b_smoke.c`, `tools/gen_yolo_conv13_m6b_smoke.py`.
+- [x] m6c C2f runner cv1/cv2 OC>64 (`yolo_run_pw_conv1x1_oc_chunks`): brought up
+  c2f_6 (model.6, n=2, 128ch; cv1=conv14 128->128, cv2=conv19 256->128 chunked)
+  end-to-end from conv13 output, bit-exact (RTL_TOL=16). PASS.
+  `firmware/yolo_c2f6_smoke.c`, `tools/gen_yolo_c2f6_smoke.py`. Backbone verified
+  through model.6. Next: conv20 (128->256 s2), c2f_8 (n=1, needs bottleneck OC>64
+  chunking since half_c=128), SPPF.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
 

@@ -29,7 +29,7 @@ def load(name, path):
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
 
 
-def main():
+def compute_conv13():
     g = load("c2f4", C2F4_GEN)
     conv0, c2f4_out = g.compute_c2f4()    # [640,64] at conv12 out = conv13 in
     lut = conv0.load_lut()
@@ -88,6 +88,11 @@ def main():
 """
     OUT_PATH.write_text(body, encoding="utf-8")
     print(f"wrote {OUT_PATH}")
+    return conv0, golden   # conv13 output [SP_OUT,128] int8 (40x4x128)
+
+
+def main():
+    compute_conv13()
 
 
 if __name__ == "__main__":
