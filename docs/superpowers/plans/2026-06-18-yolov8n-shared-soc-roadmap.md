@@ -198,6 +198,11 @@
 
 **Deliverable:** NPU produces YOLO detect-head logits; CPU handles DFL/decode/NMS first.
 
+- Neck/head analysis (2026-06-19): c2f_12 (FPN) and c2f_15 (PAN p3) verified via
+  the runner (shortcut=0). c2f_18/c2f_21 are the same path (fixtures only).
+  Detect head structure + two open issues (LINEAR output convs need int32_out+CPU
+  requant; DFL/decode needs no-FPU handling, likely host-side) documented in
+  `plans/2026-06-19-yolov8n-detect-head-m6.md`.
 - [ ] Run detect-head conv outputs through shared NPU block scheduling.
 - [ ] DMA detect logits to DDR.
 - [ ] Reuse or port the existing C golden DFL/decode logic in firmware or host-side checker.
