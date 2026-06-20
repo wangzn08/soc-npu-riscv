@@ -108,6 +108,22 @@ module param_regfile #(
     output wire                         o_elt_signed,    // CTRL[20]: signed INT8 + zero-point eltwise add (YOLO C2f residual)
     output wire [7:0]                   o_elt_zp,        // NPU_ELTWISE_ZP (0x3D4): glue zero-point for signed eltwise add
 
+    // YOLO detect-head decode: DFL expectation engine + sigmoid LUT
+    output wire [SRAM_ADDR_W-1:0]       o_dfl_src,       // 0x3D8: DFL src Act-SRAM word base
+    output wire [SRAM_ADDR_W-1:0]       o_dfl_dst,       // 0x3DC: DFL dst Act-SRAM word base
+    output wire [15:0]                  o_dfl_cnt,       // 0x3E0: DFL input word count (anchors*4)
+    output wire                         o_dfl_trig,      // 0x3E4 write: pulse to start dfl_unit
+    output wire                         o_dfl_wload_en,  // 0x3E8 write: W_k load pulse
+    output wire [3:0]                   o_dfl_wload_idx,
+    output wire [15:0]                  o_dfl_wload_val,
+    output wire                         o_dfl_eload_en,  // 0x3EC write: EXP_LUT load pulse
+    output wire [7:0]                   o_dfl_eload_idx,
+    output wire [15:0]                  o_dfl_eload_val,
+    output wire                         o_sigmoid_en,    // CTRL[21]: post-process sigmoid LUT (vs SiLU)
+    output wire                         o_sigm_load_en,  // 0x3F0 write: sigmoid LUT load pulse
+    output wire [7:0]                   o_sigm_load_idx,
+    output wire [7:0]                   o_sigm_load_val,
+
     // Status
     input  wire                         i_done_irq,
     input  wire                         i_busy,
@@ -187,6 +203,7 @@ module param_regfile #(
     input  wire                         i_expand_done,      // img_expand: completion (level), exposed in STATUS[3]
     output wire                         o_upsample_trig,    // 0x3C8 write: pulse to start Act-SRAM 2x upsample
     input  wire                         i_upsample_done,    // upsample2x: completion (level), exposed in STATUS[4]
+    input  wire                         i_dfl_done,         // dfl_unit: completion (level), exposed in STATUS[5]
     output wire [15:0]                  o_upsample_in_w,    // 0x3C0[15:0]
     output wire [15:0]                  o_upsample_in_h,    // 0x3C0[31:16]
     output wire [15:0]                  o_upsample_ic_groups, // 0x3C4[15:0]
@@ -295,6 +312,14 @@ module param_regfile #(
     reg [15:0] upsample_in_w;
     reg [15:0] upsample_in_h;
     reg [15:0] upsample_ic_groups;
+    // DFL engine + sigmoid LUT control state
+    reg [SRAM_ADDR_W-1:0] dfl_src, dfl_dst;
+    reg [15:0] dfl_cnt;
+    reg        dfl_trig_d;
+    reg        dfl_wload_en_d; reg [3:0] dfl_wload_idx; reg [15:0] dfl_wload_val;
+    reg        dfl_eload_en_d; reg [7:0] dfl_eload_idx; reg [15:0] dfl_eload_val;
+    reg        ctrl_sigmoid_en;
+    reg        sigm_load_en_d; reg [7:0] sigm_load_idx; reg [7:0] sigm_load_val;
     reg        dma_sram_sel;   // 0=Act SRAM, 1=Wgt SRAM for DMA write target
     reg        dma_out_rd_sel; // 0=skip path owns Out SRAM Port B, 1=DMA owns it
     reg [1:0]  dma_rd_sram_sel; // 0=Out SRAM, 1=Act SRAM, 2=Wgt SRAM for DMA read source
@@ -408,6 +433,12 @@ module param_regfile #(
             upsample_in_w    <= 16'd0;
             upsample_in_h    <= 16'd0;
             upsample_ic_groups <= 16'd0;
+            dfl_src <= {SRAM_ADDR_W{1'b0}}; dfl_dst <= {SRAM_ADDR_W{1'b0}};
+            dfl_cnt <= 16'd0; dfl_trig_d <= 1'b0;
+            dfl_wload_en_d <= 1'b0; dfl_wload_idx <= 4'd0; dfl_wload_val <= 16'd0;
+            dfl_eload_en_d <= 1'b0; dfl_eload_idx <= 8'd0; dfl_eload_val <= 16'd0;
+            ctrl_sigmoid_en <= 1'b0;
+            sigm_load_en_d <= 1'b0; sigm_load_idx <= 8'd0; sigm_load_val <= 8'd0;
             dma_sram_sel     <= 1'b0;
             dma_out_rd_sel   <= 1'b0;
             dma_rd_sram_sel  <= 2'd0;
@@ -430,6 +461,10 @@ module param_regfile #(
             copy_trig_d  <= 1'b0;
             expand_trig_d <= 1'b0;
             upsample_trig_d <= 1'b0;
+            dfl_trig_d <= 1'b0;
+            dfl_wload_en_d <= 1'b0;
+            dfl_eload_en_d <= 1'b0;
+            sigm_load_en_d <= 1'b0;
 
             if (wr_en) begin
                 // synthesis translate_off
@@ -461,6 +496,7 @@ module param_regfile #(
                         ctrl_silu_en     <= s_axi_wdata[18];
                         ctrl_silu_requant_en <= s_axi_wdata[19];
                         ctrl_elt_signed  <= s_axi_wdata[20];
+                        ctrl_sigmoid_en  <= s_axi_wdata[21];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -563,6 +599,25 @@ module param_regfile #(
                     end
                     10'h3D0: pad_value <= s_axi_wdata[7:0];   // NPU_PAD_VALUE
                     10'h3D4: elt_zp    <= s_axi_wdata[7:0];   // NPU_ELTWISE_ZP
+                    10'h3D8: dfl_src   <= s_axi_wdata[SRAM_ADDR_W-1:0]; // NPU_DFL_SRC
+                    10'h3DC: dfl_dst   <= s_axi_wdata[SRAM_ADDR_W-1:0]; // NPU_DFL_DST
+                    10'h3E0: dfl_cnt   <= s_axi_wdata[15:0];   // NPU_DFL_CNT
+                    10'h3E4: dfl_trig_d <= 1'b1;               // NPU_DFL_TRIG
+                    10'h3E8: begin                            // NPU_DFL_WLOAD
+                        dfl_wload_en_d  <= 1'b1;
+                        dfl_wload_idx   <= s_axi_wdata[19:16];
+                        dfl_wload_val   <= s_axi_wdata[15:0];
+                    end
+                    10'h3EC: begin                            // NPU_DFL_ELOAD
+                        dfl_eload_en_d  <= 1'b1;
+                        dfl_eload_idx   <= s_axi_wdata[23:16];
+                        dfl_eload_val   <= s_axi_wdata[15:0];
+                    end
+                    10'h3F0: begin                            // NPU_SIGM_LOAD
+                        sigm_load_en_d  <= 1'b1;
+                        sigm_load_idx   <= s_axi_wdata[15:8];
+                        sigm_load_val   <= s_axi_wdata[7:0];
+                    end
 
                     default: ; // Ignore unmapped addresses
                 endcase
@@ -678,7 +733,7 @@ module param_regfile #(
                     10'h15C: rdata <= {gavg_shift, gavg_mul};
 
                     // DMA status (0x140, read-only)
-                    10'h140: rdata <= {27'd0, i_upsample_done, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
+                    10'h140: rdata <= {26'd0, i_dfl_done, i_upsample_done, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
 
                     // DMA register readback (0x124-0x13C)
                     10'h124: rdata <= dma_rd_ddr_addr;
@@ -812,6 +867,20 @@ module param_regfile #(
     assign o_copy_trig        = copy_trig_d;
     assign o_expand_trig      = expand_trig_d;
     assign o_upsample_trig    = upsample_trig_d;
+    assign o_dfl_src          = dfl_src;
+    assign o_dfl_dst          = dfl_dst;
+    assign o_dfl_cnt          = dfl_cnt;
+    assign o_dfl_trig         = dfl_trig_d;
+    assign o_dfl_wload_en     = dfl_wload_en_d;
+    assign o_dfl_wload_idx    = dfl_wload_idx;
+    assign o_dfl_wload_val    = dfl_wload_val;
+    assign o_dfl_eload_en     = dfl_eload_en_d;
+    assign o_dfl_eload_idx    = dfl_eload_idx;
+    assign o_dfl_eload_val    = dfl_eload_val;
+    assign o_sigmoid_en       = ctrl_sigmoid_en;
+    assign o_sigm_load_en     = sigm_load_en_d;
+    assign o_sigm_load_idx    = sigm_load_idx;
+    assign o_sigm_load_val    = sigm_load_val;
     assign o_upsample_in_w    = upsample_in_w;
     assign o_upsample_in_h    = upsample_in_h;
     assign o_upsample_ic_groups = upsample_ic_groups;

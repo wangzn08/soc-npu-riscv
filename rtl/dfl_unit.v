@@ -93,8 +93,9 @@ module dfl_unit #(
         end else begin
             case (state)
             S_IDLE: begin
-                o_done <= 1'b0;
+                // o_done held level (like upsample2x) until the next trigger.
                 if (i_trig) begin
+                    o_done <= 1'b0;
                     src_q <= i_src_base; dst_q <= i_dst_base; cnt_q <= i_cnt;
                     widx <= 16'd0; coord <= 2'd0; outw <= {DATA_W{1'b0}};
                     state <= S_READ;

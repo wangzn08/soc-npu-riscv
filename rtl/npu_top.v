@@ -170,6 +170,27 @@ module npu_top #(
     wire                            upsample_en;
     wire                            upsample_we;
     wire [ACT_DATA_W-1:0]           upsample_wdata;
+    // DFL expectation engine
+    wire                            cfg_dfl_trig;
+    wire [SRAM_ADDR_W-1:0]          cfg_dfl_src;
+    wire [SRAM_ADDR_W-1:0]          cfg_dfl_dst;
+    wire [15:0]                     cfg_dfl_cnt;
+    wire                            cfg_dfl_wload_en;
+    wire [3:0]                      cfg_dfl_wload_idx;
+    wire [15:0]                     cfg_dfl_wload_val;
+    wire                            cfg_dfl_eload_en;
+    wire [7:0]                      cfg_dfl_eload_idx;
+    wire [15:0]                     cfg_dfl_eload_val;
+    wire                            cfg_sigmoid_en;
+    wire                            cfg_sigm_load_en;
+    wire [7:0]                      cfg_sigm_load_idx;
+    wire [7:0]                      cfg_sigm_load_val;
+    wire                            dfl_done;
+    wire                            dfl_busy;
+    wire [SRAM_ADDR_W-1:0]          dfl_addr;
+    wire                            dfl_en;
+    wire                            dfl_we;
+    wire [ACT_DATA_W-1:0]           dfl_wdata;
     wire                            copy_done;
     wire                            copy_busy;
     wire [SRAM_ADDR_W-1:0]          copy_out_rd_addr;
@@ -389,6 +410,21 @@ module npu_top #(
         .o_upsample_in_w   (cfg_upsample_in_w),
         .o_upsample_in_h   (cfg_upsample_in_h),
         .o_upsample_ic_groups(cfg_upsample_ic_groups),
+        .i_dfl_done        (dfl_done),
+        .o_dfl_src         (cfg_dfl_src),
+        .o_dfl_dst         (cfg_dfl_dst),
+        .o_dfl_cnt         (cfg_dfl_cnt),
+        .o_dfl_trig        (cfg_dfl_trig),
+        .o_dfl_wload_en    (cfg_dfl_wload_en),
+        .o_dfl_wload_idx   (cfg_dfl_wload_idx),
+        .o_dfl_wload_val   (cfg_dfl_wload_val),
+        .o_dfl_eload_en    (cfg_dfl_eload_en),
+        .o_dfl_eload_idx   (cfg_dfl_eload_idx),
+        .o_dfl_eload_val   (cfg_dfl_eload_val),
+        .o_sigmoid_en      (cfg_sigmoid_en),
+        .o_sigm_load_en    (cfg_sigm_load_en),
+        .o_sigm_load_idx   (cfg_sigm_load_idx),
+        .o_sigm_load_val   (cfg_sigm_load_val),
         .i_perf_busy       (fsm_busy),
         .i_perf_arr_active (fsm_array_vld),
         .i_perf_rd_beat    (perf_rd_beat),
@@ -1267,19 +1303,23 @@ module npu_top #(
     wire act_dma_wr_active = dma_sram_wr_en & ~cfg_dma_sram_sel;
     wire act_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd1);
 
-    // img_expand / upsample2x / sram_copy take Act Port B while busy; else DMA muxes.
-    assign act_sram_addrb = expand_busy ? expand_addr
+    // dfl_unit / img_expand / upsample2x / sram_copy take Act Port B while busy; else DMA muxes.
+    assign act_sram_addrb = dfl_busy ? dfl_addr
+                          : expand_busy ? expand_addr
                           : upsample_busy ? upsample_addr
                           : copy_busy ? copy_act_wr_addr
                           : act_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
-    assign act_sram_enb   = expand_busy ? expand_en
+    assign act_sram_enb   = dfl_busy ? dfl_en
+                          : expand_busy ? expand_en
                           : upsample_busy ? upsample_en
                           : copy_busy ? copy_act_wr_en
                           : (act_dma_wr_active | act_dma_rd_active);
-    assign act_sram_dib   = expand_busy ? expand_wdata
+    assign act_sram_dib   = dfl_busy ? dfl_wdata
+                          : expand_busy ? expand_wdata
                           : upsample_busy ? upsample_wdata
                           : copy_busy ? copy_act_wr_data : dma_sram_wr_data;
-    assign act_sram_web   = expand_busy ? expand_we
+    assign act_sram_web   = dfl_busy ? dfl_we
+                          : expand_busy ? expand_we
                           : upsample_busy ? upsample_we
                           : copy_busy ? copy_act_wr_en : act_dma_wr_active;
 
@@ -1404,6 +1444,36 @@ module npu_top #(
         .i_rdata     (act_sram_dob),
         .o_busy      (upsample_busy),
         .o_done      (upsample_done)
+    );
+
+    // ===================================================================
+    // Shared Act-SRAM DFL expectation engine for YOLO detect-head decode.
+    // Reads 16xINT8 logit words from Act SRAM, writes packed Q8.8 distances.
+    // Default idle for MNIST. (CTRL[21] sigmoid_en routes to post_process.)
+    // ===================================================================
+    dfl_unit #(
+        .ADDR_W (SRAM_ADDR_W),
+        .DATA_W (ACT_DATA_W)
+    ) u_dfl_unit (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .i_trig      (cfg_dfl_trig),
+        .i_src_base  (cfg_dfl_src),
+        .i_dst_base  (cfg_dfl_dst),
+        .i_cnt       (cfg_dfl_cnt),
+        .i_wload_en  (cfg_dfl_wload_en),
+        .i_wload_idx (cfg_dfl_wload_idx),
+        .i_wload_val (cfg_dfl_wload_val),
+        .i_eload_en  (cfg_dfl_eload_en),
+        .i_eload_idx (cfg_dfl_eload_idx),
+        .i_eload_val (cfg_dfl_eload_val),
+        .o_addr      (dfl_addr),
+        .o_en        (dfl_en),
+        .o_we        (dfl_we),
+        .o_wdata     (dfl_wdata),
+        .i_rdata     (act_sram_dob),
+        .o_busy      (dfl_busy),
+        .o_done      (dfl_done)
     );
 
     // ===================================================================

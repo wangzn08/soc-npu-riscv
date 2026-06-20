@@ -98,6 +98,13 @@ void usercode7(void);
 #define NPU_SILU_REQUANT_CFG (NPU_BASE + 0x3CC)  // [31:24]zp [21:16]shift [15:0]mul; optional SiLU output requant
 #define NPU_PAD_VALUE         (NPU_BASE + 0x3D0)  // [7:0] hardware padding fill byte, default 0
 #define NPU_ELTWISE_ZP        (NPU_BASE + 0x3D4)  // [7:0] glue zero-point for signed eltwise add (CTRL[20])
+#define NPU_DFL_SRC           (NPU_BASE + 0x3D8)  // DFL src Act-SRAM word base
+#define NPU_DFL_DST           (NPU_BASE + 0x3DC)  // DFL dst Act-SRAM word base
+#define NPU_DFL_CNT           (NPU_BASE + 0x3E0)  // DFL input word count (anchors*4)
+#define NPU_DFL_TRIG          (NPU_BASE + 0x3E4)  // write: start dfl_unit
+#define NPU_DFL_WLOAD         (NPU_BASE + 0x3E8)  // [19:16]idx [15:0]W_k(Q8.8 signed)
+#define NPU_DFL_ELOAD         (NPU_BASE + 0x3EC)  // [23:16]idx [15:0]exp(Q1.15)
+#define NPU_SIGM_LOAD         (NPU_BASE + 0x3F0)  // [15:8]idx [7:0]prob(Q0.8)
 
 // NPU_DMA_STATUS bits
 #define NPU_DMA_STATUS_RD_DONE     (1 << 0)
@@ -105,6 +112,7 @@ void usercode7(void);
 #define NPU_DMA_STATUS_COPY_DONE   (1 << 2)
 #define NPU_DMA_STATUS_EXPAND_DONE (1 << 3)
 #define NPU_DMA_STATUS_UPSAMPLE_DONE (1 << 4)
+#define NPU_DMA_STATUS_DFL_DONE    (1 << 5)
 
 // CTRL bits
 #define NPU_CTRL_START      (1 << 0)
@@ -128,6 +136,7 @@ void usercode7(void);
 #define NPU_CTRL_SILU_EN     (1 << 18) // shared post-process SiLU LUT activation (default off)
 #define NPU_CTRL_SILU_REQUANT_EN (1 << 19) // optional SiLU Q4.4 -> output INT8 requant
 #define NPU_CTRL_ELT_SIGNED  (1 << 20) // signed INT8 + zero-point eltwise add (YOLO C2f residual)
+#define NPU_CTRL_SIGMOID_EN  (1 << 21) // post-process sigmoid LUT (vs SiLU); detect-head cls
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)
