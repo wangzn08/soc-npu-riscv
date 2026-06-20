@@ -41,6 +41,10 @@ module post_process_top #(
     input  wire [5:0]                       i_silu_requant_shift,
     input  wire [7:0]                       i_silu_requant_zp,
     input  wire [7:0]                       i_clip_max,   // upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
+    input  wire                             i_sigmoid_en, // CTRL[21]: sigmoid LUT activation (detect-head cls)
+    input  wire                             i_sigm_load_en, // runtime sigmoid LUT load (per scale)
+    input  wire [7:0]                       i_sigm_load_idx,
+    input  wire [7:0]                       i_sigm_load_val,
 
     // Pooling state control (from FSM)
     input  wire                             i_start,      // op-start pulse: reset pool phase
@@ -136,6 +140,16 @@ module post_process_top #(
         $readmemh("rtl/silu_lut_q4_4.hex", silu_lut);
     end
 
+    // Sigmoid LUT (INT8 logit -> Q0.8 prob): boot default + runtime-loadable per
+    // detect scale via NPU_SIGM_LOAD. Used by the detect-head cls path (CTRL[21]).
+    reg [ACT_WIDTH-1:0] sigmoid_lut [0:255];
+    initial begin
+        $readmemh("rtl/sigmoid_lut_q0_8.hex", sigmoid_lut);
+    end
+    always @(posedge clk) begin
+        if (i_sigm_load_en) sigmoid_lut[i_sigm_load_idx] <= i_sigm_load_val;
+    end
+
     reg [DATA_W-1:0] s3_act;
     reg              s3_vld;
 
@@ -149,6 +163,7 @@ module post_process_top #(
                                          (s2_signed > SILU_IN_MAX) ? 8'sh7f :
                                                                      s2_signed[7:0];
             wire [ACT_WIDTH-1:0] silu_val = silu_lut[silu_sat[7:0]];
+            wire [ACT_WIDTH-1:0] sigmoid_val = sigmoid_lut[silu_sat[7:0]];
             wire signed [7:0] silu_signed = $signed(silu_val);
             wire signed [31:0] silu_rq_prod = $signed({{24{silu_signed[7]}}, silu_signed})
                                             * $signed({16'd0, i_silu_requant_mul});
@@ -175,7 +190,8 @@ module post_process_top #(
             // When relu_en: negative→0, >clip_max→clip_max, else pass through
             // When !relu_en: only clamp >clip_max→clip_max, keep negative values
             // clip_max defaults to 127 (legacy ReLU); set lower for ReLU6.
-            assign act_val = (i_silu_en && i_silu_requant_en) ? silu_requant_val :
+            assign act_val = i_sigmoid_en          ? sigmoid_val :
+                             (i_silu_en && i_silu_requant_en) ? silu_requant_val :
                              i_silu_en             ? silu_val :
                              i_silu_requant_en     ? lin_requant_val :
                              (i_relu_en && is_neg) ? {ACT_WIDTH{1'b0}} :
