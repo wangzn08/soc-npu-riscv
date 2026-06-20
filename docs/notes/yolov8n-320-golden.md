@@ -76,6 +76,26 @@ Both conv types tile correctly -> backbone C2f assembly is unblocked.
 Measured @320 (tiled, row_par where applicable): conv1=441K, conv2(1x1)=830K,
 conv20=6.47M, all PASS.
 
+## NEXT: tiled C2f runner (precise, resumable plan)
+
+The existing `yolo_run_c2f_block` (firmware/yolo_c2f.c) is reusable EXCEPT its 4
+conv calls use the non-tiled `*_oc_chunks` path (loads whole tensor to SRAM),
+which overflows at 320 (c2f_2 cv1 out 80x80x32=204KB > 128KB Out SRAM; cv2 concat
+48x80x80=307KB > 256KB Act SRAM). CPU residual-add/concat are already DDR-based
+and fine. Scoped change:
+  1. Swap the 4 conv calls (cv1/m_cv1/m_cv2/cv2) to yolo_run_conv2d_tiled
+     (DDR->DDR, handles 1x1 + 3x3 now). Add cfg->pad_row_ddr + strip(=16); update
+     the 5 existing 640-strip c2f smokes to set pad_row_ddr (small data also OK
+     through tiled). Re-verify c2f4/6/8 still PASS.
+  2. c2f_2 @320 scales+integer model ALREADY exist in
+     gen_yolo_c2f_close_m5v_smoke.py (+ m5u chain): glue=/model.2/m.0/Add
+     (0.1549137533,-124 = yolo_glue_quant[0]); CAT_SCALE=0.1612435579,-125;
+     conv5_out=0.0763198882,-124; CONV2 s0/s1=0.1601515412,-126. Re-run that
+     chain at 80x80 with the real conv1 dump (dump320/conv1.bin), self-check vs
+     dump320/conv5.bin (c2f_2 output golden).
+  3. Firmware c2f2_320 smoke -> PASS -> chain backbone -> neck/head -> on-chip
+     decode (DFL HW + sigmoid HW + int argmax/geometry/NMS) -> full TRAP cycles.
+
 ## Phase 4 (on-SoC full inference) status
 
 Done: all per-op + tiled conv + DFL HW + sigmoid HW verified; C@320 golden above.
