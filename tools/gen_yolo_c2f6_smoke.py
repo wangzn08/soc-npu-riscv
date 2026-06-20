@@ -57,7 +57,7 @@ def cat_req(conv0, q, in_zp, src_scale):
 def W(name, shape): return np.fromfile(WEIGHT_DIR/name, dtype=np.int8).reshape(*shape)
 
 
-def main():
+def compute_c2f6():
     g = load("c2f4", C2F4_GEN)
     c13 = load("conv13", CONV13_GEN)
     conv0, conv13_out = c13.compute_conv13()      # [160,128] @ conv13 out = conv14 in
@@ -184,6 +184,11 @@ def main():
 """
     OUT_PATH.write_text(body, encoding="utf-8")
     print(f"wrote {OUT_PATH} ratios=({ratio0},{ratio1}) cat=({cm_s},{cm_a0},{cm_a1})")
+    return conv0, golden   # c2f_6 output [SP,128] int8 (40x4x128)
+
+
+def main():
+    compute_c2f6()
 
 
 if __name__ == "__main__":

@@ -152,6 +152,12 @@
   `firmware/yolo_c2f6_smoke.c`, `tools/gen_yolo_c2f6_smoke.py`. Backbone verified
   through model.6. Next: conv20 (128->256 s2), c2f_8 (n=1, needs bottleneck OC>64
   chunking since half_c=128), SPPF.
+- [x] m6d conv20 (model.7, 128->256 s2, OC=256) + c2f_8 (model.8, n=1, 256ch):
+  runner bottleneck m_cv1/m_cv2 routed through the OC>64 chunk helper too (half_c
+  may be >64). Both bit-exact (RTL_TOL=16). PASS. **Backbone (model.0..model.8)
+  now fully verified** through the generic runner; only SPPF (model.9) remains in
+  the backbone. `firmware/yolo_conv20_smoke.c`, `firmware/yolo_c2f8_smoke.c`,
+  `tools/gen_yolo_conv20_smoke.py`, `tools/gen_yolo_c2f8_smoke.py`.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
 
