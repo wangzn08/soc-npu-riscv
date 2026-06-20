@@ -5,8 +5,8 @@
 #include "firmware.h"
 #include "yolo_ops.h"
 
-#define YOLO_DMA_TIMEOUT 500000u
-#define YOLO_NPU_TIMEOUT 500000u
+#define YOLO_DMA_TIMEOUT 4000000u
+#define YOLO_NPU_TIMEOUT 60000000u   /* big 320 layers (ic128/oc256, no row_par) run many M cycles */
 #define YOLO_DMA_MAX_BEATS 256u
 
 static inline void npu_wr(uint32_t addr, uint32_t data)

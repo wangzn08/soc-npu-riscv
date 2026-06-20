@@ -40,6 +40,25 @@ decode). Format: `int32 c,h,w; float scale; int32 zp; int8 data[c*h*w]` (CHW).
 Each yolo_full.c stage's DDR output is compared against the matching conv<ci>.bin.
 Sanity: conv0=16x160x160 zp=-127, conv26(SPPF out)=256x10x10, conv61(head)=64x10x10.
 
+## Measured @320 per-layer cycles (tiled, perf counters)
+
+tools/gen_yolo_layer320.py <ci> + firmware/yolo_layer320_smoke.c (PERF around the
+tiled call; excludes test DDR init). All PASS vs RTL-model golden (<=tol).
+
+| layer | shape | cyc_total | npu_busy | note |
+|-------|-------|-----------|----------|------|
+| conv1  | 160x160x16 -> 80x80x32  (3x3 s2) | 809,452    | 425,300    | ic=16 (1 grp) |
+| conv20 | 20x20x128 -> 10x10x256 (3x3 s2) | 59,716,861 | 59,180,552 | ic=128 (8 grp), **no row_par** |
+
+**KEY FINDING:** the tiled primitive runs WITHOUT row_par (CTRL[9]), so deep
+(ic128/oc256) layers process output positions ~serially -> conv20 alone = 59.7M
+cycles. The full net this way would be hundreds of M cycles (impractical sim).
+Enabling row_par cuts this ~15x BUT the tiled strip-drain must match row_par's
+reverse-order 16-deep reorder semantics (adding NPU_CTRL_ROW_PAR naively breaks
+conv13 tiled golden). **Optimization TODO before full-net is practical: row_par-
+aware strip drain in yolo_run_conv2d_tiled.** Firmware NPU/DMA timeouts were
+raised (yolo_ops.c: NPU 60M, DMA 4M) so big layers complete.
+
 ## Phase 4 (on-SoC full inference) status
 
 Done: all per-op + tiled conv + DFL HW + sigmoid HW verified; C@320 golden above.
