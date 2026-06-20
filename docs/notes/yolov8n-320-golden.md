@@ -45,19 +45,21 @@ Sanity: conv0=16x160x160 zp=-127, conv26(SPPF out)=256x10x10, conv61(head)=64x10
 tools/gen_yolo_layer320.py <ci> + firmware/yolo_layer320_smoke.c (PERF around the
 tiled call; excludes test DDR init). All PASS vs RTL-model golden (<=tol).
 
-| layer | shape | cyc_total | npu_busy | note |
+| layer | shape | cyc_total (no rp) | cyc_total (row_par) | note |
 |-------|-------|-----------|----------|------|
-| conv1  | 160x160x16 -> 80x80x32  (3x3 s2) | 809,452    | 425,300    | ic=16 (1 grp) |
-| conv20 | 20x20x128 -> 10x10x256 (3x3 s2) | 59,716,861 | 59,180,552 | ic=128 (8 grp), **no row_par** |
+| conv1  | 160x160x16 -> 80x80x32  (3x3 s2) | 809,452    | **441,118**   | ic=16, 5 strips |
+| conv20 | 20x20x128 -> 10x10x256 (3x3 s2) | 59,716,861 | **6,468,621** | ic=128/oc=256, 1 strip |
 
-**KEY FINDING:** the tiled primitive runs WITHOUT row_par (CTRL[9]), so deep
-(ic128/oc256) layers process output positions ~serially -> conv20 alone = 59.7M
-cycles. The full net this way would be hundreds of M cycles (impractical sim).
-Enabling row_par cuts this ~15x BUT the tiled strip-drain must match row_par's
-reverse-order 16-deep reorder semantics (adding NPU_CTRL_ROW_PAR naively breaks
-conv13 tiled golden). **Optimization TODO before full-net is practical: row_par-
-aware strip drain in yolo_run_conv2d_tiled.** Firmware NPU/DMA timeouts were
-raised (yolo_ops.c: NPU 60M, DMA 4M) so big layers complete.
+**RESOLVED:** the tiled primitive now AUTO-enables row_par (CTRL[9]) when
+strip_out_rows>=16. row_par is correct in the tiled path including multi-strip
+(conv1 = 5 strips, PASS) and ~9x faster on deep layers. It only misorders strips
+SMALLER than 16 rows (the conv13 strip=2 halo stress test), which stay on the
+serial path. Firmware NPU/DMA timeouts raised (NPU 60M, DMA 4M) for big layers.
+
+Note: conv20 still 6.47M (ic128/oc256 oc_single over 8 ic-groups is heavy). Full
+net is a mix; summing measured layers is the path to the real total (next: chain
+assembly). Naive full-net @320 still likely ~50-150M cycles -> sim is long; the
+on-chip residency + per-layer measurement-then-sum is the practical route.
 
 ## Phase 4 (on-SoC full inference) status
 
