@@ -27,6 +27,12 @@ int yolo_run_upsample2x(uint32_t src_act_base,
                         uint32_t in_h,
                         uint32_t ic_groups);
 void yolo_set_silu_requant(uint32_t mul, uint32_t shift, int32_t zp);
+
+// Detect-head decode helpers (DFL expectation engine + sigmoid LUT).
+void yolo_dfl_load_weights(const int16_t wk_q8_8[16]);    // conv63 W_k = wscale*w[k]
+void yolo_dfl_load_exp_lut(const uint16_t exp_q1_15[256]); // per-scale exp table
+int  yolo_run_dfl(uint32_t src_act_base, uint32_t dst_act_base, uint32_t in_words);
+void yolo_load_sigmoid_lut(const uint8_t prob_q0_8[256]);  // per-scale cls sigmoid
 void yolo_set_pad_value(int32_t pad_value);
 void yolo_set_eltwise(int32_t zp, uint32_t skip_base);
 

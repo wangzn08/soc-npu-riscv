@@ -211,6 +211,36 @@ void yolo_set_pad_value(int32_t pad_value)
     npu_wr(NPU_PAD_VALUE, (uint32_t)pad_value & 0xFFu);
 }
 
+void yolo_dfl_load_weights(const int16_t wk[16])
+{
+    uint32_t i;
+    for (i = 0u; i < 16u; i++)
+        npu_wr(NPU_DFL_WLOAD, (i << 16) | ((uint32_t)(uint16_t)wk[i]));
+}
+
+void yolo_dfl_load_exp_lut(const uint16_t e[256])
+{
+    uint32_t i;
+    for (i = 0u; i < 256u; i++)
+        npu_wr(NPU_DFL_ELOAD, (i << 16) | (uint32_t)e[i]);
+}
+
+int yolo_run_dfl(uint32_t src, uint32_t dst, uint32_t n)
+{
+    npu_wr(NPU_DFL_SRC, src);
+    npu_wr(NPU_DFL_DST, dst);
+    npu_wr(NPU_DFL_CNT, n);
+    npu_wr(NPU_DFL_TRIG, 1u);
+    return wait_dma_status(NPU_DMA_STATUS_DFL_DONE);
+}
+
+void yolo_load_sigmoid_lut(const uint8_t p[256])
+{
+    uint32_t i;
+    for (i = 0u; i < 256u; i++)
+        npu_wr(NPU_SIGM_LOAD, (i << 8) | (uint32_t)p[i]);
+}
+
 void yolo_set_eltwise(int32_t zp, uint32_t skip_base)
 {
     npu_wr(NPU_ELTWISE_ZP, (uint32_t)zp & 0xFFu);
