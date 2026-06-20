@@ -5,9 +5,7 @@
 #include "yolo_ops.h"
 #include "yolo_c2f.h"
 
-#define ACT_BASE 0u
 #define WGT_BASE 0u
-#define OUT_BASE 0u
 
 static void wr_word(uint32_t a, uint32_t w, const uint32_t l[4])
 {
@@ -64,59 +62,59 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
     uint32_t half_groups = (cfg->full_c / 2u) / 16u;
     uint32_t full_groups = cfg->full_c / 16u;
     uint32_t sp = cfg->spatial;
+    uint32_t strip = (cfg->strip != 0u) ? cfg->strip : 16u;
     uint32_t i, pos, g;
 
     if (cfg->n_bottleneck == 0u || cfg->n_bottleneck > YOLO_C2F_MAX_BN)
         return 0;
 
-    // ---------- cv1 (1x1): block input -> s0|s1 (OC-chunked, supports >64) ----------
+    // ---------- cv1 (1x1): block input -> s0|s1 (tiled DDR->DDR, supports >64) ----------
     push_wgt(cfg->wgt_ddr, cfg->cv1_wgt, cfg->cv1_wgt_words);
     yolo_set_silu_requant(cfg->cv1_rq_mul, cfg->cv1_rq_shift, cfg->cv1_rq_zp);
-    if (!yolo_dma_ddr_to_act(cfg->in_ddr, ACT_BASE, sp * (cfg->cv1_ic / 16u)) ||
-        !yolo_run_pw_conv1x1_oc_chunks(ACT_BASE, cfg->wgt_ddr, WGT_BASE, cfg->cv1_out_ddr,
-                                       cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
-                                       cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
-                                       NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN, sp))
+    if (!yolo_run_conv2d_tiled(cfg->in_ddr, cfg->wgt_ddr, WGT_BASE, cfg->cv1_out_ddr,
+                               cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
+                               1u, 1u, 1u, 0u,
+                               cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
+                               NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
+                               cfg->cv1_wgt_words / cfg->full_c, strip, 0))
         return 0;
     (void)full_groups;
 
     // ---------- bottleneck chain ----------
     for (i = 0u; i < cfg->n_bottleneck; i++) {
-        // bottleneck input -> Act SRAM (half_c): i==0 => s1, i>0 => add_{i-1}.
+        // bottleneck input (half_c) lives in DDR: i==0 => s1 slice, i>0 => add_{i-1}.
         uint32_t prev_ddr;
-        if (i == 0u) {
-            if (!yolo_slice_ddr_to_act(cfg->cv1_out_ddr, ACT_BASE, sp, half_groups, half_groups))
-                return 0;
+        if (i == 0u)
             prev_ddr = cfg->cv1_out_ddr + (half_groups * sp) * 16u; // s1 slice base
-        } else {
-            if (!yolo_dma_ddr_to_act(cfg->add_ddr[i-1u], ACT_BASE, sp * half_groups))
-                return 0;
+        else
             prev_ddr = cfg->add_ddr[i-1u];
-        }
 
-        // m_cv1 (3x3) -> bn_out (OC-chunked; half_c may be >64)
+        // m_cv1 (3x3) -> bn_out (tiled DDR->DDR; half_c may be >64)
         push_wgt(cfg->wgt_ddr, cfg->mcv1_wgt[i], cfg->mcv1_wgt_words);
         yolo_set_pad_value(cfg->mcv1_pad_value[i]);
         yolo_set_silu_requant(cfg->mcv1_rq_mul[i], cfg->mcv1_rq_shift[i], cfg->mcv1_rq_zp[i]);
-        if (!yolo_run_conv2d_oc_chunks(ACT_BASE, cfg->wgt_ddr, WGT_BASE, cfg->bn_out_ddr,
-                                       cfg->in_w, cfg->in_h, cfg->full_c/2u, cfg->full_c/2u,
-                                       3u, 3u, 1u, 1u,
-                                       cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
-                                       NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
-                                       cfg->mcv1_wgt_words / (cfg->full_c/2u), sp))
+        if (!yolo_run_conv2d_tiled(prev_ddr, cfg->wgt_ddr, WGT_BASE, cfg->bn_out_ddr,
+                                   cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                                   cfg->full_c/2u, cfg->full_c/2u,
+                                   3u, 3u, 1u, 1u,
+                                   cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
+                                   NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
+                                   cfg->mcv1_wgt_words / (cfg->full_c/2u), strip,
+                                   cfg->mcv1_pad_value[i]))
             return 0;
 
-        // m_cv2 (3x3) requant to glue[i] -> mcv2_ddr (OC-chunked)
+        // m_cv2 (3x3) requant to glue[i] -> mcv2_ddr (tiled DDR->DDR)
         push_wgt(cfg->wgt_ddr, cfg->mcv2_wgt[i], cfg->mcv2_wgt_words);
         yolo_set_pad_value(cfg->mcv2_pad_value[i]);
         yolo_set_silu_requant(cfg->glue_rq_mul[i], cfg->glue_rq_shift[i], cfg->glue_zp[i]);
-        if (!yolo_dma_ddr_to_act(cfg->bn_out_ddr, ACT_BASE, sp * half_groups) ||
-            !yolo_run_conv2d_oc_chunks(ACT_BASE, cfg->wgt_ddr, WGT_BASE, cfg->mcv2_ddr,
-                                       cfg->in_w, cfg->in_h, cfg->full_c/2u, cfg->full_c/2u,
-                                       3u, 3u, 1u, 1u,
-                                       cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
-                                       NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
-                                       cfg->mcv2_wgt_words / (cfg->full_c/2u), sp))
+        if (!yolo_run_conv2d_tiled(cfg->bn_out_ddr, cfg->wgt_ddr, WGT_BASE, cfg->mcv2_ddr,
+                                   cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                                   cfg->full_c/2u, cfg->full_c/2u,
+                                   3u, 3u, 1u, 1u,
+                                   cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
+                                   NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
+                                   cfg->mcv2_wgt_words / (cfg->full_c/2u), strip,
+                                   cfg->mcv2_pad_value[i]))
             return 0;
 
         // residual add (CPU) -> add_ddr[i]; or pass-through when !shortcut.
@@ -148,14 +146,15 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
                              cfg->cat_req_shift, cfg->cat_zp, cfg->concat_ddr, (dstg++)*sp+pos);
     }
 
-    // ---------- cv2 (1x1, OC-chunked, supports >64) ----------
+    // ---------- cv2 (1x1, tiled DDR->DDR, supports >64) ----------
     push_wgt(cfg->wgt_ddr, cfg->cv2_wgt, cfg->cv2_wgt_words);
     yolo_set_silu_requant(cfg->cv2_rq_mul, cfg->cv2_rq_shift, cfg->cv2_rq_zp);
-    if (!yolo_dma_ddr_to_act(cfg->concat_ddr, ACT_BASE, sp * (cfg->cv2_ic / 16u)) ||
-        !yolo_run_pw_conv1x1_oc_chunks(ACT_BASE, cfg->wgt_ddr, WGT_BASE, cfg->out_ddr,
-                                       cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
-                                       cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,
-                                       NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN, sp))
+    if (!yolo_run_conv2d_tiled(cfg->concat_ddr, cfg->wgt_ddr, WGT_BASE, cfg->out_ddr,
+                               cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
+                               1u, 1u, 1u, 0u,
+                               cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,
+                               NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
+                               cfg->cv2_wgt_words / cfg->cv2_oc, strip, 0))
         return 0;
 
     return 1;

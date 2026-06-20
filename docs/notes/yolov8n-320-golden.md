@@ -83,10 +83,12 @@ conv calls use the non-tiled `*_oc_chunks` path (loads whole tensor to SRAM),
 which overflows at 320 (c2f_2 cv1 out 80x80x32=204KB > 128KB Out SRAM; cv2 concat
 48x80x80=307KB > 256KB Act SRAM). CPU residual-add/concat are already DDR-based
 and fine. Scoped change:
-  1. Swap the 4 conv calls (cv1/m_cv1/m_cv2/cv2) to yolo_run_conv2d_tiled
-     (DDR->DDR, handles 1x1 + 3x3 now). Add cfg->pad_row_ddr + strip(=16); update
-     the 5 existing 640-strip c2f smokes to set pad_row_ddr (small data also OK
-     through tiled). Re-verify c2f4/6/8 still PASS.
+  1. DONE — swapped the 4 conv calls (cv1/m_cv1/m_cv2/cv2) in yolo_run_c2f_block
+     to yolo_run_conv2d_tiled (DDR->DDR, 1x1 + 3x3). Added cfg->pad_row_ddr +
+     cfg->strip (default 16). The 6 c2f smokes (c2f4/6/8/12/15 + backbone_tail)
+     set pad_row_ddr=0x40080000, strip=16. Re-verified RTL: c2f4 PASS (31.99M),
+     c2f6 PASS (18.33M), c2f8 PASS (11.39M), all Errors:0. The tiled path no
+     longer overflows Out/Act SRAM, so 320 spatial is unblocked.
   2. c2f_2 @320 scales+integer model ALREADY exist in
      gen_yolo_c2f_close_m5v_smoke.py (+ m5u chain): glue=/model.2/m.0/Add
      (0.1549137533,-124 = yolo_glue_quant[0]); CAT_SCALE=0.1612435579,-125;

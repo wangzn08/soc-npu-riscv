@@ -29,6 +29,8 @@ typedef struct {
     uint32_t mcv2_ddr;              // m_cv2 output scratch (half_c, glue scale)
     uint32_t add_ddr[YOLO_C2F_MAX_BN];
     uint32_t concat_ddr, out_ddr, wgt_ddr;
+    uint32_t pad_row_ddr;           // one-row scratch for tiled vertical padding
+    uint32_t strip;                 // tiled output-row strip height (0 => default 16)
 
     // ----- cv1 (1x1) -----
     const uint32_t (*cv1_wgt)[4]; uint32_t cv1_wgt_words;

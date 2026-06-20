@@ -11,6 +11,7 @@
 #include "yolo_sppf_data.h"
 #include <stdint.h>
 
+#define PAD_ROW    0x40080000u   // tiled vertical-pad scratch row
 #define C20_IN     0x40090000u   // conv20 input (c2f_6 out, baked)
 #define C20_OUT    0x40120000u   // conv20 out = c2f_8 in
 #define CV1_OUT    0x40140000u
@@ -94,6 +95,7 @@ void usercode7(void)
         cfg.in_ddr=C20_OUT; cfg.cv1_ic=YOLO_C2F8_CV1_IC; cfg.cv1_out_ddr=CV1_OUT;
         cfg.bn_out_ddr=BN_OUT; cfg.mcv2_ddr=MCV2_DDR; cfg.add_ddr[0]=ADD0_DDR;
         cfg.concat_ddr=CONCAT8; cfg.out_ddr=C2F8_OUT; cfg.wgt_ddr=WGT_DDR;
+        cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u;
         cfg.cv1_wgt=yolo_c2f8_cv1_wgt; cfg.cv1_wgt_words=YOLO_C2F8_CV1_WGT_WORDS;
         cfg.cv1_bias=yolo_c2f8_cv1_bias; cfg.cv1_mul=yolo_c2f8_cv1_mul; cfg.cv1_shift=yolo_c2f8_cv1_shift;
         cfg.cv1_rq_mul=YOLO_C2F8_CV1_RQ_MUL; cfg.cv1_rq_shift=YOLO_C2F8_CV1_RQ_SHIFT; cfg.cv1_rq_zp=YOLO_C2F8_CV1_RQ_ZP;
