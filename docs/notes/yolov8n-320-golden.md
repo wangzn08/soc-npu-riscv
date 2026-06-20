@@ -98,6 +98,35 @@ and fine. Scoped change:
   3. Firmware c2f2_320 smoke -> PASS -> chain backbone -> neck/head -> on-chip
      decode (DFL HW + sigmoid HW + int argmax/geometry/NMS) -> full TRAP cycles.
 
+### BLOCKER found at Step 2.2 (2026-06-21): SiLU LUT range gap
+
+tools/gen_yolo_c2f2_320.py runs the full c2f_2 from the REAL conv1 dump and
+self-checks vs dump320/conv5.bin. Result: mismatch 152231/204800, maxabs=69 —
+and even cv1 (conv2 alone) is maxabs=116 vs dump320/conv2.bin.
+
+Root cause is ARCHITECTURAL, not a generator bug:
+- The C float engine matches dump320/conv2.bin BIT-EXACTLY (mism 0).
+- The NPU SiLU uses a FIXED Q4.4 LUT (rtl/silu_lut_q4_4.hex, boot $readmemh in
+  post_process_top.v) — input range +-8, resolution 1/16. The integer datapath
+  feeds q44 ~= 16*preact into it.
+- conv2 preact spans [-71.7, +26.4]. 6.4% of elements have |16*preact|>127 and
+  SATURATE the LUT -> max error 116. Non-saturated elements match within +-2
+  (pure LUT rounding).
+- Prior per-conv/m5v smokes never caught this: they validate firmware against the
+  SAME saturating RTL model, never against the C float golden. Step 2's per-layer
+  alignment-to-C is the first true-oracle check.
+
+Fix direction (recommended): make the SiLU LUT runtime-loadable PER LAYER, mirror
+the existing sigmoid LUT load path (i_sigm_load_en / yolo_load_sigmoid_lut in the
+same RTL file). Offline gen builds each layer's 256-entry table from its
+(silu_in_scale, out_scale, out_zp); index = round(preact/silu_in_scale)+128 with
+silu_in_scale covering that layer's preact range -> SiLU exact to int8. Touches
+RTL (LUT load port) + firmware + all yolo generators. Plan reference:
+docs/superpowers/plans/2026-06-18-yolov8n-silu-lut-m1.md.
+
+gen_yolo_c2f2_320.py + the C2f tiled swap (commit 5c45855) are ready; c2f2_320
+will align once the LUT fix lands.
+
 ## Phase 4 (on-SoC full inference) status
 
 Done: all per-op + tiled conv + DFL HW + sigmoid HW verified; C@320 golden above.
