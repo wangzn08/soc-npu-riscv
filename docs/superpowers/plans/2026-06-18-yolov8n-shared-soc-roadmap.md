@@ -203,8 +203,13 @@
   Detect head structure + two open issues (LINEAR output convs need int32_out+CPU
   requant; DFL/decode needs no-FPU handling, likely host-side) documented in
   `plans/2026-06-19-yolov8n-detect-head-m6.md`.
-- [ ] Run detect-head conv outputs through shared NPU block scheduling.
-- [ ] DMA detect logits to DDR.
+- [x] LINEAR output-conv HW path (post_process linear-requant: silu_requant_en &&
+  !silu_en => clamp_s8(s2 + out_zp)); validated by `tb_npu_integ` LIN_REQUANT and
+  the scale-0 bbox branch `yolo_head_bbox0_smoke.c` (conv36->38->conv41 LINEAR),
+  bit-exact. MNIST byte-identical. Closes the head's last per-op gap.
+- [x] Run detect-head conv outputs through shared NPU block scheduling (scale-0
+  bbox branch end-to-end on NPU).
+- [ ] DMA detect logits to DDR (other branches/scales: same path, fixtures only).
 - [ ] Reuse or port the existing C golden DFL/decode logic in firmware or host-side checker.
 - [ ] Compare boxes/classes/scores against the existing INT8 golden.
 - [ ] Defer DFL hardening until the software-tail path is correct.
@@ -212,9 +217,26 @@
 
 ## Milestone 7: Full YOLO RTL Simulation
 
-**Status:** Planned.
+**Status:** In progress. All per-op capabilities are proven and a multi-block
+integrated RTL run works.
 
-**Deliverable:** Full YOLOv8n INT8 inference runs in RTL simulation under CPU control.
+Progress (2026-06-19):
+- Every YOLOv8n op type is bit-exact on the shared NPU: conv (1x1/3x3, stride1/2,
+  any IC/OC via OC>64 chunking), SiLU, SiLU-requant, LINEAR conv, 2x2 + 5x5
+  maxpool, upsample2x, concat, residual add, generic C2f (shortcut 0/1).
+- **First multi-block integrated RTL run** (`yolo_backbone_tail_smoke.c`):
+  conv20 -> c2f_8 -> SPPF chained in ONE sim, intermediates in DDR (not re-baked),
+  final bit-exact vs golden. Proves blocks chain end-to-end in hardware.
+- Functional full-image inference verified on the C reference (bus.jpg -> 4 person
+  detections), i.e. the quantized math the RTL is validated against is correct
+  end-to-end.
+
+Remaining for a single conv0->detections RTL pass over a full 640x640:
+- A **halo-aware strip scheduler** for the large early feature maps (640x640 down
+  to 80x80 exceed Act/Out SRAM, so each layer runs in vertical strips that need
+  halo rows from adjacent strips for 3x3/stride-2 convs). This is the one large
+  remaining integration; all the per-layer/per-block pieces it would call are done.
+- Detect-head logits -> DDR -> host-side DFL/decode/NMS (no FPU on PicoRV32).
 
 - [ ] Build a firmware entry point such as `firmware/yolo_smoke.c`.
 - [ ] Use CPU scheduling for every layer and block.
