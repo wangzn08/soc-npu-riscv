@@ -28,6 +28,18 @@ Build: `gcc -O2 -o test_infer test_infer.c yolov8n_infer.c -lm`.
 
 At 320: P3/P4/P5 = 40/20/10, num_anchors = 1600+400+100 = 2100.
 
+## Per-layer golden oracle (for yolo_full.c stage validation)
+
+`dbg_dump_conv` writes full int8 tensors when both env vars are set:
+```
+cd yolov8n_int8 && mkdir -p dump320
+YOLO_DEBUG_DUMP=1 YOLO_DUMP_DIR=dump320 ./test_infer bus320.ppm
+```
+Produces `dump320/conv<ci>.bin` for ci=0..62 (conv63 is the DFL projection, done in
+decode). Format: `int32 c,h,w; float scale; int32 zp; int8 data[c*h*w]` (CHW).
+Each yolo_full.c stage's DDR output is compared against the matching conv<ci>.bin.
+Sanity: conv0=16x160x160 zp=-127, conv26(SPPF out)=256x10x10, conv61(head)=64x10x10.
+
 ## Phase 4 (on-SoC full inference) status
 
 Done: all per-op + tiled conv + DFL HW + sigmoid HW verified; C@320 golden above.

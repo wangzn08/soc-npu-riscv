@@ -202,8 +202,25 @@ static Tensor conv_int8(int ci, const Tensor *in) {
 /* Dump dequantized first-8 values for the conv indices that map to the
  * ONNX checkpoint tensors (conv0, C2f.2 cv1, SPPF cv2, scale2 bbox head). */
 static void dbg_dump_conv(int ci, const void *tp) {
-    if (ci != 0 && ci != 2 && ci != 26 && ci != 61) return;
     const Tensor *t = (const Tensor *)tp;
+    /* Full per-layer golden dump for the SoC assembly oracle:
+     * <YOLO_DUMP_DIR>/conv<ci>.bin = [int32 c,h,w, float scale, int32 zp] + int8 CHW */
+    const char *dd = getenv("YOLO_DUMP_DIR");
+    if (dd) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/conv%d.bin", dd, ci);
+        FILE *fp = fopen(path, "wb");
+        if (fp) {
+            int32_t hdr[3] = { t->c, t->h, t->w };
+            float sc = t->scale; int32_t zp = t->zero_point;
+            fwrite(hdr, sizeof(int32_t), 3, fp);
+            fwrite(&sc, sizeof(float), 1, fp);
+            fwrite(&zp, sizeof(int32_t), 1, fp);
+            fwrite(t->data, sizeof(int8_t), (size_t)t->c * t->h * t->w, fp);
+            fclose(fp);
+        }
+    }
+    if (ci != 0 && ci != 2 && ci != 26 && ci != 61) return;
     const char *tag = "?";
     if (ci == 0)  tag = "conv0   /model.0/act/Mul_output_0";
     if (ci == 2)  tag = "conv2   /model.2/cv1/act/Mul_output_0";
