@@ -84,8 +84,8 @@ def main():
 
     act_words = [pack_i8_word(act[g*16:g*16+16, y, x])
                  for g in range(IC//16) for y in range(IN_H) for x in range(IN_W)]
-    wgt_words = [pack_i8_word(w[oc, :, ko//KW, ko%KW])
-                 for oc in range(OC) for ko in range(KH*KW)]
+    wgt_words = [pack_i8_word(w[oc, g*16:g*16+16, ko//KW, ko%KW])
+                 for oc in range(OC) for g in range(IC//16) for ko in range(KH*KW)]
 
     def u32a(name, words):
         L = [f"static const uint32_t {name}[{len(words)}][4] = {{"]

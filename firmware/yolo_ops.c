@@ -475,14 +475,25 @@ int yolo_run_conv2d_tiled(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_ba
             if (!yolo_dma_ddr_to_wgt(wgt_all_ddr + done * wgt_words_per_oc * 16u,
                                      wgt_base, chunk * wgt_words_per_oc))
                 return 0;
-            if (!yolo_run_conv2d_qparams_pads(0u, wgt_base, 0u,
+            if (kernel_h == 1u && kernel_w == 1u) {
+                /* 1x1 pointwise: no halo (strip_in_h==so), no pad; PW engine.
+                 * PW path is not row_par-aware, so mask it off. */
+                if (!yolo_run_pw_conv1x1_qparams(0u, wgt_base, 0u,
+                                                 in_w, strip_in_h, in_c, chunk,
+                                                 bias + done, scale_mul + done,
+                                                 scale_shift + done,
+                                                 (ctrl_flags & ~NPU_CTRL_ROW_PAR) |
+                                                 NPU_CTRL_OC_SINGLE))
+                    return 0;
+            } else if (!yolo_run_conv2d_qparams_pads(0u, wgt_base, 0u,
                                               in_w, strip_in_h, in_c, chunk,
                                               kernel_h, kernel_w, stride,
                                               0u, pad,
                                               bias + done, scale_mul + done,
                                               scale_shift + done,
-                                              ctrl_flags | NPU_CTRL_OC_SINGLE))
+                                              ctrl_flags | NPU_CTRL_OC_SINGLE)) {
                 return 0;
+            }
             /* Drain 'so' rows per OC-group into the full-height out tensor at row oy0. */
             for (sg = 0u; sg < chunk / 16u; sg++) {
                 uint32_t oc_grp = done / 16u + sg;

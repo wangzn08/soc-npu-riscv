@@ -61,15 +61,20 @@ net is a mix; summing measured layers is the path to the real total (next: chain
 assembly). Naive full-net @320 still likely ~50-150M cycles -> sim is long; the
 on-chip residency + per-layer measurement-then-sum is the practical route.
 
-## OPEN: 1x1 pointwise tiling (blocks backbone C2f at 320)
+## 1x1 pointwise tiling — DONE
 
-3x3 tiling is solid (conv1/13/20 PASS). 1x1 layers at 320 also exceed SRAM and
-need tiling, but routing 1x1 strips through the PW engine inside
-yolo_run_conv2d_tiled gives a per-channel mismatch (conv2 80x80x32: oc0 exact,
-oc1+ off by ~26, with AND without row_par). Root cause not yet found — the
-standalone conv7 @640 PW smoke passes, so it's specific to the tiled/strip PW
-feed. gen_yolo_layer320.py now kernel-aware (CFG has conv2) to drive the fix.
-**Next: debug PW-in-strip per-channel result, then 1x1 tiling unblocks C2f.**
+yolo_run_conv2d_tiled now routes 1x1 strips through the PW engine (kh==kw==1; no
+halo, no pad, row_par masked off — PW path isn't row_par-aware). conv2 @320
+(80x80x32 1x1, tiled) PASS, cyc_total=829,875.
+
+Root cause of the earlier mismatch was a generator bug: gen_yolo_layer320.py
+weight packing dropped the ic-group loop, so any IC>16 layer kept only the first
+16 input channels. Fixed (pack per oc x ic-group x tap). NOTE: cycle counts are
+data-independent so prior measurements stand; correctness now verified for ic>16.
+
+Both conv types tile correctly -> backbone C2f assembly is unblocked.
+Measured @320 (tiled, row_par where applicable): conv1=441K, conv2(1x1)=830K,
+conv20=6.47M, all PASS.
 
 ## Phase 4 (on-SoC full inference) status
 
