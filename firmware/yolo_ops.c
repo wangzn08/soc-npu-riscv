@@ -374,6 +374,91 @@ int yolo_run_conv2d_oc_chunks(uint32_t act_base, uint32_t wgt_all_ddr, uint32_t 
     return 1;
 }
 
+int yolo_run_conv2d_tiled(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_base,
+                          uint32_t out_ddr, uint32_t pad_row_ddr,
+                          uint32_t in_w, uint32_t in_h, uint32_t in_c, uint32_t out_c,
+                          uint32_t kernel_h, uint32_t kernel_w,
+                          uint32_t stride, uint32_t pad,
+                          const int32_t *bias, const uint32_t *scale_mul,
+                          const uint32_t *scale_shift, uint32_t ctrl_flags,
+                          uint32_t wgt_words_per_oc, uint32_t strip_out_rows,
+                          int32_t pad_value)
+{
+    uint32_t icg = in_c / 16u;
+    uint32_t out_w, out_h, oy0;
+
+    if (icg == 0u || in_w == 0u || in_h == 0u || out_c == 0u ||
+        kernel_h == 0u || kernel_w == 0u || stride == 0u || strip_out_rows == 0u)
+        return 0;
+
+    out_w = (in_w + 2u * pad - kernel_w) / stride + 1u;
+    out_h = (in_h + 2u * pad - kernel_h) / stride + 1u;
+
+    /* Materialize one pad row in DDR: in_w words, each lane = pad_value. */
+    {
+        uint32_t lane = (uint32_t)pad_value & 0xFFu;
+        uint32_t word = lane | (lane << 8) | (lane << 16) | (lane << 24);
+        volatile uint32_t *p = (volatile uint32_t *)pad_row_ddr;
+        uint32_t i;
+        for (i = 0u; i < in_w * 4u; i++)
+            p[i] = word;
+    }
+
+    for (oy0 = 0u; oy0 < out_h; oy0 += strip_out_rows) {
+        uint32_t so = out_h - oy0;
+        uint32_t strip_in_h;
+        int32_t ir0;
+        uint32_t g, ri, done;
+
+        if (so > strip_out_rows)
+            so = strip_out_rows;
+        strip_in_h = (so - 1u) * stride + kernel_h;  /* rows needed for 'so' out rows, pad_h=0 */
+        ir0 = (int32_t)(oy0 * stride) - (int32_t)pad; /* first input row (may be < 0 => pad) */
+
+        /* Stage strip input rows (with vertical pad rows) into Act SRAM, tile-major. */
+        for (g = 0u; g < icg; g++) {
+            for (ri = 0u; ri < strip_in_h; ri++) {
+                int32_t r = ir0 + (int32_t)ri;
+                uint32_t dst = (g * strip_in_h + ri) * in_w;
+                uint32_t src = (r >= 0 && r < (int32_t)in_h)
+                    ? in_ddr + (g * in_h + (uint32_t)r) * in_w * 16u
+                    : pad_row_ddr;
+                if (!yolo_dma_ddr_to_act(src, dst, in_w))
+                    return 0;
+            }
+        }
+
+        /* OC>64 chunks: weights reloaded per chunk; conv runs pad_h=0, pad_w=pad (HW). */
+        done = 0u;
+        while (done < out_c) {
+            uint32_t chunk = out_c - done;
+            uint32_t sg;
+            if (chunk > 64u)
+                chunk = 64u;
+            if (!yolo_dma_ddr_to_wgt(wgt_all_ddr + done * wgt_words_per_oc * 16u,
+                                     wgt_base, chunk * wgt_words_per_oc))
+                return 0;
+            if (!yolo_run_conv2d_qparams_pads(0u, wgt_base, 0u,
+                                              in_w, strip_in_h, in_c, chunk,
+                                              kernel_h, kernel_w, stride,
+                                              0u, pad,
+                                              bias + done, scale_mul + done,
+                                              scale_shift + done,
+                                              ctrl_flags | NPU_CTRL_OC_SINGLE))
+                return 0;
+            /* Drain 'so' rows per OC-group into the full-height out tensor at row oy0. */
+            for (sg = 0u; sg < chunk / 16u; sg++) {
+                uint32_t oc_grp = done / 16u + sg;
+                if (!yolo_dma_out_to_ddr(out_ddr + (oc_grp * out_h + oy0) * out_w * 16u,
+                                         sg * so * out_w, so * out_w, 0u))
+                    return 0;
+            }
+            done += chunk;
+        }
+    }
+    return 1;
+}
+
 int yolo_run_conv2d_qparams(uint32_t act_base,
                             uint32_t wgt_base,
                             uint32_t out_base,
