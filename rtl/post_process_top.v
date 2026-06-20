@@ -159,12 +159,25 @@ module post_process_top #(
                 (silu_rq_biased >  32'sd127) ? 8'h7f :
                                                 silu_rq_biased[7:0];
 
+            // Linear-output requant (silu_requant_en && !silu_en): for LINEAR
+            // quantized convs (detect-head outputs, has_silu=0). Stage-2 scale_mul/
+            // shift are set so s2_quant == round(real_preact / out_scale); here we
+            // just add the output zero-point (reusing i_silu_requant_zp) and clamp
+            // to signed INT8. Bypasses the SiLU LUT and its Q4.4 (+/-8) clamp.
+            wire signed [PSUM_WIDTH-1:0] lin_biased =
+                s2_signed + $signed({{(PSUM_WIDTH-8){i_silu_requant_zp[7]}}, i_silu_requant_zp});
+            wire [ACT_WIDTH-1:0] lin_requant_val =
+                (lin_biased < -32'sd128) ? 8'h80 :
+                (lin_biased >  32'sd127) ? 8'h7f :
+                                            lin_biased[ACT_WIDTH-1:0];
+
             wire [ACT_WIDTH-1:0] act_val;
             // When relu_en: negative→0, >clip_max→clip_max, else pass through
             // When !relu_en: only clamp >clip_max→clip_max, keep negative values
             // clip_max defaults to 127 (legacy ReLU); set lower for ReLU6.
             assign act_val = (i_silu_en && i_silu_requant_en) ? silu_requant_val :
                              i_silu_en             ? silu_val :
+                             i_silu_requant_en     ? lin_requant_val :
                              (i_relu_en && is_neg) ? {ACT_WIDTH{1'b0}} :
                              is_gt                 ? i_clip_max :
                                                      s2_val[ACT_WIDTH-1:0];

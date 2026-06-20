@@ -21,7 +21,17 @@ Tail (CPU/host, float): assemble [84, 8400], DFL softmax-expectation over 16 bin
 - The stem/mid convs (conv36/37/38/39 ...) are ordinary 3x3 SiLU convs — already
   a proven path (OC-chunked).
 
-## Open issue 1: the LINEAR output convs (conv41/42/... has_silu=0)
+## RESOLVED — Open issue 1: LINEAR output convs (conv41/42/... has_silu=0)
+
+FIXED 2026-06-19: added a linear-requant mode to `post_process_top.v` — when
+`silu_requant_en && !silu_en`, output = `clamp_s8(s2_quant + out_zp)` (reuses
+`silu_requant_zp` as the output zp; bypasses the SiLU LUT and its Q4.4 clamp).
+Per-OC stage-2 `scale_mul/shift` are set (generator `lin_qparams`) so `s2_quant ==
+round(real_preact/out_scale)`. Validated by `tb_npu_integ` LIN_REQUANT and a real
+head branch (`yolo_head_bbox0_smoke.c`: conv36->38->conv41 LINEAR, bit-exact).
+MNIST 10/10 byte-identical (MNIST never sets silu_requant_en). No int32_out needed.
+
+## (original) Open issue 1: the LINEAR output convs (conv41/42/... has_silu=0)
 
 The shared post-process only has a zero-point-aware signed requant **inside the
 SiLU path** (it requants `LUT[q44]`). It has no "requant without SiLU":

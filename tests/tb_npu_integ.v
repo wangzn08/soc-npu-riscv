@@ -112,7 +112,7 @@ module tb_npu_integ;
     function [9:0] R_SCALE(input integer ch); R_SCALE = 10'h80 + ch*4; endfunction
     function [9:0] R_SHIFT(input integer ch); R_SHIFT = 10'hC0 + ch*4; endfunction
 
-    integer ic, oc, p, t, oy, ox;
+    integer ic, oc, p, t, oy, ox, ev;
     reg [127:0] actw, wgtw, outw;
     reg [7:0] got, exp;
 
@@ -285,6 +285,40 @@ module tb_npu_integ;
             end
           end
         if (errors == 0) $display("  [PASS] S2_3x3: stride-2 window positions");
+
+        // ============ TEST: linear requant (silu_requant_en && !silu_en) ============
+        // GEMM acc=oc+1; scale_mul=1, shift=0 => s2=oc+1. silu_requant_en with
+        // zp=-5, silu_en=0 => out = clamp_s8(oc+1-5). Validates the LINEAR conv
+        // output path (detect head has_silu=0 convs).
+        actw = 128'd0;
+        for (ic = 0; ic < 16; ic = ic + 1) actw[ic*8 +: 8] = 8'd1;
+        act_poke(0, actw);
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            wgtw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1) if (ic <= oc) wgtw[ic*8 +: 8] = 8'd1;
+            wgt_poke(oc, wgtw);
+        end
+        reg_write(R_INW, 1);  reg_write(R_INH, 1);
+        reg_write(R_IC, 16);  reg_write(R_OC, 16);
+        reg_write(R_KERN, (1<<8)|1); reg_write(R_STR, (1<<8)|1);
+        reg_write(R_ACTA, 0); reg_write(R_WGTA, 0); reg_write(R_OUTA, 0);
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            reg_write(R_BIAS(oc), 0); reg_write(R_SCALE(oc), 1); reg_write(R_SHIFT(oc), 0);
+        end
+        reg_write(10'h3CC, 32'hFB000000);          // silu_requant cfg: zp=-5, mul/shift=0
+        reg_write(R_CTRL, C_START | C_GEMM | 32'h80000);  // GEMM | silu_requant_en (no silu_en)
+        wait_done(5000);
+        repeat (5) @(negedge clk);
+        outw = dut.u_out_sram.u_bram.mem[0];
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            ev = (oc + 1) - 5; if (ev < -128) ev = -128; if (ev > 127) ev = 127;
+            got = outw[oc*8 +: 8];
+            if ($signed(got) !== ev) begin
+                $display("  [FAIL] LIN out[%0d]=%0d exp=%0d", oc, $signed(got), ev);
+                errors = errors + 1;
+            end
+        end
+        if (errors == 0) $display("  [PASS] LIN_REQUANT: out[oc]=clamp(oc+1-5)");
 
         if (errors == 0) $display("TB_NPU_INTEG PASS");
         else $display("TB_NPU_INTEG FAIL errors=%0d", errors);
