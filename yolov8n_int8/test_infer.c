@@ -4,6 +4,8 @@
 #include <string.h>
 #include "yolov8n_infer.h"
 
+extern int g_yolo_input;   /* inference resolution (square, multiple of 32) */
+
 /* Load a PPM P6 image (640x640 RGB) */
 static uint8_t *load_ppm(const char *path, int *w, int *h) {
     FILE *f = fopen(path, "rb");
@@ -66,13 +68,14 @@ int main(int argc, char **argv) {
         iw = ih = 640;
     }
 
-    if (iw != 640 || ih != 640) {
-        fprintf(stderr, "Image must be 640x640, got %dx%d\n", iw, ih);
+    if (iw != ih || (iw % 32) != 0) {
+        fprintf(stderr, "Image must be square, multiple of 32; got %dx%d\n", iw, ih);
         free(image);
         return 1;
     }
+    g_yolo_input = iw;
 
-    printf("Running YOLOv8n INT8 inference...\n");
+    printf("Running YOLOv8n INT8 inference at %dx%d...\n", iw, ih);
     YoloDet dets[100];
     int n = yolo_infer(image, dets, 100, conf_thr, nms_thr);
 

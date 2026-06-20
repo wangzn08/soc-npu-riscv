@@ -36,6 +36,10 @@ static inline int8_t *t_at(const Tensor *t, int ch, int row, int col) {
 static char arena[128 * 1024 * 1024];  /* 128 MB */
 static size_t arena_off = 0;
 
+/* Input resolution (square, multiple of 32). Default 640; set to 320 for the
+ * SoC deploy golden. Same weights/quant scales are reused at any resolution. */
+int g_yolo_input = 640;
+
 static void *arena_alloc(size_t bytes) {
     bytes = (bytes + 15) & ~15;  /* 16-byte align */
     void *p = arena + arena_off;
@@ -495,12 +499,15 @@ int yolo_infer(const uint8_t *image_rgb, YoloDet *dets, int max_dets,
                float conf_thr, float nms_thr) {
     arena_off = 0;
 
-    /* Convert input to int8 CHW (quantize per conv0's in_scale/in_zp) */
-    Tensor input = tensor_make(3, 640, 640, conv_w[0].in_scale, conv_w[0].in_zp);
+    /* Convert input to int8 CHW (quantize per conv0's in_scale/in_zp).
+     * Resolution-parametric: g_yolo_input (default 640) lets the same weights/
+     * scales run at e.g. 320x320. Must be a multiple of 32 (5 stride-2 stages). */
+    int IN = g_yolo_input;
+    Tensor input = tensor_make(3, IN, IN, conv_w[0].in_scale, conv_w[0].in_zp);
     for (int c = 0; c < 3; c++)
-        for (int h = 0; h < 640; h++)
-            for (int w = 0; w < 640; w++) {
-                float real_val = image_rgb[(h*640+w)*3+c] / 255.0f;
+        for (int h = 0; h < IN; h++)
+            for (int w = 0; w < IN; w++) {
+                float real_val = image_rgb[(h*IN+w)*3+c] / 255.0f;
                 *t_at(&input, c, h, w) = clamp_round_int8(real_val / input.scale + input.zero_point);
             }
 
@@ -597,7 +604,7 @@ int yolo_infer(const uint8_t *image_rgb, YoloDet *dets, int max_dets,
     d2_cls = conv_int8(62, &d2_cls);
 
     /* === Concatenate bbox/cls across 3 scales === */
-    int a0 = 80*80, a1 = 40*40, a2 = 20*20;
+    int a0 = d0_bbox.h * d0_bbox.w, a1 = d1_bbox.h * d1_bbox.w, a2 = d2_bbox.h * d2_bbox.w;
     int num_anchors = a0 + a1 + a2; /* 8400 */
 
     /* bbox/cls outputs are int8; dequant to float while assembling the
@@ -672,18 +679,17 @@ int yolo_infer(const uint8_t *image_rgb, YoloDet *dets, int max_dets,
     int n_dets = 0;
     YoloDet raw_dets[8400];
 
+    int scale_hw[3] = { d0_bbox.h, d1_bbox.h, d2_bbox.h };
     for (int scale = 0; scale < 3; scale++) {
-        int hw, stride;
-        if (scale == 0) { hw = 80; stride = 8; }
-        else if (scale == 1) { hw = 40; stride = 16; }
-        else                 { hw = 20; stride = 32; }
+        int hw = scale_hw[scale];
+        int stride = g_yolo_input / hw;   /* 8/16/32 at any resolution */
 
         for (int ay = 0; ay < hw; ay++) {
             for (int ax = 0; ax < hw; ax++) {
                 int a;
-                if (scale == 0)      a = ay * 80 + ax;
-                else if (scale == 1) a = a0 + ay * 40 + ax;
-                else                 a = a0 + a1 + ay * 20 + ax;
+                if (scale == 0)      a = ay * hw + ax;
+                else if (scale == 1) a = a0 + ay * hw + ax;
+                else                 a = a0 + a1 + ay * hw + ax;
 
                 float lt_x = bbox_dfl[0 * num_anchors + a];
                 float lt_y = bbox_dfl[1 * num_anchors + a];
