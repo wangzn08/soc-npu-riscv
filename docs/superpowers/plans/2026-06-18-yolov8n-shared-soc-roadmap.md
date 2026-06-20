@@ -136,6 +136,11 @@
 - [x] M5x conv7 (model.4 cv1, 64->64 1x1 pointwise): PASS, bit-exact (RTL_TOL=8),
   fed from conv6 output. Exercises IC=64 (4 ic-groups) OC=64 oc_single pointwise.
   `firmware/yolo_conv7_from_conv6_m5x_smoke.c`, `tools/gen_yolo_conv7_from_conv6_m5x_smoke.py`.
+- [x] m6a generic C2f runner (`firmware/yolo_c2f.c/.h`, `yolo_run_c2f_block`):
+  convs on NPU, CPU residual add + per-piece concat requant (faithful to C ref,
+  any per-bottleneck glue scale). Brought up c2f_4 (model.4, n=2) end-to-end from
+  conv6 output, bit-exact (RTL_TOL=16). See
+  `plans/2026-06-19-yolov8n-c2f-generic-runner-m6a.md`. Next: c2f_6/c2f_8 reuse it.
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
 

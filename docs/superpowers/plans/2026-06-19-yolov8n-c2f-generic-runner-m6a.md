@@ -32,12 +32,16 @@ cv2 (1x1), plus glue (add) and concat requant params, n_bottleneck, shortcut.
 
 ## Increments
 
-- [x] m6a-1: `yolo_run_c2f_block` (firmware/yolo_c2f.c/.h) for n=1 shortcut;
-  `yolo_c2f_block_smoke.c` runs c2f_2 via the runner (block input = baked conv1
-  output, cfg wired from existing c2f_2 fixtures) and matches the M5v golden.
-  PASS (TRAP 38,600,132). The i>0 residual staging path returns 0 (TODO m6a-2).
-- [ ] m6a-2: extend to n=2 (two bottlenecks, two adds, concat 4 pieces); bring up
-  c2f_4 (model.4) end-to-end from conv7 output. Generate conv8..conv12 fixtures.
+- [x] m6a-1: first `yolo_run_c2f_block` (n=1) reproduced c2f_2 via the HW-eltwise
+  path. SUPERSEDED by the CPU-residual-add design below (the HW staging trick does
+  not generalize to bottlenecks with differing glue scales, and it added an extra
+  quantization vs the C reference). The c2f_2 generic smoke was removed; c2f_2 is
+  still covered standalone by M5v, and the generic runner is validated by c2f_4.
+- [x] m6a-2: generic runner reworked to **CPU residual add + per-piece CPU concat
+  requant** (faithful to the C reference, handles arbitrary per-bottleneck glue
+  scales). Brought up c2f_4 (model.4, n=2) end-to-end from conv6 output:
+  `firmware/yolo_c2f4_smoke.c` + `tools/gen_yolo_c2f4_smoke.py`. Bit-exact vs the
+  RTL-integer/C-faithful golden (RTL_TOL=16). PASS (TRAP 33,579,604).
 - [ ] m6a-3: c2f_6 (model.6) and c2f_8 (model.8) via the same runner.
 
 ## Verification
