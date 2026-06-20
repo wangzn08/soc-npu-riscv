@@ -163,6 +163,13 @@
   on CPU (same scale => identity requant). Bit-exact (RTL_TOL=16). PASS.
   **The entire YOLOv8n backbone (model.0..model.9) is now verified layer-by-layer
   on the shared NPU.** `firmware/yolo_sppf_smoke.c`, `tools/gen_yolo_sppf_smoke.py`.
+- [x] m7a Neck FPN-top: c2f_12 (model.12, n=1, **shortcut=0** — first no-shortcut
+  C2f). Input cat1 = concat(upsample2x(SPPF out), p5=c2f_6 out) requant to conv27
+  in, baked. cv1=conv27(384->128), bn=conv28/29(64->64, no residual), cv2=conv30
+  (192->128). Bit-exact (RTL_TOL=16). PASS. Validates the runner's shortcut=0 path;
+  the neck C2f_15/18/21 are the same pattern. `firmware/yolo_c2f12_smoke.c`,
+  `tools/gen_yolo_c2f12_smoke.py`. (upsample2x engine M2 + concat helper already
+  exist; here their result is baked to focus on the C2f runner.)
 
 ## Milestone 5: YOLO Subgraph RTL Smoke
 
