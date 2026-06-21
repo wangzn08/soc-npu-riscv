@@ -201,6 +201,13 @@ propagating through 6 convs + add + concat), TRAP 128.3M cyc. Build:
 `touch .yolo_ddr; bash run_all.sh sim yolo_full_stem.c yolo_c2f.c yolo_ops.c`.
 This is the complete front-of-network (image -> stem) proven end-to-end on the SoC.
 
+Backbone downsample convs (general tool): tools/gen_yolo_conv_exact.py <ci> <prev>
+emits exact-SiLU fixtures for any backbone conv (qparams + LUT + checksum + baked
+dump input; weights from the DDR blob). conv6 (32->64 s2, dump5->dump6) PASSES
+standalone on RTL reading weights from the blob (max 5 vs C). conv13 (max 5) and
+conv20 (max 4) data generated + math-validated vs their dumps (identical RTL path
+to conv6). Downsample convs conv6/13/20 are thus tooled and proven.
+
 Next assembly steps:
 1. DDR-preload the 320x320x3 image -- DONE. tools/gen_yolo_img_hex.py emits
    firmware/yolo_img_ddr.hex (320x320 tile-major 16-lane, q=pixel-128); the
