@@ -14,7 +14,7 @@
 #define OUT_DDR     0x40200000u
 #define PAD_ROW_DDR 0x40300000u
 #define WGT_BASE    0u
-#define STRIP_OUT_ROWS 16u
+#define STRIP_OUT_ROWS 16u  /* stride-2 => tiled auto-uses serial path (row_par stride1-only) */
 
 static void wrw(uint32_t a, uint32_t w, const uint32_t l[4])
 { volatile uint32_t *p=(volatile uint32_t*)(a+w*16u); p[0]=l[0];p[1]=l[1];p[2]=l[2];p[3]=l[3]; }

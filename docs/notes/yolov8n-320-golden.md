@@ -98,7 +98,18 @@ and fine. Scoped change:
   3. Firmware c2f2_320 smoke -> PASS -> chain backbone -> neck/head -> on-chip
      decode (DFL HW + sigmoid HW + int argmax/geometry/NMS) -> full TRAP cycles.
 
-### NEW BLOCKER (2026-06-21): stride-2 tiled boundary bug (exposed by exact SiLU)
+### RESOLVED (2026-06-21): stride-2 row_par reorder bug -> serial fallback
+
+FIXED. Bisected with strip=8 (row_par off) => conv1 exact PASS, strip=16
+(row_par on) => FAIL: the bug is the row_par 16-row drain REORDER under stride>1,
+NOT padding/staging (those are bit-exact). yolo_run_conv2d_tiled now auto-enables
+row_par only for stride==1 (&& strip>=16); stride-2 convs (conv0/1, downsamples
+13/20/35/46/57) use the bit-exact serial path. conv1 @320 exact now PASSES,
+aligned to dump320/conv1.bin within +-1. Cost: conv1 946K cyc serial vs 441K
+buggy-row_par -- a row_par+stride2 reorder fix is a deferred perf optimization.
+Legacy conv1_320 + c2f4 re-verified PASS (no regression). History below.
+
+### [HISTORY] stride-2 tiled boundary bug (exposed by exact SiLU)
 
 conv1 @320 (16->32 3x3 **stride2** pad1) with exact SiLU FAILS the C-dump check at
 edge rows (errors=17, diff ~20). Root cause is NOT exact SiLU — it is a stride-2

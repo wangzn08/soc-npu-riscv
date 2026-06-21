@@ -432,10 +432,13 @@ int yolo_run_conv2d_tiled(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_ba
     out_h = (in_h + 2u * pad - kernel_h) / stride + 1u;
 
     /* row_par (16-row spatial parallelism) is correct here and ~9x faster on deep
-     * layers, BUT only for normal-size strips: its 16-row group misorders strips
-     * smaller than 16 (e.g. the conv13 strip=2 halo stress test). Auto-enable for
-     * normal strips; tiny halo-test strips fall back to the serial path. */
-    if (strip_out_rows >= 16u)
+     * layers, BUT only for stride-1, normal-size strips:
+     *   - it misorders strips smaller than 16 (e.g. the conv13 strip=2 halo test);
+     *   - it misorders the drain for stride>1 convs (verified on conv1 @320: the
+     *     16-row reorder assumes stride-1 row spacing). Exposed once the exact SiLU
+     *     LUT stopped masking edge errors; the serial path is bit-exact for stride2.
+     * Auto-enable only when safe; otherwise fall back to the serial path. */
+    if (strip_out_rows >= 16u && stride == 1u)
         ctrl_flags |= NPU_CTRL_ROW_PAR;
 
     /* Materialize one pad row in DDR: in_w words, each lane = pad_value. */
