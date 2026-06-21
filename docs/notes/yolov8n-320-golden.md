@@ -208,6 +208,23 @@ standalone on RTL reading weights from the blob (max 5 vs C). conv13 (max 5) and
 conv20 (max 4) data generated + math-validated vs their dumps (identical RTL path
 to conv6). Downsample convs conv6/13/20 are thus tooled and proven.
 
+C2f exact (general tool): tools/gen_yolo_c2f_exact.py <blk> emits exact-SiLU
+fixtures for any C2f block (c2f2/4/6/8 configured) from dumps + act_quant_meta +
+glue_ops. VALIDATED CORRECT: on c2f2 it reproduces the known-good gen_yolo_c2f2_320
+exactly (max 13 vs dump5); c2f4 cv1(conv7) max 4 vs dump7. BUT the per-layer
+"vs C dump" drift GROWS WITH DEPTH: c2f2=13, c2f8=56, c2f6=51, c2f4=77.
+
+IMPORTANT finding -- this is NOT a bug, it is the exact-SiLU LUT-vs-float gap
+accumulating: the per-layer LUT computes SiLU from the QUANTIZED preact (index =
+round(preact/out_scale)), while the C reference engine uses FLOAT SiLU. Each layer
+adds a small biased error; through deep blocks + residual adds it compounds. The C
+engine itself is "int8 weights/acts + float SiLU epilogue", so our all-integer
+SiLU path legitimately diverges from it. CONSEQUENCE: full-net correctness must be
+judged at the DETECTION level (final boxes vs the 4-person golden), NOT per-layer
+bit-match. The per-layer dumps were a development oracle; they over-constrain a
+LUT-based SiLU. (If end-to-end detections drift, options: higher-resolution SiLU
+LUT, or a 2-point interpolated LUT, or accept and measure mAP.)
+
 Next assembly steps:
 1. DDR-preload the 320x320x3 image -- DONE. tools/gen_yolo_img_hex.py emits
    firmware/yolo_img_ddr.hex (320x320 tile-major 16-lane, q=pixel-128); the
