@@ -57,26 +57,41 @@ def load_dump(ci):
     return data, c, h, w, scale, zp
 
 
-def make_qparams(conv0, w, b, s, in_scale, in_zp):
+def make_qparams(conv0, w, b, s, in_scale, in_zp, out_scale):
+    """Exact-SiLU out-grid qparams: s2 == round(preact/out_scale).
+       mul = round(in_scale*wscale/out_scale * 2^Q); bias folds -in_zp*wsum."""
     wsum = w.astype(np.int32).sum(axis=(1, 2, 3))
     bias_q, mul = [], []
     for oc in range(w.shape[0]):
-        m = int(round(in_scale * float(s[oc]) * 16.0 * (1 << Q_SHIFT)))
+        m = int(round(in_scale * float(s[oc]) / out_scale * (1 << Q_SHIFT)))
         if m == 0:
             raise SystemExit("zero mul")
         mul.append(m)
-        be = int(round(float(b[oc]) * 16.0 * (1 << Q_SHIFT) / m))
+        be = int(round(float(b[oc]) / (in_scale * float(s[oc]))))
         bias_q.append(int(be - in_zp * int(wsum[oc])))
     return bias_q, mul, [Q_SHIFT] * w.shape[0]
 
 
-def conv_rtl(conv0, act, w, bias_q, mul, lut, kh, kw, stride, pad, in_zp,
-             out_scale, out_zp):
-    """conv -> q44 -> SiLU LUT -> requant to (out_scale,out_zp). [SP_out, OC] int8."""
+def build_silu_lut(conv0, out_scale, out_zp):
+    """256-entry exact SiLU LUT, indexed by the linear out-grid INT8 q:
+       lut[q] = round(SiLU((q-out_zp)*out_scale)/out_scale + out_zp)."""
+    import math
+    lut = np.zeros(256, dtype=np.uint8)
+    for i in range(256):
+        q = i if i < 128 else i - 256
+        realq = (q - out_zp) * out_scale
+        silu = realq / (1.0 + math.exp(-realq))
+        lut[i] = np.uint8(conv0.s8(conv0.clamp_s8(int(round(silu / out_scale + out_zp)))) & 0xFF)
+    return lut
+
+
+def conv_rtl(conv0, act, w, bias_q, mul, lut, kh, kw, stride, pad, in_zp, out_zp):
+    """Exact-SiLU conv (mirrors post_process_top exact path):
+       s2 = (acc+bias_q)*mul >> Q; idx = clamp_s8(s2+out_zp); out = lut[idx].
+       [SP_out, OC] int8."""
     OC, IC = w.shape[0], w.shape[1]
     out_h = (act.shape[1] + 2 * pad - kh) // stride + 1
     out_w = (act.shape[2] + 2 * pad - kw) // stride + 1
-    rqm = int(round((1 << REQ_SHIFT) / (16.0 * out_scale)))
     out = np.zeros((out_h * out_w, OC), dtype=np.int8)
     for oy in range(out_h):
         for ox in range(out_w):
@@ -89,11 +104,10 @@ def conv_rtl(conv0, act, w, bias_q, mul, lut, kh, kw, stride, pad, in_zp,
                             iy = oy * stride + ky - pad; ix = ox * stride + kx - pad
                             av = int(act[ic, iy, ix]) if 0 <= iy < act.shape[1] and 0 <= ix < act.shape[2] else in_zp
                             acc += av * int(w[oc, ic, ky, kx])
-                q44 = ((acc + bias_q[oc]) * mul[oc]) >> Q_SHIFT
-                sb = conv0.rtl_silu_byte(q44, lut)
-                rq = ((conv0.s8(sb) * rqm) >> REQ_SHIFT) + out_zp
-                out[pos, oc] = np.int8(conv0.s8(conv0.clamp_s8(rq)))
-    return out, rqm
+                s2 = ((acc + bias_q[oc]) * mul[oc]) >> Q_SHIFT
+                idx = conv0.clamp_s8(s2 + out_zp) & 0xFF
+                out[pos, oc] = np.int8(conv0.s8(int(lut[idx])))
+    return out
 
 
 def cpu_add(conv0, prev, conv, prev_scale, prev_zp, glue_scale):
@@ -128,6 +142,9 @@ def fmt_u8(name, v):
     out = [f"static const uint8_t {name}[{v.shape[0]}][{v.shape[1]}] = {{"]
     for r in v: out.append("    {" + ", ".join(f"0x{int(x):02X}u" for x in r) + "},")
     out.append("};"); return "\n".join(out)
+def fmt_u8_1d(name, v):
+    return f"static const uint8_t {name}[{len(v)}] = {{\n    " + \
+        ", ".join(f"0x{int(x):02X}u" for x in v) + "\n};"
 
 
 def pack1x1(conv0, w):
@@ -153,27 +170,33 @@ def pack_act(conv0, act):
 
 def compute_c2f2():
     conv0 = load("conv0", CONV0_GEN)
-    lut = conv0.load_lut()
 
     blkin, c, h, w, in_scale, in_zp = load_dump(1)   # conv1 out = c2f_2 input
     assert (c, h, w) == (32, IN_H, IN_W), f"conv1 dump {(c,h,w)}"
     assert abs(in_scale - AQ[2][0]) < 1e-6 and in_zp == AQ[2][1], "conv1 scale/zp mismatch AQ[2] in"
 
+    # Per-layer exact SiLU LUTs (out-grid indexed), built from each conv's target
+    # (out_scale, out_zp). conv4 (m_cv2) targets the GLUE scale, conv5 (cv2) AQ[5].
+    lut2 = build_silu_lut(conv0, AQ[2][2], AQ[2][3])
+    lut3 = build_silu_lut(conv0, AQ[3][2], AQ[3][3])
+    lut4 = build_silu_lut(conv0, GLUE[0], GLUE[1])
+    lut5 = build_silu_lut(conv0, AQ[5][2], AQ[5][3])
+
     # cv1 = conv2 (1x1, 32->32)
     w2 = np.fromfile(WEIGHT_DIR / "conv2_w.bin", dtype=np.int8).reshape(32, 32, 1, 1)
-    bq2, m2, sh2 = make_qparams(conv0, w2, fw("conv2_b.bin"), fw("conv2_s.bin"), AQ[2][0], AQ[2][1])
-    cv1_out, rq2 = conv_rtl(conv0, blkin, w2, bq2, m2, lut, 1, 1, 1, 0, AQ[2][1], AQ[2][2], AQ[2][3])
+    bq2, m2, sh2 = make_qparams(conv0, w2, fw("conv2_b.bin"), fw("conv2_s.bin"), AQ[2][0], AQ[2][1], AQ[2][2])
+    cv1_out = conv_rtl(conv0, blkin, w2, bq2, m2, lut2, 1, 1, 1, 0, AQ[2][1], AQ[2][3])
     cv1 = cv1_out.reshape(IN_H, IN_W, 32).transpose(2, 0, 1)
     s0 = cv1[0:16]; s1 = cv1[16:32]
 
     # bottleneck 0: conv3 -> conv4 (requant to glue)
     w3 = np.fromfile(WEIGHT_DIR / "conv3_w.bin", dtype=np.int8).reshape(16, 16, 3, 3)
-    bq3, m3, sh3 = make_qparams(conv0, w3, fw("conv3_b.bin"), fw("conv3_s.bin"), AQ[3][0], AQ[3][1])
-    c3, rq3 = conv_rtl(conv0, s1, w3, bq3, m3, lut, 3, 3, 1, 1, AQ[3][1], AQ[3][2], AQ[3][3])
+    bq3, m3, sh3 = make_qparams(conv0, w3, fw("conv3_b.bin"), fw("conv3_s.bin"), AQ[3][0], AQ[3][1], AQ[3][2])
+    c3 = conv_rtl(conv0, s1, w3, bq3, m3, lut3, 3, 3, 1, 1, AQ[3][1], AQ[3][3])
     c3m = c3.reshape(IN_H, IN_W, 16).transpose(2, 0, 1)
     w4 = np.fromfile(WEIGHT_DIR / "conv4_w.bin", dtype=np.int8).reshape(16, 16, 3, 3)
-    bq4, m4, sh4 = make_qparams(conv0, w4, fw("conv4_b.bin"), fw("conv4_s.bin"), AQ[4][0], AQ[4][1])
-    c4, rq4 = conv_rtl(conv0, c3m, w4, bq4, m4, lut, 3, 3, 1, 1, AQ[4][1], GLUE[0], GLUE[1])
+    bq4, m4, sh4 = make_qparams(conv0, w4, fw("conv4_b.bin"), fw("conv4_s.bin"), AQ[4][0], AQ[4][1], GLUE[0])
+    c4 = conv_rtl(conv0, c3m, w4, bq4, m4, lut4, 3, 3, 1, 1, AQ[4][1], GLUE[1])
     s1_flat = s1.transpose(1, 2, 0).reshape(SP, 16)
     add0, ratio0 = cpu_add(conv0, s1_flat, c4, AQ[2][2], AQ[2][3], GLUE[0])  # prev=s1 @conv2 out
 
@@ -185,8 +208,8 @@ def compute_c2f2():
     concat = np.concatenate([s0c, s1c, a0c], axis=1)  # [SP, 48]
     concat_chw = concat.reshape(IN_H, IN_W, 48).transpose(2, 0, 1)
     w5 = np.fromfile(WEIGHT_DIR / "conv5_w.bin", dtype=np.int8).reshape(32, 48, 1, 1)
-    bq5, m5, sh5 = make_qparams(conv0, w5, fw("conv5_b.bin"), fw("conv5_s.bin"), CAT[0], CAT[1])
-    golden, rq5 = conv_rtl(conv0, concat_chw, w5, bq5, m5, lut, 1, 1, 1, 0, CAT[1], AQ[5][2], AQ[5][3])
+    bq5, m5, sh5 = make_qparams(conv0, w5, fw("conv5_b.bin"), fw("conv5_s.bin"), CAT[0], CAT[1], AQ[5][2])
+    golden = conv_rtl(conv0, concat_chw, w5, bq5, m5, lut5, 1, 1, 1, 0, CAT[1], AQ[5][3])
 
     # self-check vs the C engine's model.2 output dump (conv5.bin)
     c5, _, _, _, c5_scale, c5_zp = load_dump(5)
@@ -212,15 +235,20 @@ def compute_c2f2():
 #define YOLO_C2F2_BLKIN_WORDS {SP * 2}u
 {fmt_u32_arr("yolo_c2f2_blkin_words", pack_act(conv0, blkin))}
 
+/* Exact-SiLU mode: the mul/shift arrays are LINEAR out-grid qparams; the
+   RQ_MUL macros are unused (0); SiLU comes from the per-conv 256-entry out-grid
+   LUTs below. */
+
 /* cv1 = conv2 (1x1, 32->32) */
 #define YOLO_C2F2_CV1_WGT_WORDS {32 * 2}u
-#define YOLO_C2F2_CV1_RQ_MUL {rq2}u
+#define YOLO_C2F2_CV1_RQ_MUL 0u
 #define YOLO_C2F2_CV1_RQ_SHIFT {REQ_SHIFT}u
 #define YOLO_C2F2_CV1_RQ_ZP {AQ[2][3]}
 {fmt_u32_arr("yolo_c2f2_cv1_wgt", pack1x1(conv0, w2))}
 {fmt_i32("yolo_c2f2_cv1_bias", bq2)}
 {fmt_u32("yolo_c2f2_cv1_mul", m2)}
 {fmt_u32("yolo_c2f2_cv1_shift", sh2)}
+{fmt_u8_1d("yolo_c2f2_cv1_silu_lut", lut2)}
 
 /* bottleneck m_cv1 = conv3 (3x3, 16->16) */
 #define YOLO_C2F2_MCV1_WGT_WORDS {16 * 9}u
@@ -228,7 +256,8 @@ def compute_c2f2():
 {fmt_i32("yolo_c2f2_mcv1_0_bias", bq3)}
 {fmt_u32("yolo_c2f2_mcv1_0_mul", m3)}
 {fmt_u32("yolo_c2f2_mcv1_0_shift", sh3)}
-#define YOLO_C2F2_MCV1_0_RQ_MUL {rq3}u
+{fmt_u8_1d("yolo_c2f2_mcv1_0_silu_lut", lut3)}
+#define YOLO_C2F2_MCV1_0_RQ_MUL 0u
 #define YOLO_C2F2_MCV1_0_RQ_ZP {AQ[3][3]}
 #define YOLO_C2F2_MCV1_0_PAD {AQ[3][1]}
 #define YOLO_C2F2_MCV2_0_PAD {AQ[4][1]}
@@ -239,7 +268,8 @@ def compute_c2f2():
 {fmt_i32("yolo_c2f2_mcv2_0_bias", bq4)}
 {fmt_u32("yolo_c2f2_mcv2_0_mul", m4)}
 {fmt_u32("yolo_c2f2_mcv2_0_shift", sh4)}
-#define YOLO_C2F2_GLUE0_RQ_MUL {rq4}u
+{fmt_u8_1d("yolo_c2f2_mcv2_0_silu_lut", lut4)}
+#define YOLO_C2F2_GLUE0_RQ_MUL 0u
 #define YOLO_C2F2_GLUE0_ZP {GLUE[1]}
 #define YOLO_C2F2_GLUE_RQ_SHIFT {REQ_SHIFT}u
 
@@ -258,13 +288,14 @@ def compute_c2f2():
 
 /* cv2 = conv5 (1x1, 48->32) */
 #define YOLO_C2F2_CV2_WGT_WORDS {32 * 3}u
-#define YOLO_C2F2_CV2_RQ_MUL {rq5}u
+#define YOLO_C2F2_CV2_RQ_MUL 0u
 #define YOLO_C2F2_CV2_RQ_SHIFT {REQ_SHIFT}u
 #define YOLO_C2F2_CV2_RQ_ZP {AQ[5][3]}
 {fmt_u32_arr("yolo_c2f2_cv2_wgt", pack1x1(conv0, w5))}
 {fmt_i32("yolo_c2f2_cv2_bias", bq5)}
 {fmt_u32("yolo_c2f2_cv2_mul", m5)}
 {fmt_u32("yolo_c2f2_cv2_shift", sh5)}
+{fmt_u8_1d("yolo_c2f2_cv2_silu_lut", lut5)}
 
 {fmt_u8("yolo_c2f2_expected_rtl", golden.astype(np.uint8))}
 

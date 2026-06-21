@@ -98,7 +98,18 @@ and fine. Scoped change:
   3. Firmware c2f2_320 smoke -> PASS -> chain backbone -> neck/head -> on-chip
      decode (DFL HW + sigmoid HW + int argmax/geometry/NMS) -> full TRAP cycles.
 
-### BLOCKER found at Step 2.2 (2026-06-21): SiLU LUT range gap
+### RESOLVED (2026-06-21): exact per-layer SiLU LUT + c2f_2 @320 PASS
+
+The SiLU LUT range gap below is FIXED. Added CTRL[22] NPU_CTRL_SILU_EXACT_EN +
+NPU_SILU_LOAD (0x3F4): a per-layer runtime-loadable SiLU LUT indexed by the
+linear output-quantized preact (out-grid), so no +-8 saturation. The c2f_2 @320
+smoke (firmware/yolo_c2f2_320_smoke.c, gen_yolo_c2f2_320.py, exact mode) runs the
+full model.2 block on RTL (80x80, tiled DDR->DDR) and PASSES; its golden aligns
+to the C float dump320/conv5.bin within ~13 (was 69), with cv1 alone within ~2
+(was 116). MNIST 10/10 baseline unchanged (SiLU path gated off). tb_silu_lut.v
+extended for the exact path. Original diagnosis kept below for history.
+
+### BLOCKER found at Step 2.2 (2026-06-21): SiLU LUT range gap [RESOLVED above]
 
 tools/gen_yolo_c2f2_320.py runs the full c2f_2 from the REAL conv1 dump and
 self-checks vs dump320/conv5.bin. Result: mismatch 152231/204800, maxabs=69 —

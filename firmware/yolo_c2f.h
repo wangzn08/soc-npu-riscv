@@ -32,6 +32,17 @@ typedef struct {
     uint32_t pad_row_ddr;           // one-row scratch for tiled vertical padding
     uint32_t strip;                 // tiled output-row strip height (0 => default 16)
 
+    // ----- exact per-layer SiLU LUT (0 = legacy Q4.4 SiLU + requant) -----
+    // When silu_exact != 0, each conv loads its 256-entry out-grid SiLU LUT,
+    // runs with NPU_CTRL_SILU_EXACT_EN, and the *_mul/*_shift/*_bias arrays are
+    // the LINEAR out-grid qparams (s2 == round(preact/out_scale)); the *_rq_zp /
+    // glue_zp fields supply the output zero-point. Legacy *_rq_mul are unused.
+    uint32_t silu_exact;
+    const uint8_t *cv1_silu_lut;
+    const uint8_t *mcv1_silu_lut[YOLO_C2F_MAX_BN];
+    const uint8_t *mcv2_silu_lut[YOLO_C2F_MAX_BN];
+    const uint8_t *cv2_silu_lut;
+
     // ----- cv1 (1x1) -----
     const uint32_t (*cv1_wgt)[4]; uint32_t cv1_wgt_words;
     const int32_t *cv1_bias; const uint32_t *cv1_mul; const uint32_t *cv1_shift;

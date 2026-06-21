@@ -21,6 +21,21 @@ static void push_wgt(uint32_t ddr, const uint32_t (*words)[4], uint32_t n)
 {
     uint32_t i; for (i = 0u; i < n; i++) wr_word(ddr, i, words[i]);
 }
+// Program the per-conv SiLU mode and return the ctrl flags. Legacy: fixed Q4.4
+// LUT + Q4.4->out requant. Exact: load the per-layer out-grid LUT, output zp
+// only, NPU_CTRL_SILU_EXACT_EN (the *_mul/*_shift carry out-grid qparams).
+static uint32_t silu_setup(const yolo_c2f_cfg_t *cfg, const uint8_t *lut,
+                           uint32_t rq_mul, uint32_t rq_shift, int32_t zp)
+{
+    if (cfg->silu_exact) {
+        yolo_load_silu_lut(lut);
+        yolo_set_silu_requant(0u, 0u, zp);
+        return NPU_CTRL_SILU_EXACT_EN;
+    }
+    yolo_set_silu_requant(rq_mul, rq_shift, zp);
+    return NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN;
+}
+
 static int32_t s8c(int32_t v) { return v > 127 ? 127 : (v < -128 ? -128 : v); }
 static int32_t lane_s8(uint32_t w, uint32_t k) {
     uint32_t b = (w >> ((k & 3u) * 8u)) & 0xFFu;
@@ -70,14 +85,16 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
 
     // ---------- cv1 (1x1): block input -> s0|s1 (tiled DDR->DDR, supports >64) ----------
     push_wgt(cfg->wgt_ddr, cfg->cv1_wgt, cfg->cv1_wgt_words);
-    yolo_set_silu_requant(cfg->cv1_rq_mul, cfg->cv1_rq_shift, cfg->cv1_rq_zp);
-    if (!yolo_run_conv2d_tiled(cfg->in_ddr, cfg->wgt_ddr, WGT_BASE, cfg->cv1_out_ddr,
-                               cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
-                               1u, 1u, 1u, 0u,
-                               cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
-                               NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
-                               cfg->cv1_wgt_words / cfg->full_c, strip, 0))
-        return 0;
+    {
+        uint32_t f = silu_setup(cfg, cfg->cv1_silu_lut, cfg->cv1_rq_mul,
+                                cfg->cv1_rq_shift, cfg->cv1_rq_zp);
+        if (!yolo_run_conv2d_tiled(cfg->in_ddr, cfg->wgt_ddr, WGT_BASE, cfg->cv1_out_ddr,
+                                   cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
+                                   1u, 1u, 1u, 0u,
+                                   cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
+                                   f, cfg->cv1_wgt_words / cfg->full_c, strip, 0))
+            return 0;
+    }
     (void)full_groups;
 
     // ---------- bottleneck chain ----------
@@ -92,30 +109,34 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
         // m_cv1 (3x3) -> bn_out (tiled DDR->DDR; half_c may be >64)
         push_wgt(cfg->wgt_ddr, cfg->mcv1_wgt[i], cfg->mcv1_wgt_words);
         yolo_set_pad_value(cfg->mcv1_pad_value[i]);
-        yolo_set_silu_requant(cfg->mcv1_rq_mul[i], cfg->mcv1_rq_shift[i], cfg->mcv1_rq_zp[i]);
-        if (!yolo_run_conv2d_tiled(prev_ddr, cfg->wgt_ddr, WGT_BASE, cfg->bn_out_ddr,
-                                   cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
-                                   cfg->full_c/2u, cfg->full_c/2u,
-                                   3u, 3u, 1u, 1u,
-                                   cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
-                                   NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
-                                   cfg->mcv1_wgt_words / (cfg->full_c/2u), strip,
-                                   cfg->mcv1_pad_value[i]))
-            return 0;
+        {
+            uint32_t f = silu_setup(cfg, cfg->mcv1_silu_lut[i], cfg->mcv1_rq_mul[i],
+                                    cfg->mcv1_rq_shift[i], cfg->mcv1_rq_zp[i]);
+            if (!yolo_run_conv2d_tiled(prev_ddr, cfg->wgt_ddr, WGT_BASE, cfg->bn_out_ddr,
+                                       cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                                       cfg->full_c/2u, cfg->full_c/2u,
+                                       3u, 3u, 1u, 1u,
+                                       cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
+                                       f, cfg->mcv1_wgt_words / (cfg->full_c/2u), strip,
+                                       cfg->mcv1_pad_value[i]))
+                return 0;
+        }
 
         // m_cv2 (3x3) requant to glue[i] -> mcv2_ddr (tiled DDR->DDR)
         push_wgt(cfg->wgt_ddr, cfg->mcv2_wgt[i], cfg->mcv2_wgt_words);
         yolo_set_pad_value(cfg->mcv2_pad_value[i]);
-        yolo_set_silu_requant(cfg->glue_rq_mul[i], cfg->glue_rq_shift[i], cfg->glue_zp[i]);
-        if (!yolo_run_conv2d_tiled(cfg->bn_out_ddr, cfg->wgt_ddr, WGT_BASE, cfg->mcv2_ddr,
-                                   cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
-                                   cfg->full_c/2u, cfg->full_c/2u,
-                                   3u, 3u, 1u, 1u,
-                                   cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
-                                   NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
-                                   cfg->mcv2_wgt_words / (cfg->full_c/2u), strip,
-                                   cfg->mcv2_pad_value[i]))
-            return 0;
+        {
+            uint32_t f = silu_setup(cfg, cfg->mcv2_silu_lut[i], cfg->glue_rq_mul[i],
+                                    cfg->glue_rq_shift[i], cfg->glue_zp[i]);
+            if (!yolo_run_conv2d_tiled(cfg->bn_out_ddr, cfg->wgt_ddr, WGT_BASE, cfg->mcv2_ddr,
+                                       cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                                       cfg->full_c/2u, cfg->full_c/2u,
+                                       3u, 3u, 1u, 1u,
+                                       cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
+                                       f, cfg->mcv2_wgt_words / (cfg->full_c/2u), strip,
+                                       cfg->mcv2_pad_value[i]))
+                return 0;
+        }
 
         // residual add (CPU) -> add_ddr[i]; or pass-through when !shortcut.
         for (g = 0u; g < half_groups; g++)
@@ -148,14 +169,16 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
 
     // ---------- cv2 (1x1, tiled DDR->DDR, supports >64) ----------
     push_wgt(cfg->wgt_ddr, cfg->cv2_wgt, cfg->cv2_wgt_words);
-    yolo_set_silu_requant(cfg->cv2_rq_mul, cfg->cv2_rq_shift, cfg->cv2_rq_zp);
-    if (!yolo_run_conv2d_tiled(cfg->concat_ddr, cfg->wgt_ddr, WGT_BASE, cfg->out_ddr,
-                               cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
-                               1u, 1u, 1u, 0u,
-                               cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,
-                               NPU_CTRL_SILU_EN | NPU_CTRL_SILU_REQUANT_EN,
-                               cfg->cv2_wgt_words / cfg->cv2_oc, strip, 0))
-        return 0;
+    {
+        uint32_t f = silu_setup(cfg, cfg->cv2_silu_lut, cfg->cv2_rq_mul,
+                                cfg->cv2_rq_shift, cfg->cv2_rq_zp);
+        if (!yolo_run_conv2d_tiled(cfg->concat_ddr, cfg->wgt_ddr, WGT_BASE, cfg->out_ddr,
+                                   cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
+                                   1u, 1u, 1u, 0u,
+                                   cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,
+                                   f, cfg->cv2_wgt_words / cfg->cv2_oc, strip, 0))
+            return 0;
+    }
 
     return 1;
 }
