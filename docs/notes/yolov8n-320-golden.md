@@ -189,6 +189,39 @@ docs/superpowers/plans/2026-06-18-yolov8n-silu-lut-m1.md.
 gen_yolo_c2f2_320.py + the C2f tiled swap (commit 5c45855) are ready; c2f2_320
 will align once the LUT fix lands.
 
+## CRITICAL detection-level finding (2026-06-21): int8 SiLU drift collapses boxes
+
+Instead of a multi-hour RTL full-net sim, the open question -- "does the SoC's
+exact-SiLU path still detect correctly after 60 layers of accumulated int8 drift?"
+-- was answered FAST with the C oracle: yolov8n_infer.c gained YOLO_EXACT_SILU
+(the SoC's per-layer out-grid SiLU LUT) + YOLO_EXACT_MAXCI (apply to conv<N) +
+YOLO_SILU_INTERP (2-point interpolation). Run on bus320:
+
+| config | detections |
+|--------|-----------|
+| float SiLU (C reference / golden) | **4 persons** |
+| exact-SiLU all layers (the SoC) | **0** |
+| exact-SiLU conv<6 (stem only) | 4 |
+| exact-SiLU conv<13 | 3 |
+| exact-SiLU conv<21 | 0 |
+| **2-point INTERPOLATED** SiLU, all | **0** (identical degradation 4/3/0) |
+
+KEY RESULT: the SoC's all-integer SiLU path accumulates enough error to DESTROY
+detections by ~mid-backbone (conv21), and 2-point LUT interpolation does NOT help
+-- so it is NOT the SiLU input-quantization resolution. The limiter is the
+accumulated int8-activation requant drift of evaluating SiLU on quantized
+intermediates through 60 layers (the C reference keeps SiLU in float). The SoC
+RUNS the network functionally, but matching the float mAP needs either
+quantization-aware training (QAT) so the net tolerates int8 SiLU, or a
+higher-internal-precision activation path. This is the honest accuracy story; per
+the earlier finding, the per-layer dumps over-constrain and the real gate is
+detection-level, which this measures directly WITHOUT the long RTL sim.
+
+IMPLICATION for assembly: a bit-exact on-SoC full run would reproduce the C
+exact-SiLU result (0 boxes on this image) -- so finishing the firmware assembly
+proves the DATAPATH but not detection accuracy. Detection accuracy is now a
+quantization/training problem, separable from the (working) SoC datapath.
+
 ## yolo_full.c assembly (incremental, on-SoC chain)
 
 `firmware/yolo_full_stem.c` runs the FULL STEM as a real layer chain (not

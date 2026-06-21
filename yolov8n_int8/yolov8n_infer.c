@@ -81,8 +81,14 @@ typedef struct {
 } ConvW;
 
 static ConvW conv_w[YOLO_NUM_CONV];
+static int g_exact_silu = 0;   /* YOLO_EXACT_SILU=1 -> SoC's quantized-preact SiLU LUT path */
+static int g_exact_maxci = 64; /* apply exact-SiLU only to conv idx < this (YOLO_EXACT_MAXCI) */
+static int g_silu_interp = 0;  /* YOLO_SILU_INTERP=1 -> 2-point interpolated SiLU LUT */
 
 void load_weights(const char *dir) {
+    g_exact_silu = (getenv("YOLO_EXACT_SILU") != NULL);
+    { const char *e = getenv("YOLO_EXACT_MAXCI"); if (e) g_exact_maxci = atoi(e); }
+    g_silu_interp = (getenv("YOLO_SILU_INTERP") != NULL);
     (void)dir;  /* w_file/b_file/s_file already include "weights/" prefix */
     for (int i = 0; i < YOLO_NUM_CONV; i++) {
         const YoloConvCfg *c = &yolo_conv[i];
@@ -198,8 +204,32 @@ static Tensor conv_int8(int ci, const Tensor *in) {
                     if (preact < -7.9375f || preact > 7.9375f) ps_sat++;
                     ps_tot++;
                 }
-                float y = cw->has_silu ? (preact / (1.0f + expf(-preact))) : preact;
-                out_ch[oh * OW + ow] = clamp_round_int8(y / cw->out_scale + cw->out_zp);
+                if (cw->has_silu && g_exact_silu && ci < g_exact_maxci) {
+                    /* SoC SiLU LUT path. g_silu_interp=0: nearest (out-grid index,
+                     * the current SoC). =1: 2-point linear interpolation between
+                     * adjacent LUT entries by the sub-grid fraction of preact -- a
+                     * higher-fidelity LUT that needs extra fractional preact bits +
+                     * an interpolator in the NPU post-process. */
+                    float fidx = preact / cw->out_scale + cw->out_zp;
+                    if (g_silu_interp) {
+                        float fl = floorf(fidx);
+                        int q0 = (int)fl; if (q0 < -128) q0 = -128; if (q0 > 126) q0 = 126;
+                        float fr = fidx - (float)q0; if (fr < 0) fr = 0; if (fr > 1) fr = 1;
+                        float d0 = ((float)q0 - cw->out_zp) * cw->out_scale;
+                        float d1 = ((float)(q0+1) - cw->out_zp) * cw->out_scale;
+                        float l0 = (d0/(1.0f+expf(-d0)))/cw->out_scale + cw->out_zp;
+                        float l1 = (d1/(1.0f+expf(-d1)))/cw->out_scale + cw->out_zp;
+                        out_ch[oh*OW+ow] = clamp_round_int8(l0 + fr*(l1-l0));
+                    } else {
+                        int q = clamp_round_int8(fidx);
+                        float dq = ((float)q - cw->out_zp) * cw->out_scale;
+                        float sl = dq / (1.0f + expf(-dq));
+                        out_ch[oh * OW + ow] = clamp_round_int8(sl / cw->out_scale + cw->out_zp);
+                    }
+                } else {
+                    float y = cw->has_silu ? (preact / (1.0f + expf(-preact))) : preact;
+                    out_ch[oh * OW + ow] = clamp_round_int8(y / cw->out_scale + cw->out_zp);
+                }
             }
         }
     }
