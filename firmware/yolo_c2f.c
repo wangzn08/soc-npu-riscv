@@ -72,6 +72,16 @@ static void requant_word(uint32_t src, uint32_t sw, uint32_t mul, int32_t in_zp,
     wr_word(dst, dw, out);
 }
 
+// Resolve a conv's weight DDR base: blob address (no copy) or push the C array
+// into the wgt_ddr scratch and return that.
+static uint32_t wgt_src(const yolo_c2f_cfg_t *cfg, uint32_t blob_addr,
+                        const uint32_t (*arr)[4], uint32_t words)
+{
+    if (cfg->wgt_in_blob) return blob_addr;
+    push_wgt(cfg->wgt_ddr, arr, words);
+    return cfg->wgt_ddr;
+}
+
 int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
 {
     uint32_t half_groups = (cfg->full_c / 2u) / 16u;
@@ -84,11 +94,11 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
         return 0;
 
     // ---------- cv1 (1x1): block input -> s0|s1 (tiled DDR->DDR, supports >64) ----------
-    push_wgt(cfg->wgt_ddr, cfg->cv1_wgt, cfg->cv1_wgt_words);
     {
+        uint32_t wd = wgt_src(cfg, cfg->cv1_wgt_ddr, cfg->cv1_wgt, cfg->cv1_wgt_words);
         uint32_t f = silu_setup(cfg, cfg->cv1_silu_lut, cfg->cv1_rq_mul,
                                 cfg->cv1_rq_shift, cfg->cv1_rq_zp);
-        if (!yolo_run_conv2d_tiled(cfg->in_ddr, cfg->wgt_ddr, WGT_BASE, cfg->cv1_out_ddr,
+        if (!yolo_run_conv2d_tiled(cfg->in_ddr, wd, WGT_BASE, cfg->cv1_out_ddr,
                                    cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
                                    1u, 1u, 1u, 0u,
                                    cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
@@ -107,12 +117,12 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
             prev_ddr = cfg->add_ddr[i-1u];
 
         // m_cv1 (3x3) -> bn_out (tiled DDR->DDR; half_c may be >64)
-        push_wgt(cfg->wgt_ddr, cfg->mcv1_wgt[i], cfg->mcv1_wgt_words);
         yolo_set_pad_value(cfg->mcv1_pad_value[i]);
         {
+            uint32_t wd = wgt_src(cfg, cfg->mcv1_wgt_ddr[i], cfg->mcv1_wgt[i], cfg->mcv1_wgt_words);
             uint32_t f = silu_setup(cfg, cfg->mcv1_silu_lut[i], cfg->mcv1_rq_mul[i],
                                     cfg->mcv1_rq_shift[i], cfg->mcv1_rq_zp[i]);
-            if (!yolo_run_conv2d_tiled(prev_ddr, cfg->wgt_ddr, WGT_BASE, cfg->bn_out_ddr,
+            if (!yolo_run_conv2d_tiled(prev_ddr, wd, WGT_BASE, cfg->bn_out_ddr,
                                        cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
                                        cfg->full_c/2u, cfg->full_c/2u,
                                        3u, 3u, 1u, 1u,
@@ -123,12 +133,12 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
         }
 
         // m_cv2 (3x3) requant to glue[i] -> mcv2_ddr (tiled DDR->DDR)
-        push_wgt(cfg->wgt_ddr, cfg->mcv2_wgt[i], cfg->mcv2_wgt_words);
         yolo_set_pad_value(cfg->mcv2_pad_value[i]);
         {
+            uint32_t wd = wgt_src(cfg, cfg->mcv2_wgt_ddr[i], cfg->mcv2_wgt[i], cfg->mcv2_wgt_words);
             uint32_t f = silu_setup(cfg, cfg->mcv2_silu_lut[i], cfg->glue_rq_mul[i],
                                     cfg->glue_rq_shift[i], cfg->glue_zp[i]);
-            if (!yolo_run_conv2d_tiled(cfg->bn_out_ddr, cfg->wgt_ddr, WGT_BASE, cfg->mcv2_ddr,
+            if (!yolo_run_conv2d_tiled(cfg->bn_out_ddr, wd, WGT_BASE, cfg->mcv2_ddr,
                                        cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
                                        cfg->full_c/2u, cfg->full_c/2u,
                                        3u, 3u, 1u, 1u,
@@ -168,11 +178,11 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
     }
 
     // ---------- cv2 (1x1, tiled DDR->DDR, supports >64) ----------
-    push_wgt(cfg->wgt_ddr, cfg->cv2_wgt, cfg->cv2_wgt_words);
     {
+        uint32_t wd = wgt_src(cfg, cfg->cv2_wgt_ddr, cfg->cv2_wgt, cfg->cv2_wgt_words);
         uint32_t f = silu_setup(cfg, cfg->cv2_silu_lut, cfg->cv2_rq_mul,
                                 cfg->cv2_rq_shift, cfg->cv2_rq_zp);
-        if (!yolo_run_conv2d_tiled(cfg->concat_ddr, cfg->wgt_ddr, WGT_BASE, cfg->out_ddr,
+        if (!yolo_run_conv2d_tiled(cfg->concat_ddr, wd, WGT_BASE, cfg->out_ddr,
                                    cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
                                    1u, 1u, 1u, 0u,
                                    cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,

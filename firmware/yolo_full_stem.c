@@ -80,6 +80,9 @@ void usercode7(void)
     cfg.bn_out_ddr=BN_OUT; cfg.mcv2_ddr=MCV2_DDR; cfg.add_ddr[0]=ADD0_DDR;
     cfg.concat_ddr=CONCAT; cfg.out_ddr=C2F_OUT; cfg.wgt_ddr=C2F_WGT;
     cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=1u;
+    cfg.wgt_in_blob=1u;   // c2f_2 weights (conv2/3/4/5) from the DDR blob too
+    cfg.cv1_wgt_ddr=WGT_OF(2); cfg.mcv1_wgt_ddr[0]=WGT_OF(3);
+    cfg.mcv2_wgt_ddr[0]=WGT_OF(4); cfg.cv2_wgt_ddr=WGT_OF(5);
     cfg.cv1_wgt=yolo_c2f2_cv1_wgt; cfg.cv1_wgt_words=YOLO_C2F2_CV1_WGT_WORDS;
     cfg.cv1_bias=yolo_c2f2_cv1_bias; cfg.cv1_mul=yolo_c2f2_cv1_mul; cfg.cv1_shift=yolo_c2f2_cv1_shift;
     cfg.cv1_rq_mul=YOLO_C2F2_CV1_RQ_MUL; cfg.cv1_rq_shift=YOLO_C2F2_CV1_RQ_SHIFT; cfg.cv1_rq_zp=YOLO_C2F2_CV1_RQ_ZP;

@@ -43,6 +43,15 @@ typedef struct {
     const uint8_t *mcv2_silu_lut[YOLO_C2F_MAX_BN];
     const uint8_t *cv2_silu_lut;
 
+    // ----- weights-from-DDR-blob (0 = use the cv*_wgt C arrays via push_wgt) -----
+    // When wgt_in_blob != 0, each conv reads weights DIRECTLY from its DDR blob
+    // address (no push_wgt copy); the cv*_wgt C-array pointers are then unused.
+    uint32_t wgt_in_blob;
+    uint32_t cv1_wgt_ddr;
+    uint32_t mcv1_wgt_ddr[YOLO_C2F_MAX_BN];
+    uint32_t mcv2_wgt_ddr[YOLO_C2F_MAX_BN];
+    uint32_t cv2_wgt_ddr;
+
     // ----- cv1 (1x1) -----
     const uint32_t (*cv1_wgt)[4]; uint32_t cv1_wgt_words;
     const int32_t *cv1_bias; const uint32_t *cv1_mul; const uint32_t *cv1_shift;

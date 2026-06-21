@@ -40,7 +40,7 @@ void usercode7(void)
     cfg.bn_out_ddr=BN_OUT; cfg.mcv2_ddr=MCV2_DDR;
     cfg.add_ddr[0]=ADD0_DDR; cfg.add_ddr[1]=ADD1_DDR;
     cfg.concat_ddr=CONCAT_DDR; cfg.out_ddr=OUT_DDR; cfg.wgt_ddr=WGT_DDR;
-    cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=0u;
+    cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=0u; cfg.wgt_in_blob=0u;
 
     cfg.cv1_wgt=yolo_c2f4_cv1_wgt; cfg.cv1_wgt_words=YOLO_C2F4_CV1_WGT_WORDS;
     cfg.cv1_bias=yolo_c2f4_cv1_bias; cfg.cv1_mul=yolo_c2f4_cv1_mul; cfg.cv1_shift=yolo_c2f4_cv1_shift;
