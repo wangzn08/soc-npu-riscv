@@ -128,6 +128,25 @@ yolo_run_conv2d_tiled strip-staging fix. firmware/yolo_conv1_320_exact_smoke.c +
 gen_yolo_conv1_320_exact.py are the harness (exact-SiLU is correct; they pin the
 stride-2 bug). conv0 (also stride2) will hit the same.
 
+### Exact-SiLU layer coverage (2026-06-21)
+
+| layer | stride | exact-SiLU vs C dump | RTL smoke |
+|-------|--------|----------------------|-----------|
+| conv0 | 2 | max 2 (gen self-check) | **FAIL** (see below) |
+| conv1 | 2 | max 1 | PASS (serial path) |
+| c2f_2 (conv2/3/4/5) | 1 | block max 13 | PASS |
+
+**conv0 open item (NPU <16-real-IC first layer):** conv0 is the ONLY conv with
+<16 REAL input channels (IC=3, zero-padded to the 16-lane datapath). Its exact
+math is proven vs dump320/conv0.bin (max 2), but the RTL smoke
+(yolo_conv0_320_exact_smoke.c) FAILS grossly even at pos=0 -- not a pad/stride
+issue (conv1 same path passes; c2f_2 IC=16 mcv1/mcv2 OC=16 pass). The NPU
+mishandles zero-padded input lanes for a <16-real-IC conv. Needs an int32_out acc
+probe to see the raw accumulator, then either an img_expand-style 3->16 input
+build (cf. MNIST conv1) or an NPU IC-tail fix. Does NOT affect the proven
+exact-SiLU / stride-2 work. (conv0 image is 1.6MB so the smoke checks a
+position-weighted checksum, not a baked golden.)
+
 ### RESOLVED (2026-06-21): exact per-layer SiLU LUT + c2f_2 @320 PASS
 
 The SiLU LUT range gap below is FIXED. Added CTRL[22] NPU_CTRL_SILU_EXACT_EN +
