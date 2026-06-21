@@ -25,7 +25,7 @@ module im2col_line_buffer #(
     parameter ACT_BUS_W        = ARRAY_ROWS * ACT_GROUP_W, // 2048
     parameter KERNEL_SIZE      = 3,
     parameter KERNEL_OFFSETS   = KERNEL_SIZE * KERNEL_SIZE, // 9
-    parameter ADDR_W           = 8,   // log2(MAX_WIDTH)
+    parameter ADDR_W           = $clog2(MAX_WIDTH), // tracks MAX_WIDTH (256->8, 512->9)
     parameter ICG_MAX          = 4    // max IC tiles (64 channels / 16)
 ) (
     input  wire                         clk,

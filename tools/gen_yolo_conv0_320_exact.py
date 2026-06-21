@@ -8,8 +8,10 @@ self-checked against dump320/conv0.bin (the C float oracle).
 """
 from __future__ import annotations
 from pathlib import Path
-import struct, math
+import os, struct, math
 import numpy as np
+
+CROP = int(os.environ.get("CONV0_CROP", "0"))  # >0: crop to CROPxCROP, emit full golden
 
 ROOT = Path(__file__).resolve().parents[1]
 WDIR = ROOT / "yolov8n_int8" / "weights"
@@ -69,6 +71,8 @@ def build_silu_lut(out_scale, out_zp):
 def main():
     px, IN_W, IN_H = read_ppm(PPM)                    # [H,W,3] uint8
     c0, out_scale, out_zp = read_dump("conv0.bin")    # golden + out scales
+    if CROP > 0:
+        px = px[:CROP, :CROP, :]; IN_W = IN_H = CROP   # tiny reproducer, full golden
     OC = 16
     OUT_H = (IN_H + 2*PAD - KH)//STRIDE + 1            # 160
     OUT_W = (IN_W + 2*PAD - KW)//STRIDE + 1
@@ -105,9 +109,10 @@ def main():
                 idx = clamp_s8(s2 + out_zp)
                 golden[oy*OUT_W+ox, oc] = np.int8(s8(int(lut[idx & 0xFF])))
 
-    cflat = c0.transpose(1, 2, 0).reshape(SP_OUT, OC)
-    df = np.abs(golden.astype(int) - cflat.astype(int))
-    print(f"exact conv0 vs dump320/conv0.bin: mism={int((df>0).sum())}/{golden.size} max={int(df.max())}")
+    if CROP == 0:
+        cflat = c0.transpose(1, 2, 0).reshape(SP_OUT, OC)
+        df = np.abs(golden.astype(int) - cflat.astype(int))
+        print(f"exact conv0 vs dump320/conv0.bin: mism={int((df>0).sum())}/{golden.size} max={int(df.max())}")
 
     # Position-weighted checksum over the whole golden tensor (no cancellation):
     # chk = sum_idx ((byte+128) * (idx+1)) mod 2^32, idx = pos*OC + oc. The smoke
@@ -170,6 +175,10 @@ def main():
 {u32("yolo_conv0_320e_scale_shift", [Q_SHIFT]*OC)}
 
 {u8("yolo_conv0_320e_silu_lut", lut)}
+""" + ("" if CROP == 0 else ("#define C0E_HAVE_GOLDEN 1\n" + chr(10).join(
+        [f"static const uint8_t yolo_conv0_320e_golden[{SP_OUT}][{OC}] = {{"] +
+        ["    {"+", ".join(f"0x{int(x)&0xFF:02X}u" for x in golden[p])+"}," for p in range(SP_OUT)] +
+        ["};"]))) + """
 
 #endif
 """

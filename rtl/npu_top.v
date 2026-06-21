@@ -39,7 +39,7 @@ module npu_top #(
     parameter ARRAY_COLS    = 16,
     parameter ACT_BUS_W     = ARRAY_ROWS * ACT_DATA_W,  // 2048
     parameter WGT_BUS_W     = ARRAY_COLS * ACT_DATA_W,  // 2048
-    parameter MAX_WIDTH     = 256
+    parameter MAX_WIDTH     = 512  // im2col line-buffer width cap; 512 covers 320-wide YOLO stem (conv0)
 ) (
     input  wire                             clk,
     input  wire                             rst_n,

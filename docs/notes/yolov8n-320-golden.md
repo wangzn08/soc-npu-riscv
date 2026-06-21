@@ -136,16 +136,18 @@ stride-2 bug). conv0 (also stride2) will hit the same.
 | conv1 | 2 | max 1 | PASS (serial path) |
 | c2f_2 (conv2/3/4/5) | 1 | block max 13 | PASS |
 
-**conv0 open item (NPU <16-real-IC first layer):** conv0 is the ONLY conv with
-<16 REAL input channels (IC=3, zero-padded to the 16-lane datapath). Its exact
-math is proven vs dump320/conv0.bin (max 2), but the RTL smoke
-(yolo_conv0_320_exact_smoke.c) FAILS grossly even at pos=0 -- not a pad/stride
-issue (conv1 same path passes; c2f_2 IC=16 mcv1/mcv2 OC=16 pass). The NPU
-mishandles zero-padded input lanes for a <16-real-IC conv. Needs an int32_out acc
-probe to see the raw accumulator, then either an img_expand-style 3->16 input
-build (cf. MNIST conv1) or an NPU IC-tail fix. Does NOT affect the proven
-exact-SiLU / stride-2 work. (conv0 image is 1.6MB so the smoke checks a
-position-weighted checksum, not a baked golden.)
+**conv0 RESOLVED (im2col line-buffer width cap):** conv0 @320 now PASSES. The
+root cause was NOT zero-lanes (an int32_out acc probe, conv0_accprobe_smoke.c,
+proved the <16-real-IC MAC is bit-exact -- and incidentally documented that
+int32_out OUT-SRAM layout is oc-group-major, word=(oc/4)*SP+pos, and only the
+first oc-group drains correctly for multi-position convs). Bisected by cropping:
+conv0 @18x18 PASSES, @320 FAILS => the trigger is WIDTH. `im2col_line_buffer` had
+MAX_WIDTH=256 (ADDR_W=8); conv0 input is 320 wide (322 padded), so the line-buffer
+write/read pointers wrapped at 256 and corrupted wide rows. conv1 (160) fit.
+Fix: npu_top MAX_WIDTH 256->512 and ADDR_W=$clog2(MAX_WIDTH) in the line buffer.
+conv0 @320 exact PASSES (checksum match); MNIST 10/10 / 941,155 cyc unchanged.
+NOTE: strip tiling tiles HEIGHT only; for 640-wide layers bump MAX_WIDTH to 1024
+or add WIDTH (column) tiling -- the FPGA-scalable route per the spatial-tiling plan.
 
 ### RESOLVED (2026-06-21): exact per-layer SiLU LUT + c2f_2 @320 PASS
 

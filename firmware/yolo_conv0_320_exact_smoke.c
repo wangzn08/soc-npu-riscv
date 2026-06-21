@@ -51,6 +51,30 @@ void usercode7(void)
     print_str(" npu_busy=");      print_dec(rdp(NPU_PERF_CYC_BUSY));
     print_str("\n");
 
+#ifdef C0E_HAVE_GOLDEN
+    {
+        uint32_t dbg_err = 0u;
+        for (pos = 0u; pos < C0E_OUT_SPATIAL; pos++)
+            for (oc = 0u; oc < C0E_OC; oc++) {
+                int32_t got = rs8(OUT_DDR, pos, oc);
+                int32_t exp = yolo_conv0_320e_golden[pos][oc]; exp = (exp&0x80)?exp-256:exp;
+                int32_t d = got-exp; if (d<0) d=-d;
+                if ((uint32_t)d > C0E_RTL_TOL) {
+                    errors++;
+                    if (dbg_err++ < 12u) {
+                        print_str("  pos="); print_dec(pos);
+                        print_str(" oc="); print_dec(oc);
+                        print_str(" got="); print_dec((uint32_t)got);
+                        print_str(" exp="); print_dec((uint32_t)exp); print_str("\n");
+                    }
+                }
+            }
+        if (errors == 0u) { print_str("YOLO CONV0 @320 EXACT-SiLU SMOKE PASS\n"); return; }
+        print_str("YOLO CONV0 @320 EXACT-SiLU SMOKE FAIL errors="); print_dec(errors); print_str("\n");
+        __asm__ volatile ("ebreak");
+    }
+#endif
+
     /* Position-weighted checksum over the whole output (the 1.6MB image leaves no
      * room to bake the golden tensor; per-element exactness is proven on conv1). */
     {
