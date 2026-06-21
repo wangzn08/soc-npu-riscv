@@ -1,32 +1,34 @@
-// yolo_full.c seed: on-SoC LAYER CHAIN through DDR (no re-baked intermediates).
-// Stage A: conv1 (exact-SiLU, stride-2 tiled) from the conv0 dump -> DDR.
-// Stage B: c2f_2 (exact-SiLU) reads conv1's RTL output DIRECTLY (matching scale/
-//          zp/tile-major layout) -> DDR. Final compared to the c2f_2 golden.
-// Proves layers chain bit-faithfully on the SoC: conv1.out (0.6557820439,-128,
-// 32ch tile-major) == c2f_2.in. conv0 (1.6MB image) needs DDR-preload, added later.
+// yolo_full.c stem: FULL on-SoC stem chain conv0 -> conv1 -> c2f_2, all through
+// DDR with exact-SiLU. conv0 reads the DDR-PRELOADED 320x320x3 image (no bake;
+// requires `touch .yolo_ddr` so the shared-mem model $readmemh's the image into
+// 0x4040_0000). Each layer's RTL output feeds the next directly (scale/zp/tile-
+// major layout match by construction). Final compared to the c2f_2 golden with a
+// propagation-aware tolerance (conv0/conv1 quantization +-1..2 propagates).
+//
+// Build: touch .yolo_ddr; bash run_all.sh sim yolo_full_stem.c yolo_c2f.c yolo_ops.c
 
 #include "firmware.h"
 #include "yolo_ops.h"
 #include "yolo_c2f.h"
+#include "yolo_conv0_320_noact_data.h"
 #include "yolo_conv1_320_exact_data.h"
 #include "yolo_c2f2_320_data.h"
 #include <stdint.h>
 
-// ---- conv1 buffers ----
-#define PAD_ROW   0x40080000u
-#define C1_IN     0x40090000u   // conv0 dump (baked)
-#define C1_WGT    0x40180000u
-#define C1_OUT    0x40400000u   // = c2f_2 input
-// ---- c2f_2 scratch ----
-#define CV1_OUT   0x40440000u
-#define BN_OUT    0x404C0000u
-#define MCV2_DDR  0x40500000u
-#define ADD0_DDR  0x40540000u
-#define CONCAT    0x40580000u
-#define C2F_OUT   0x40600000u
-#define C2F_WGT   0x40680000u
+#define IMG       0x40400000u   // preloaded image (conv0 input)
+#define C0_WGT    0x405C0000u
+#define C0_OUT    0x40600000u   // = conv1 input
+#define C1_WGT    0x40680000u
+#define C1_OUT    0x406C0000u   // = c2f_2 input
+#define CV1_OUT   0x40700000u
+#define BN_OUT    0x40740000u
+#define MCV2_DDR  0x40760000u
+#define ADD0_DDR  0x40780000u
+#define CONCAT    0x407A0000u
+#define C2F_OUT   0x40820000u
+#define C2F_WGT   0x40880000u
+#define PAD_ROW   0x408C0000u
 #define WGT_BASE  0u
-#define STRIP     16u
 
 static void wrw(uint32_t a, uint32_t w, const uint32_t l[4])
 { volatile uint32_t *p=(volatile uint32_t*)(a+w*16u); p[0]=l[0];p[1]=l[1];p[2]=l[2];p[3]=l[3]; }
@@ -40,24 +42,37 @@ void usercode7(void)
     uint32_t i, pos, oc, errors = 0u, maxd = 0u;
     yolo_c2f_cfg_t cfg;
 
-    print_str("YOLO FULL STEM: conv1 -> c2f_2 chain (on-SoC, DDR)\n");
+    print_str("YOLO FULL STEM: conv0 -> conv1 -> c2f_2 (on-SoC, DDR, preloaded img)\n");
 
-    // ---------- Stage A: conv1 (input = conv0 dump) -> C1_OUT ----------
-    for (i = 0u; i < C1E_ACT_WORDS; i++) wrw(C1_IN, i, yolo_conv1_320e_act_words[i]);
+    // ---------- Stage 0: conv0 (preloaded image) -> C0_OUT ----------
+    for (i = 0u; i < C0E_WGT_WORDS; i++) wrw(C0_WGT, i, yolo_conv0_320e_wgt_words[i]);
+    yolo_set_pad_value(C0E_PAD_VALUE);
+    yolo_load_silu_lut(yolo_conv0_320e_silu_lut);
+    yolo_set_silu_requant(0u, 0u, C0E_OUT_ZP);
+    if (!yolo_run_conv2d_tiled(IMG, C0_WGT, WGT_BASE, C0_OUT, PAD_ROW,
+                               C0E_IN_W, C0E_IN_H, C0E_IC, C0E_OC,
+                               3u, 3u, 2u, 1u,
+                               yolo_conv0_320e_bias_q, yolo_conv0_320e_scale_mul,
+                               yolo_conv0_320e_scale_shift,
+                               NPU_CTRL_SILU_EXACT_EN, C0E_WGT_PER_OC, 16u, C0E_PAD_VALUE)) {
+        print_str("  conv0 fail\n"); errors++;
+    }
+
+    // ---------- Stage 1: conv1 reads C0_OUT -> C1_OUT ----------
     for (i = 0u; i < C1E_WGT_WORDS; i++) wrw(C1_WGT, i, yolo_conv1_320e_wgt_words[i]);
     yolo_set_pad_value(C1E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv1_320e_silu_lut);
     yolo_set_silu_requant(0u, 0u, C1E_OUT_ZP);
-    if (!yolo_run_conv2d_tiled(C1_IN, C1_WGT, WGT_BASE, C1_OUT, PAD_ROW,
+    if (errors == 0u && !yolo_run_conv2d_tiled(C0_OUT, C1_WGT, WGT_BASE, C1_OUT, PAD_ROW,
                                C1E_IN_W, C1E_IN_H, C1E_IC, C1E_OC,
                                3u, 3u, 2u, 1u,
                                yolo_conv1_320e_bias_q, yolo_conv1_320e_scale_mul,
                                yolo_conv1_320e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C1E_WGT_PER_OC, STRIP, C1E_PAD_VALUE)) {
+                               NPU_CTRL_SILU_EXACT_EN, C1E_WGT_PER_OC, 16u, C1E_PAD_VALUE)) {
         print_str("  conv1 fail\n"); errors++;
     }
 
-    // ---------- Stage B: c2f_2 reads C1_OUT directly ----------
+    // ---------- Stage 2: c2f_2 reads C1_OUT ----------
     cfg.in_w=YOLO_C2F2_IN_W; cfg.in_h=YOLO_C2F2_IN_H; cfg.spatial=YOLO_C2F2_SPATIAL;
     cfg.full_c=YOLO_C2F2_FULL_C; cfg.n_bottleneck=1u; cfg.shortcut=1u;
     cfg.in_ddr=C1_OUT; cfg.cv1_ic=YOLO_C2F2_CV1_IC; cfg.cv1_out_ddr=CV1_OUT;
@@ -92,14 +107,14 @@ void usercode7(void)
     cfg.cv2_silu_lut=yolo_c2f2_cv2_silu_lut;
     if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f2 fail\n"); errors++; }
 
-    // ---------- validate c2f_2 chain output vs golden (conv1's +-1 propagates) ----------
+    // ---------- validate full-stem c2f_2 output vs golden ----------
     for (pos = 0u; pos < YOLO_C2F2_SPATIAL && errors <= 16u; pos++)
         for (oc = 0u; oc < YOLO_C2F2_CV2_OC; oc++) {
             int32_t got = rs8(C2F_OUT, (oc>>4)*YOLO_C2F2_SPATIAL + pos, oc&15u);
             int32_t exp = s8(yolo_c2f2_expected_rtl[pos][oc]);
             uint32_t d = ad(got, exp);
             if (d > maxd) maxd = d;
-            if (d > 24u) {   /* conv1's +-1 vs dump propagates through c2f_2's 4 convs (<=18 here) */
+            if (d > 32u) {   /* conv0+conv1 +-1..2 propagate through c2f_2 */
                 errors++;
                 if (errors <= 8u) {
                     print_str("  pos="); print_dec(pos); print_str(" oc="); print_dec(oc);
@@ -108,8 +123,8 @@ void usercode7(void)
             }
         }
 
-    print_str("chain c2f_2 vs golden maxdiff="); print_dec(maxd); print_str("\n");
-    if (errors == 0u) { print_str("YOLO FULL STEM PASS (conv1->c2f_2 chained)\n"); return; }
+    print_str("full-stem c2f_2 vs golden maxdiff="); print_dec(maxd); print_str("\n");
+    if (errors == 0u) { print_str("YOLO FULL STEM PASS (conv0->conv1->c2f_2 chained)\n"); return; }
     print_str("YOLO FULL STEM FAIL errors="); print_dec(errors); print_str("\n");
     __asm__ volatile ("ebreak");
 }

@@ -191,13 +191,15 @@ will align once the LUT fix lands.
 
 ## yolo_full.c assembly (incremental, on-SoC chain)
 
-`firmware/yolo_full_stem.c` is the first real LAYER CHAIN (not per-layer smokes
-with baked inputs): conv1 (exact-SiLU, stride-2 tiled) runs from the conv0 dump,
-its RTL output stays in DDR, and c2f_2 reads it DIRECTLY -- conv1.out
-(0.6557820439, -128, 32ch tile-major) == c2f_2.in by construction. PASS:
-chain c2f_2 vs golden maxdiff=18 (conv1's +-1-vs-dump propagating through c2f_2's
-4 convs; the standalone c2f_2 on dump-conv1 is exact), TRAP 120.9M cyc. Proves
-on-SoC inter-layer chaining through DDR with exact SiLU + tiled stride-2.
+`firmware/yolo_full_stem.c` runs the FULL STEM as a real layer chain (not
+per-layer smokes with baked inputs): conv0 reads the DDR-preloaded 320x320x3
+image, conv0->conv1->c2f_2 each feed the next DIRECTLY through DDR (scale/zp/tile-
+major layout match by construction: conv0.out=(0.235,-127,16ch)=conv1.in;
+conv1.out=(0.6557820439,-128,32ch)=c2f_2.in). All exact-SiLU, tiled stride-2.
+PASS: full-stem c2f_2 vs golden maxdiff=19 (conv0/conv1 +-1..2 quantization
+propagating through 6 convs + add + concat), TRAP 128.3M cyc. Build:
+`touch .yolo_ddr; bash run_all.sh sim yolo_full_stem.c yolo_c2f.c yolo_ops.c`.
+This is the complete front-of-network (image -> stem) proven end-to-end on the SoC.
 
 Next assembly steps:
 1. DDR-preload the 320x320x3 image -- DONE. tools/gen_yolo_img_hex.py emits
