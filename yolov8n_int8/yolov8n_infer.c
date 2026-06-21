@@ -160,6 +160,8 @@ static Tensor conv_int8(int ci, const Tensor *in) {
 
     Tensor out = tensor_make(OC, OH, OW, cw->out_scale, cw->out_zp);
 
+    float ps_min = 1e30f, ps_max = -1e30f; long ps_sat = 0, ps_tot = 0;
+
     for (int oc = 0; oc < OC; oc++) {
         float bias = cw->b[oc];
         float wscale = cw->wscale[oc];
@@ -190,11 +192,20 @@ static Tensor conv_int8(int ci, const Tensor *in) {
                 }
                 int32_t acc_corrected = acc - in->zero_point * wsum;
                 float preact = (float)acc_corrected * in->scale * wscale + bias;
+                if (cw->has_silu) {
+                    if (preact < ps_min) ps_min = preact;
+                    if (preact > ps_max) ps_max = preact;
+                    if (preact < -7.9375f || preact > 7.9375f) ps_sat++;
+                    ps_tot++;
+                }
                 float y = cw->has_silu ? (preact / (1.0f + expf(-preact))) : preact;
                 out_ch[oh * OW + ow] = clamp_round_int8(y / cw->out_scale + cw->out_zp);
             }
         }
     }
+    if (cw->has_silu && getenv("YOLO_PREACT_STATS"))
+        fprintf(stderr, "PREACT conv%-2d silu pmin=%9.3f pmax=%9.3f sat(|p|>7.94)=%6.3f%% (%ld/%ld)\n",
+                ci, ps_min, ps_max, ps_tot ? 100.0 * (double)ps_sat / (double)ps_tot : 0.0, ps_sat, ps_tot);
     if (getenv("YOLO_DEBUG_DUMP")) dbg_dump_conv(ci, &out);
     return out;
 }
