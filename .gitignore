@@ -18,3 +18,4 @@ Thumbs.db
 tmp/
 firmware/yolo_conv1_320_data.h
 firmware/yolo_layer320_data.h
+.yolo_ddr

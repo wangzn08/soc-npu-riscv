@@ -530,6 +530,13 @@
         // runtime (see deepnet_deploy.c / gen_act_hex.py).
         reg [127:0] act_pre [0:489];
         integer api;
+`ifdef YOLO_DDR
+        // YOLO 320x320 tile-major 16-lane image preload at DDR word base 0x40000
+        // (CPU addr 0x4040_0000), so conv0 reads its 1.6MB input from DDR instead
+        // of baking it into the 1.96MB firmware region. gen_yolo_img_hex.py.
+        reg [127:0] yimg_pre [0:102399];
+        integer ypi;
+`endif
         initial begin
             for (bram_init_i = 0; bram_init_i <= (1<<(OPT_MEM_ADDR_BITS+1))-1; bram_init_i = bram_init_i + 1)
                 byte_ram[bram_init_i] = 8'h0;
@@ -539,6 +546,11 @@
             $readmemh("firmware/act_ddr.hex", act_pre);
             for (api = 0; api < 490; api = api + 1)
                 byte_ram[81920 + api] = act_pre[api][mem_byte_index*8 +: 8];
+`ifdef YOLO_DDR
+            $readmemh("firmware/yolo_img_ddr.hex", yimg_pre);
+            for (ypi = 0; ypi < 102400; ypi = ypi + 1)
+                byte_ram[262144 + ypi] = yimg_pre[ypi][mem_byte_index*8 +: 8];
+`endif
         end
 	     
 	        assign data_in  = S_AXI_WDATA[(mem_byte_index*8+7) -: 8];

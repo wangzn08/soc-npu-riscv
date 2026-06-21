@@ -200,8 +200,14 @@ chain c2f_2 vs golden maxdiff=18 (conv1's +-1-vs-dump propagating through c2f_2'
 on-SoC inter-layer chaining through DDR with exact SiLU + tiled stride-2.
 
 Next assembly steps:
-1. DDR-preload the 320x320x3 image (gen_act_hex-style $readmemh) so conv0 can
-   chain too (its 1.6MB input cannot be baked in the 1.96MB firmware region).
+1. DDR-preload the 320x320x3 image -- DONE. tools/gen_yolo_img_hex.py emits
+   firmware/yolo_img_ddr.hex (320x320 tile-major 16-lane, q=pixel-128); the
+   shared-memory model $readmemh-loads it into DDR word base 0x40000 (CPU addr
+   0x4040_0000) under +define+YOLO_DDR. Enable per-build with `touch .yolo_ddr`
+   (gitignored) or YOLO_DDR=1; default off keeps MNIST 10/10 / 941,155 cyc.
+   firmware/yolo_conv0_preload_smoke.c runs conv0 on the preloaded image (no 1.6MB
+   bake) -> PASS. Same mechanism will host the 3.3MB weight blob next so the full
+   net is not limited by the 1.96MB firmware region.
 2. Extend the chain: conv0->conv1->c2f_2->conv6->c2f_8->... validating each stage
    vs its dump320/conv<ci>.bin with a propagation-aware tol.
 3. Detection heads (exact-SiLU on conv36..62) + on-chip DFL/sigmoid/NMS decode.

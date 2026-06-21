@@ -12,6 +12,7 @@ import os, struct, math
 import numpy as np
 
 CROP = int(os.environ.get("CONV0_CROP", "0"))  # >0: crop to CROPxCROP, emit full golden
+NOACT = int(os.environ.get("CONV0_NOACT", "0"))  # 1: omit the 1.6MB act_words (DDR-preloaded image)
 
 ROOT = Path(__file__).resolve().parents[1]
 WDIR = ROOT / "yolov8n_int8" / "weights"
@@ -163,8 +164,9 @@ def main():
 #define C0E_OUT_ZP {out_zp}
 #define C0E_RTL_TOL {RTL_TOL}u
 #define C0E_GOLDEN_CHK 0x{chk:08X}u
+#define C0E_ACT_WORD0_0 0x{act_words[0][0]:08X}u
 
-{u32a("yolo_conv0_320e_act_words", act_words)}
+{("/* act_words omitted (CONV0_NOACT): image is DDR-preloaded */" if NOACT else u32a("yolo_conv0_320e_act_words", act_words))}
 
 {u32a("yolo_conv0_320e_wgt_words", wgt_words)}
 
@@ -182,8 +184,11 @@ def main():
 
 #endif
 """
-    OUT_PATH.write_text(body, encoding="ascii")
-    print(f"wrote {OUT_PATH}")
+    out_path = (ROOT / "firmware" / "yolo_conv0_320_noact_data.h") if NOACT else OUT_PATH
+    if NOACT:
+        body = body.replace("YOLO_CONV0_320_EXACT_DATA_H", "YOLO_CONV0_320_NOACT_DATA_H")
+    out_path.write_text(body, encoding="ascii")
+    print(f"wrote {out_path}")
 
 
 if __name__ == "__main__":

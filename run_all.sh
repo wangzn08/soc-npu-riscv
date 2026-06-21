@@ -180,7 +180,14 @@ compile_rtl() {
     fi
 
     info "编译 RTL 文件列表: $FILELIST"
-    vlog -sv -timescale 1ns/1ps -f "$FILELIST" -work "$SIM_DIR/work"
+    # YOLO_DDR=1 preloads the 320x320 image into DDR (firmware/yolo_img_ddr.hex)
+    # via +define+YOLO_DDR; default off keeps MNIST builds unchanged.
+    VLOG_DEFS=""
+    if [ -n "${YOLO_DDR:-}" ] || [ -f "$ROOT_DIR/.yolo_ddr" ]; then
+        VLOG_DEFS="+define+YOLO_DDR"
+        info "YOLO_DDR 预载启用 (+define+YOLO_DDR)"
+    fi
+    vlog -sv -timescale 1ns/1ps $VLOG_DEFS -f "$FILELIST" -work "$SIM_DIR/work"
 
     ok "RTL 编译完成"
 }
