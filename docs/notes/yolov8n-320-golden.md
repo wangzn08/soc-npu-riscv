@@ -98,6 +98,25 @@ and fine. Scoped change:
   3. Firmware c2f2_320 smoke -> PASS -> chain backbone -> neck/head -> on-chip
      decode (DFL HW + sigmoid HW + int argmax/geometry/NMS) -> full TRAP cycles.
 
+### NEW BLOCKER (2026-06-21): stride-2 tiled boundary bug (exposed by exact SiLU)
+
+conv1 @320 (16->32 3x3 **stride2** pad1) with exact SiLU FAILS the C-dump check at
+edge rows (errors=17, diff ~20). Root cause is NOT exact SiLU — it is a stride-2
+tiled vertical-padding/strip bug that the old saturating Q4.4 LUT MASKED:
+- The exact-SiLU golden matches dump320/conv1.bin within +-1 (gen self-check).
+- At pos=1 (top-pad row), RTL oc3 output (-108) exactly matches a model where the
+  TOP VERTICAL PAD ROW contributes 0 instead of in_zp(-127); other OCs partially
+  match, so the staged strip / pad content is wrong for stride-2 strip 0.
+- c2f_2 @320 (all stride-1 convs) PASSES exact -> the bug is stride-2-specific.
+- The legacy conv1 smoke "passed" only because its preacts at these edges
+  saturate the +-8 LUT to the same clamped value regardless of the pad error.
+
+This is the plan's flagged top risk (分块 halo/边界 padding; stride2 单独 TB).
+Fix needs a directed stride-2 tiled-pad TB then a top_controller_fsm / axi_dma /
+yolo_run_conv2d_tiled strip-staging fix. firmware/yolo_conv1_320_exact_smoke.c +
+gen_yolo_conv1_320_exact.py are the harness (exact-SiLU is correct; they pin the
+stride-2 bug). conv0 (also stride2) will hit the same.
+
 ### RESOLVED (2026-06-21): exact per-layer SiLU LUT + c2f_2 @320 PASS
 
 The SiLU LUT range gap below is FIXED. Added CTRL[22] NPU_CTRL_SILU_EXACT_EN +
