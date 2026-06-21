@@ -13,7 +13,12 @@
 #include "yolo_conv0_320_noact_data.h"
 #include "yolo_conv1_320_exact_data.h"
 #include "yolo_c2f2_320_data.h"
+#include "yolo_weight_map.h"
 #include <stdint.h>
+
+// conv0/conv1 read weights DIRECTLY from the DDR weight blob (no bake); the tiled
+// conv takes a DDR weight base. c2f_2 weights stay baked (C2f runner takes arrays).
+#define WGT_OF(ci) (YOLO_WGT_DDR_BASE + yolo_wgt_map[ci].off * 16u)
 
 #define IMG       0x40400000u   // preloaded image (conv0 input)
 #define C0_WGT    0x405C0000u
@@ -30,8 +35,6 @@
 #define PAD_ROW   0x408C0000u
 #define WGT_BASE  0u
 
-static void wrw(uint32_t a, uint32_t w, const uint32_t l[4])
-{ volatile uint32_t *p=(volatile uint32_t*)(a+w*16u); p[0]=l[0];p[1]=l[1];p[2]=l[2];p[3]=l[3]; }
 static int32_t rs8(uint32_t a, uint32_t w, uint32_t b)
 { volatile uint32_t *p=(volatile uint32_t*)(a+w*16u); uint32_t v=p[b>>2]>>((b&3u)*8u)&0xFFu; return (v&0x80u)?((int32_t)v-256):(int32_t)v; }
 static int32_t s8(uint32_t b){ b&=0xFFu; return (b&0x80u)?((int32_t)b-256):(int32_t)b; }
@@ -39,17 +42,16 @@ static uint32_t ad(int32_t a,int32_t b){ int32_t d=a-b; return (uint32_t)(d<0?-d
 
 void usercode7(void)
 {
-    uint32_t i, pos, oc, errors = 0u, maxd = 0u;
+    uint32_t pos, oc, errors = 0u, maxd = 0u;
     yolo_c2f_cfg_t cfg;
 
     print_str("YOLO FULL STEM: conv0 -> conv1 -> c2f_2 (on-SoC, DDR, preloaded img)\n");
 
-    // ---------- Stage 0: conv0 (preloaded image) -> C0_OUT ----------
-    for (i = 0u; i < C0E_WGT_WORDS; i++) wrw(C0_WGT, i, yolo_conv0_320e_wgt_words[i]);
+    // ---------- Stage 0: conv0 (preloaded image, weights from DDR blob) -> C0_OUT ----------
     yolo_set_pad_value(C0E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv0_320e_silu_lut);
     yolo_set_silu_requant(0u, 0u, C0E_OUT_ZP);
-    if (!yolo_run_conv2d_tiled(IMG, C0_WGT, WGT_BASE, C0_OUT, PAD_ROW,
+    if (!yolo_run_conv2d_tiled(IMG, WGT_OF(0), WGT_BASE, C0_OUT, PAD_ROW,
                                C0E_IN_W, C0E_IN_H, C0E_IC, C0E_OC,
                                3u, 3u, 2u, 1u,
                                yolo_conv0_320e_bias_q, yolo_conv0_320e_scale_mul,
@@ -58,12 +60,11 @@ void usercode7(void)
         print_str("  conv0 fail\n"); errors++;
     }
 
-    // ---------- Stage 1: conv1 reads C0_OUT -> C1_OUT ----------
-    for (i = 0u; i < C1E_WGT_WORDS; i++) wrw(C1_WGT, i, yolo_conv1_320e_wgt_words[i]);
+    // ---------- Stage 1: conv1 reads C0_OUT, weights from DDR blob -> C1_OUT ----------
     yolo_set_pad_value(C1E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv1_320e_silu_lut);
     yolo_set_silu_requant(0u, 0u, C1E_OUT_ZP);
-    if (errors == 0u && !yolo_run_conv2d_tiled(C0_OUT, C1_WGT, WGT_BASE, C1_OUT, PAD_ROW,
+    if (errors == 0u && !yolo_run_conv2d_tiled(C0_OUT, WGT_OF(1), WGT_BASE, C1_OUT, PAD_ROW,
                                C1E_IN_W, C1E_IN_H, C1E_IC, C1E_OC,
                                3u, 3u, 2u, 1u,
                                yolo_conv1_320e_bias_q, yolo_conv1_320e_scale_mul,

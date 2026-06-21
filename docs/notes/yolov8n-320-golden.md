@@ -208,8 +208,16 @@ Next assembly steps:
    0x4040_0000) under +define+YOLO_DDR. Enable per-build with `touch .yolo_ddr`
    (gitignored) or YOLO_DDR=1; default off keeps MNIST 10/10 / 941,155 cyc.
    firmware/yolo_conv0_preload_smoke.c runs conv0 on the preloaded image (no 1.6MB
-   bake) -> PASS. Same mechanism will host the 3.3MB weight blob next so the full
-   net is not limited by the 1.96MB firmware region.
+   bake) -> PASS.
+2. DDR-preload ALL conv weights -- DONE. tools/gen_yolo_weights_blob.py packs all
+   64 convs tile-major (IC zero-padded to 16-mult) into firmware/yolo_weights_ddr.hex
+   (196753 words, ~3MB) + firmware/yolo_weight_map.h (per-conv {ddr off, words, oc,
+   ic, kh, kw}). The shared-mem model $readmemh's it into DDR word base 0x80000
+   (CPU 0x4080_0000) under +define+YOLO_DDR. yolo_run_conv2d_tiled takes a DDR
+   weight base, so a layer reads its weights via WGT_OF(ci)=YOLO_WGT_DDR_BASE +
+   yolo_wgt_map[ci].off*16 -- NO firmware bake. yolo_full_stem.c now runs conv0 and
+   conv1 with weights straight from the blob: full stem PASS, maxdiff=19, 122M cyc.
+   The 1.96MB firmware region no longer limits the net's weights.
 2. Extend the chain: conv0->conv1->c2f_2->conv6->c2f_8->... validating each stage
    vs its dump320/conv<ci>.bin with a propagation-aware tol.
 3. Detection heads (exact-SiLU on conv36..62) + on-chip DFL/sigmoid/NMS decode.

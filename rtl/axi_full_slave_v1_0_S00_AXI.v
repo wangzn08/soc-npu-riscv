@@ -536,6 +536,9 @@
         // of baking it into the 1.96MB firmware region. gen_yolo_img_hex.py.
         reg [127:0] yimg_pre [0:102399];
         integer ypi;
+        // YOLO all-conv weight blob at DDR word base 0x80000 (CPU 0x4080_0000).
+        reg [127:0] ywgt_pre [0:196752];
+        integer ywi;
 `endif
         initial begin
             for (bram_init_i = 0; bram_init_i <= (1<<(OPT_MEM_ADDR_BITS+1))-1; bram_init_i = bram_init_i + 1)
@@ -550,6 +553,9 @@
             $readmemh("firmware/yolo_img_ddr.hex", yimg_pre);
             for (ypi = 0; ypi < 102400; ypi = ypi + 1)
                 byte_ram[262144 + ypi] = yimg_pre[ypi][mem_byte_index*8 +: 8];
+            $readmemh("firmware/yolo_weights_ddr.hex", ywgt_pre);
+            for (ywi = 0; ywi < 196753; ywi = ywi + 1)
+                byte_ram[524288 + ywi] = ywgt_pre[ywi][mem_byte_index*8 +: 8];
 `endif
         end
 	     
