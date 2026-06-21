@@ -189,6 +189,23 @@ docs/superpowers/plans/2026-06-18-yolov8n-silu-lut-m1.md.
 gen_yolo_c2f2_320.py + the C2f tiled swap (commit 5c45855) are ready; c2f2_320
 will align once the LUT fix lands.
 
+## yolo_full.c assembly (incremental, on-SoC chain)
+
+`firmware/yolo_full_stem.c` is the first real LAYER CHAIN (not per-layer smokes
+with baked inputs): conv1 (exact-SiLU, stride-2 tiled) runs from the conv0 dump,
+its RTL output stays in DDR, and c2f_2 reads it DIRECTLY -- conv1.out
+(0.6557820439, -128, 32ch tile-major) == c2f_2.in by construction. PASS:
+chain c2f_2 vs golden maxdiff=18 (conv1's +-1-vs-dump propagating through c2f_2's
+4 convs; the standalone c2f_2 on dump-conv1 is exact), TRAP 120.9M cyc. Proves
+on-SoC inter-layer chaining through DDR with exact SiLU + tiled stride-2.
+
+Next assembly steps:
+1. DDR-preload the 320x320x3 image (gen_act_hex-style $readmemh) so conv0 can
+   chain too (its 1.6MB input cannot be baked in the 1.96MB firmware region).
+2. Extend the chain: conv0->conv1->c2f_2->conv6->c2f_8->... validating each stage
+   vs its dump320/conv<ci>.bin with a propagation-aware tol.
+3. Detection heads (exact-SiLU on conv36..62) + on-chip DFL/sigmoid/NMS decode.
+
 ## Phase 4 (on-SoC full inference) status
 
 Done: all per-op + tiled conv + DFL HW + sigmoid HW verified; C@320 golden above.
