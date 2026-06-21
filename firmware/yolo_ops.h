@@ -33,6 +33,7 @@ void yolo_dfl_load_weights(const int16_t wk_q8_8[16]);    // conv63 W_k = wscale
 void yolo_dfl_load_exp_lut(const uint16_t exp_q1_15[256]); // per-scale exp table
 int  yolo_run_dfl(uint32_t src_act_base, uint32_t dst_act_base, uint32_t in_words);
 void yolo_load_sigmoid_lut(const uint8_t prob_q0_8[256]);  // per-scale cls sigmoid
+void yolo_load_silu_lut(const uint8_t silu_q8[256]);       // per-layer exact SiLU (out-grid)
 void yolo_set_pad_value(int32_t pad_value);
 void yolo_set_eltwise(int32_t zp, uint32_t skip_base);
 

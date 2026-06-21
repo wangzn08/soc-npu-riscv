@@ -45,6 +45,10 @@ module post_process_top #(
     input  wire                             i_sigm_load_en, // runtime sigmoid LUT load (per scale)
     input  wire [7:0]                       i_sigm_load_idx,
     input  wire [7:0]                       i_sigm_load_val,
+    input  wire                             i_silu_exact_en, // CTRL[22]: per-layer exact SiLU LUT (out-grid indexed)
+    input  wire                             i_silu_load_en,  // runtime exact-SiLU LUT load (per layer)
+    input  wire [7:0]                       i_silu_load_idx,
+    input  wire [7:0]                       i_silu_load_val,
 
     // Pooling state control (from FSM)
     input  wire                             i_start,      // op-start pulse: reset pool phase
@@ -150,6 +154,16 @@ module post_process_top #(
         if (i_sigm_load_en) sigmoid_lut[i_sigm_load_idx] <= i_sigm_load_val;
     end
 
+    // Exact per-layer SiLU LUT (out-grid INT8 -> out-grid INT8 SiLU): runtime-
+    // loaded per layer via NPU_SILU_LOAD. Indexed by the LINEAR output-quantized
+    // preact (the same value the linear-requant path produces, lin_requant_val),
+    // so it never saturates the fixed Q4.4 (+/-8) range of the legacy silu_lut.
+    // No boot default: must be loaded before i_silu_exact_en is used.
+    reg [ACT_WIDTH-1:0] silu_exact_lut [0:255];
+    always @(posedge clk) begin
+        if (i_silu_load_en) silu_exact_lut[i_silu_load_idx] <= i_silu_load_val;
+    end
+
     reg [DATA_W-1:0] s3_act;
     reg              s3_vld;
 
@@ -186,11 +200,17 @@ module post_process_top #(
                 (lin_biased >  32'sd127) ? 8'h7f :
                                             lin_biased[ACT_WIDTH-1:0];
 
+            // Exact SiLU: index the per-layer loadable LUT by the linear output-
+            // quantized preact (lin_requant_val). The LUT maps that out-grid INT8
+            // to round(SiLU(dequant)/out_scale + out_zp). Exact to INT8, no +/-8 clamp.
+            wire [ACT_WIDTH-1:0] silu_exact_out = silu_exact_lut[lin_requant_val];
+
             wire [ACT_WIDTH-1:0] act_val;
             // When relu_en: negative→0, >clip_max→clip_max, else pass through
             // When !relu_en: only clamp >clip_max→clip_max, keep negative values
             // clip_max defaults to 127 (legacy ReLU); set lower for ReLU6.
-            assign act_val = i_sigmoid_en          ? sigmoid_val :
+            assign act_val = i_silu_exact_en       ? silu_exact_out :
+                             i_sigmoid_en          ? sigmoid_val :
                              (i_silu_en && i_silu_requant_en) ? silu_requant_val :
                              i_silu_en             ? silu_val :
                              i_silu_requant_en     ? lin_requant_val :

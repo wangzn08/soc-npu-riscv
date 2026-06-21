@@ -123,6 +123,10 @@ module param_regfile #(
     output wire                         o_sigm_load_en,  // 0x3F0 write: sigmoid LUT load pulse
     output wire [7:0]                   o_sigm_load_idx,
     output wire [7:0]                   o_sigm_load_val,
+    output wire                         o_silu_exact_en, // CTRL[22]: per-layer exact SiLU LUT (out-grid indexed)
+    output wire                         o_silu_load_en,  // 0x3F4 write: exact SiLU LUT load pulse
+    output wire [7:0]                   o_silu_load_idx,
+    output wire [7:0]                   o_silu_load_val,
 
     // Status
     input  wire                         i_done_irq,
@@ -320,6 +324,8 @@ module param_regfile #(
     reg        dfl_eload_en_d; reg [7:0] dfl_eload_idx; reg [15:0] dfl_eload_val;
     reg        ctrl_sigmoid_en;
     reg        sigm_load_en_d; reg [7:0] sigm_load_idx; reg [7:0] sigm_load_val;
+    reg        ctrl_silu_exact_en; // CTRL[22]: per-layer exact SiLU LUT
+    reg        silu_load_en_d; reg [7:0] silu_load_idx; reg [7:0] silu_load_val;
     reg        dma_sram_sel;   // 0=Act SRAM, 1=Wgt SRAM for DMA write target
     reg        dma_out_rd_sel; // 0=skip path owns Out SRAM Port B, 1=DMA owns it
     reg [1:0]  dma_rd_sram_sel; // 0=Out SRAM, 1=Act SRAM, 2=Wgt SRAM for DMA read source
@@ -386,6 +392,7 @@ module param_regfile #(
             ctrl_gpool_en    <= 1'b0;   // global average pooling off by default
             ctrl_silu_en     <= 1'b0;   // SiLU LUT off by default; MNIST keeps legacy path
             ctrl_silu_requant_en <= 1'b0; // SiLU requant off by default
+            ctrl_silu_exact_en <= 1'b0; // exact per-layer SiLU LUT off by default
             silu_requant_mul <= 16'd0;
             silu_requant_shift <= 6'd0;
             silu_requant_zp <= 8'd0;
@@ -439,6 +446,8 @@ module param_regfile #(
             dfl_eload_en_d <= 1'b0; dfl_eload_idx <= 8'd0; dfl_eload_val <= 16'd0;
             ctrl_sigmoid_en <= 1'b0;
             sigm_load_en_d <= 1'b0; sigm_load_idx <= 8'd0; sigm_load_val <= 8'd0;
+            ctrl_silu_exact_en <= 1'b0;
+            silu_load_en_d <= 1'b0; silu_load_idx <= 8'd0; silu_load_val <= 8'd0;
             dma_sram_sel     <= 1'b0;
             dma_out_rd_sel   <= 1'b0;
             dma_rd_sram_sel  <= 2'd0;
@@ -465,6 +474,7 @@ module param_regfile #(
             dfl_wload_en_d <= 1'b0;
             dfl_eload_en_d <= 1'b0;
             sigm_load_en_d <= 1'b0;
+            silu_load_en_d <= 1'b0;
 
             if (wr_en) begin
                 // synthesis translate_off
@@ -497,6 +507,7 @@ module param_regfile #(
                         ctrl_silu_requant_en <= s_axi_wdata[19];
                         ctrl_elt_signed  <= s_axi_wdata[20];
                         ctrl_sigmoid_en  <= s_axi_wdata[21];
+                        ctrl_silu_exact_en <= s_axi_wdata[22];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -617,6 +628,11 @@ module param_regfile #(
                         sigm_load_en_d  <= 1'b1;
                         sigm_load_idx   <= s_axi_wdata[15:8];
                         sigm_load_val   <= s_axi_wdata[7:0];
+                    end
+                    10'h3F4: begin                            // NPU_SILU_LOAD (exact SiLU LUT)
+                        silu_load_en_d  <= 1'b1;
+                        silu_load_idx   <= s_axi_wdata[15:8];
+                        silu_load_val   <= s_axi_wdata[7:0];
                     end
 
                     default: ; // Ignore unmapped addresses
@@ -881,6 +897,10 @@ module param_regfile #(
     assign o_sigm_load_en     = sigm_load_en_d;
     assign o_sigm_load_idx    = sigm_load_idx;
     assign o_sigm_load_val    = sigm_load_val;
+    assign o_silu_exact_en    = ctrl_silu_exact_en;
+    assign o_silu_load_en     = silu_load_en_d;
+    assign o_silu_load_idx    = silu_load_idx;
+    assign o_silu_load_val    = silu_load_val;
     assign o_upsample_in_w    = upsample_in_w;
     assign o_upsample_in_h    = upsample_in_h;
     assign o_upsample_ic_groups = upsample_ic_groups;

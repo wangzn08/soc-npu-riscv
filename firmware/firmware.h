@@ -105,6 +105,7 @@ void usercode7(void);
 #define NPU_DFL_WLOAD         (NPU_BASE + 0x3E8)  // [19:16]idx [15:0]W_k(Q8.8 signed)
 #define NPU_DFL_ELOAD         (NPU_BASE + 0x3EC)  // [23:16]idx [15:0]exp(Q1.15)
 #define NPU_SIGM_LOAD         (NPU_BASE + 0x3F0)  // [15:8]idx [7:0]prob(Q0.8)
+#define NPU_SILU_LOAD         (NPU_BASE + 0x3F4)  // [15:8]idx [7:0]val; exact per-layer SiLU LUT
 
 // NPU_DMA_STATUS bits
 #define NPU_DMA_STATUS_RD_DONE     (1 << 0)
@@ -137,6 +138,7 @@ void usercode7(void);
 #define NPU_CTRL_SILU_REQUANT_EN (1 << 19) // optional SiLU Q4.4 -> output INT8 requant
 #define NPU_CTRL_ELT_SIGNED  (1 << 20) // signed INT8 + zero-point eltwise add (YOLO C2f residual)
 #define NPU_CTRL_SIGMOID_EN  (1 << 21) // post-process sigmoid LUT (vs SiLU); detect-head cls
+#define NPU_CTRL_SILU_EXACT_EN (1 << 22) // per-layer exact SiLU LUT (out-grid indexed; no +-8 clamp)
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)

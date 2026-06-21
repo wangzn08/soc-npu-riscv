@@ -185,6 +185,10 @@ module npu_top #(
     wire                            cfg_sigm_load_en;
     wire [7:0]                      cfg_sigm_load_idx;
     wire [7:0]                      cfg_sigm_load_val;
+    wire                            cfg_silu_exact_en;
+    wire                            cfg_silu_load_en;
+    wire [7:0]                      cfg_silu_load_idx;
+    wire [7:0]                      cfg_silu_load_val;
     wire                            dfl_done;
     wire                            dfl_busy;
     wire [SRAM_ADDR_W-1:0]          dfl_addr;
@@ -425,6 +429,10 @@ module npu_top #(
         .o_sigm_load_en    (cfg_sigm_load_en),
         .o_sigm_load_idx   (cfg_sigm_load_idx),
         .o_sigm_load_val   (cfg_sigm_load_val),
+        .o_silu_exact_en   (cfg_silu_exact_en),
+        .o_silu_load_en    (cfg_silu_load_en),
+        .o_silu_load_idx   (cfg_silu_load_idx),
+        .o_silu_load_val   (cfg_silu_load_val),
         .i_perf_busy       (fsm_busy),
         .i_perf_arr_active (fsm_array_vld),
         .i_perf_rd_beat    (perf_rd_beat),
@@ -1028,6 +1036,10 @@ module npu_top #(
         .i_sigm_load_en(cfg_sigm_load_en),
         .i_sigm_load_idx(cfg_sigm_load_idx),
         .i_sigm_load_val(cfg_sigm_load_val),
+        .i_silu_exact_en(cfg_silu_exact_en),
+        .i_silu_load_en(cfg_silu_load_en),
+        .i_silu_load_idx(cfg_silu_load_idx),
+        .i_silu_load_val(cfg_silu_load_val),
         .i_in_drain    (fsm_in_drain),
         .i_in_post     (fsm_in_post),
         .i_row_par_en  (cfg_row_par_en),
