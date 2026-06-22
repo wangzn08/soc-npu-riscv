@@ -186,6 +186,7 @@ module npu_top #(
     wire [7:0]                      cfg_sigm_load_idx;
     wire [7:0]                      cfg_sigm_load_val;
     wire                            cfg_silu_exact_en;
+    wire                            cfg_ic_stream;      // CTRL[23]: large-IC conv streaming
     wire                            cfg_silu_load_en;
     wire [7:0]                      cfg_silu_load_idx;
     wire [7:0]                      cfg_silu_load_val;
@@ -430,6 +431,7 @@ module npu_top #(
         .o_sigm_load_idx   (cfg_sigm_load_idx),
         .o_sigm_load_val   (cfg_sigm_load_val),
         .o_silu_exact_en   (cfg_silu_exact_en),
+        .o_ic_stream       (cfg_ic_stream),
         .o_silu_load_en    (cfg_silu_load_en),
         .o_silu_load_idx   (cfg_silu_load_idx),
         .o_silu_load_val   (cfg_silu_load_val),
@@ -660,6 +662,7 @@ module npu_top #(
         .i_gemm_reduce        (cfg_gemm_reduce),
         .i_row_block_en       (cfg_row_block_en),
         .i_oc_single          (cfg_oc_single),
+        .i_ic_stream          (cfg_ic_stream),
         .i_pw_en              (cfg_pw_en),
         .o_oc_tile_sel        (fsm_oc_tile_sel),
         .o_rows_per_grp       (fsm_rows_per_grp),

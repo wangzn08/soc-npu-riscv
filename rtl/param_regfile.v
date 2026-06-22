@@ -124,6 +124,7 @@ module param_regfile #(
     output wire [7:0]                   o_sigm_load_idx,
     output wire [7:0]                   o_sigm_load_val,
     output wire                         o_silu_exact_en, // CTRL[22]: per-layer exact SiLU LUT (out-grid indexed)
+    output wire                         o_ic_stream,     // CTRL[23]: large-IC conv streaming (IC-chunk loop + psum accumulate)
     output wire                         o_silu_load_en,  // 0x3F4 write: exact SiLU LUT load pulse
     output wire [7:0]                   o_silu_load_idx,
     output wire [7:0]                   o_silu_load_val,
@@ -325,6 +326,7 @@ module param_regfile #(
     reg        ctrl_sigmoid_en;
     reg        sigm_load_en_d; reg [7:0] sigm_load_idx; reg [7:0] sigm_load_val;
     reg        ctrl_silu_exact_en; // CTRL[22]: per-layer exact SiLU LUT
+    reg        ctrl_ic_stream;     // CTRL[23]: large-IC conv streaming (IC-chunk loop + psum accumulate)
     reg        silu_load_en_d; reg [7:0] silu_load_idx; reg [7:0] silu_load_val;
     reg        dma_sram_sel;   // 0=Act SRAM, 1=Wgt SRAM for DMA write target
     reg        dma_out_rd_sel; // 0=skip path owns Out SRAM Port B, 1=DMA owns it
@@ -393,6 +395,7 @@ module param_regfile #(
             ctrl_silu_en     <= 1'b0;   // SiLU LUT off by default; MNIST keeps legacy path
             ctrl_silu_requant_en <= 1'b0; // SiLU requant off by default
             ctrl_silu_exact_en <= 1'b0; // exact per-layer SiLU LUT off by default
+            ctrl_ic_stream <= 1'b0;     // large-IC conv streaming off by default
             silu_requant_mul <= 16'd0;
             silu_requant_shift <= 6'd0;
             silu_requant_zp <= 8'd0;
@@ -447,6 +450,7 @@ module param_regfile #(
             ctrl_sigmoid_en <= 1'b0;
             sigm_load_en_d <= 1'b0; sigm_load_idx <= 8'd0; sigm_load_val <= 8'd0;
             ctrl_silu_exact_en <= 1'b0;
+            ctrl_ic_stream <= 1'b0;
             silu_load_en_d <= 1'b0; silu_load_idx <= 8'd0; silu_load_val <= 8'd0;
             dma_sram_sel     <= 1'b0;
             dma_out_rd_sel   <= 1'b0;
@@ -508,6 +512,7 @@ module param_regfile #(
                         ctrl_elt_signed  <= s_axi_wdata[20];
                         ctrl_sigmoid_en  <= s_axi_wdata[21];
                         ctrl_silu_exact_en <= s_axi_wdata[22];
+                        ctrl_ic_stream   <= s_axi_wdata[23];
                     end
                     // STATUS is read-only (write ignored)
                     // 10'h04: (no action)
@@ -898,6 +903,7 @@ module param_regfile #(
     assign o_sigm_load_idx    = sigm_load_idx;
     assign o_sigm_load_val    = sigm_load_val;
     assign o_silu_exact_en    = ctrl_silu_exact_en;
+    assign o_ic_stream        = ctrl_ic_stream;
     assign o_silu_load_en     = silu_load_en_d;
     assign o_silu_load_idx    = silu_load_idx;
     assign o_silu_load_val    = silu_load_val;

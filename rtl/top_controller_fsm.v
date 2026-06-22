@@ -33,6 +33,7 @@ module top_controller_fsm #(
     input  wire                     i_gemm_reduce,  // GEMM 16-row IC-reduction (decision M)
     input  wire                     i_row_block_en, // #4: row-block packing for narrow layers
     input  wire                     i_oc_single,    // decision O: all OC-tiles in one start (OC-inner loop)
+    input  wire                     i_ic_stream,    // CTRL[23]: large-IC conv streaming (IC-chunk loop + psum accumulate)
     input  wire                     i_pw_en,        // 1x1 pointwise: bypass im2col, direct per-pixel feed
     input  wire [7:0]               i_pad_w,        // zero-pad columns each side
     input  wire [7:0]               i_pad_h,        // zero-pad rows each side

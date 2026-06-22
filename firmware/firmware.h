@@ -139,6 +139,7 @@ void usercode7(void);
 #define NPU_CTRL_ELT_SIGNED  (1 << 20) // signed INT8 + zero-point eltwise add (YOLO C2f residual)
 #define NPU_CTRL_SIGMOID_EN  (1 << 21) // post-process sigmoid LUT (vs SiLU); detect-head cls
 #define NPU_CTRL_SILU_EXACT_EN (1 << 22) // per-layer exact SiLU LUT (out-grid indexed; no +-8 clamp)
+#define NPU_CTRL_IC_STREAM   (1 << 23) // large-IC conv streaming (IC-chunk loop + INT32 psum accumulate)
 
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)
