@@ -324,9 +324,20 @@ conv6-12 weights; relocated all written buffers above the blob (0x40C0_0000+).
 The stem passed only because it reads conv0-5 weights (early in the blob). Also
 raised the TB cycle timeout 200M->700M for multi-block chains.
 
-NEXT: isolate the n=2 runner bug (dump c2f_4 intermediates: cv1 split, bottleneck
-0/1 adds, concat) vs c2f_2's working n=1 path. This is a datapath-assembly bug,
-SEPARATE from the (proven-correct) SiLU fix and detection result.
+NARROWED (static analysis): the general gen's c2f_2 constants are IDENTICAL to the
+known-good per-block c2f_2, and the exact-c2f4 bn[1] structural constants
+(GLUE1/ADD1/CAT_*_ADD1/MCV*_1_*) are IDENTICAL to the legacy c2f4 (which PASSES on
+RTL with the SAME runner). So: runner n=2 dataflow = OK (legacy n=2 works);
+exact-SiLU = OK for n=1 (c2f_2 exact works) and OC=32 (conv1 exact works); all
+c2f_4 constants/LUTs = correct. The bug is the INTERACTION of n=2 (half_groups=2)
++ exact-SiLU at runtime -- NOT data, NOT constants. c2f_4 is the first C2f with
+half_groups=2 in EXACT mode (c2f_2 has half_groups=1).
+
+NEXT: runtime intermediate dump -- run c2f_4 exact with int8 dumps of cv1_out,
+bn_out[0/1], mcv2[0/1], add[0/1], concat, and diff each against the python exact
+model to find the first diverging stage. Expensive (multi-minute sims each). This
+is a datapath-assembly bug, SEPARATE from the (proven-correct) SiLU fix and the
+4-correct-boxes detection result.
 
 ## Phase 4 (on-SoC full inference) status
 
