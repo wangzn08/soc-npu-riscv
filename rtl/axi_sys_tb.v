@@ -22,7 +22,7 @@ module axi_sys_tb;
 
     // 超时
     initial begin
-        repeat (200000000) @(posedge clk);
+        repeat (700000000) @(posedge clk);  // raised for multi-block YOLO chains
         $display("TIMEOUT");
         $finish;
     end

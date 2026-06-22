@@ -303,6 +303,31 @@ Next assembly steps:
    vs its dump320/conv<ci>.bin with a propagation-aware tol.
 3. Detection heads (exact-SiLU on conv36..62) + on-chip DFL/sigmoid/NMS decode.
 
+## Backbone extension WIP: c2f_4 (n=2 @320) RTL bug + chain hang (2026-06-21)
+
+Extended yolo_full_stem.c to conv0->conv1->c2f_2->conv6->c2f_4. Stages 0-3 PASS
+(stage prints confirm "[stage2 c2f_2 done]" "[stage3 conv6 done]"); c2f_4 fails.
+TWO distinct symptoms, both NEW (c2f_2 is n=1 and works; c2f_4 is the first n=2
+C2f run at 320):
+- STANDALONE (yolo_c2f4_320_exact_smoke.c, baked weights, dump6 input): COMPLETES
+  (61M cyc, no hang) but WRONG -- errors=64 at pos 0 (all OCs) vs the generator's
+  own exact-model golden. RTL != model for n=2, even though gen_yolo_c2f_exact.py
+  self-checks (max 80 vs dump). So the bug is in the runner's n=2 path or the
+  c2f_4-specific config (full_c=64, cv2_ic=128, 2 bottlenecks), not weight packing
+  (baked == blob packing verified).
+- IN CHAIN (blob weights): HANGS (TIMEOUT) instead of completing -- a separate
+  NPU/DMA wait that never returns, possibly downstream of the wrong-output state.
+
+ALSO fixed here: a DDR memory-map bug -- the chain's intermediate buffers
+overlapped the preloaded weight blob (0x4080_0000..0x40B0_1000), corrupting
+conv6-12 weights; relocated all written buffers above the blob (0x40C0_0000+).
+The stem passed only because it reads conv0-5 weights (early in the blob). Also
+raised the TB cycle timeout 200M->700M for multi-block chains.
+
+NEXT: isolate the n=2 runner bug (dump c2f_4 intermediates: cv1 split, bottleneck
+0/1 adds, concat) vs c2f_2's working n=1 path. This is a datapath-assembly bug,
+SEPARATE from the (proven-correct) SiLU fix and detection result.
+
 ## Phase 4 (on-SoC full inference) status
 
 Done: all per-op + tiled conv + DFL HW + sigmoid HW verified; C@320 golden above.
