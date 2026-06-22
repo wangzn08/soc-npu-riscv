@@ -222,6 +222,30 @@ exact-SiLU result (0 boxes on this image) -- so finishing the firmware assembly
 proves the DATAPATH but not detection accuracy. Detection accuracy is now a
 quantization/training problem, separable from the (working) SoC datapath.
 
+### RESOLVED (2026-06-21): the SiLU LUT was indexed wrong -- FIX gives 4 boxes
+
+The "0 boxes" was NOT inherent int8 drift and NOT a QAT problem -- it was a bug in
+the exact-SiLU LUT INDEX. The LUT was indexed by the OUTPUT grid
+(round(preact/out_scale)+out_zp). SiLU's input domain (preact, +-30..100) is
+totally different from its output domain (SiLU output >= -0.278); with out_zp~-120
+the output-grid index can only represent preact ~[-0.3,+10], so EVERY preact below
+-0.3 collapses to one clamped index -- the entire negative-preact region is lost,
+and that compounds.
+
+FIX: index the SiLU LUT by the PREACT scale (symmetric, zp=0): idx =
+clamp_int8(round(preact/silu_step)), LUT[i]=round(SiLU(i*silu_step)/out_scale +
+out_zp). C-oracle on bus320 (YOLO_SILU_PREACT): **4 persons at the golden
+positions** for silu_step in {0.5,0.25,0.125,0.0625} (vs float 0.829/0.829/0.755/
+0.337; preact-scale 0.755/0.755/0.711/0.337 -- boxes within a few px). silu_step=
+0.5 covers preact +-64 with the 256-entry int8 LUT.
+
+CRUCIALLY this needs NO RTL change: the CTRL[22] exact-SiLU path already computes
+out=LUT[clamp_int8(s2 + silu_requant_zp)]. The fix is generator-only: set the
+stage-2 scale to target silu_step (mul=round(in_scale*wscale/silu_step*2^Q)),
+silu_requant_zp=0, and build the LUT on the preact grid. So the SoC CAN run
+YOLOv8n with correct detections -- just regenerate the exact-SiLU qparams/LUTs.
+(The earlier "needs QAT" note above is SUPERSEDED by this.)
+
 ## yolo_full.c assembly (incremental, on-SoC chain)
 
 `firmware/yolo_full_stem.c` runs the FULL STEM as a real layer chain (not

@@ -84,11 +84,15 @@ static ConvW conv_w[YOLO_NUM_CONV];
 static int g_exact_silu = 0;   /* YOLO_EXACT_SILU=1 -> SoC's quantized-preact SiLU LUT path */
 static int g_exact_maxci = 64; /* apply exact-SiLU only to conv idx < this (YOLO_EXACT_MAXCI) */
 static int g_silu_interp = 0;  /* YOLO_SILU_INTERP=1 -> 2-point interpolated SiLU LUT */
+static int g_silu_preact = 0;  /* YOLO_SILU_PREACT -> SiLU on wide preact-scale grid */
+static float g_silu_step = 0.125f; /* YOLO_SILU_STEP: preact quantization step */
 
 void load_weights(const char *dir) {
     g_exact_silu = (getenv("YOLO_EXACT_SILU") != NULL);
     { const char *e = getenv("YOLO_EXACT_MAXCI"); if (e) g_exact_maxci = atoi(e); }
     g_silu_interp = (getenv("YOLO_SILU_INTERP") != NULL);
+    g_silu_preact = (getenv("YOLO_SILU_PREACT") != NULL);
+    { const char *e = getenv("YOLO_SILU_STEP"); if (e) g_silu_step = (float)atof(e); }
     (void)dir;  /* w_file/b_file/s_file already include "weights/" prefix */
     for (int i = 0; i < YOLO_NUM_CONV; i++) {
         const YoloConvCfg *c = &yolo_conv[i];
@@ -204,7 +208,16 @@ static Tensor conv_int8(int ci, const Tensor *in) {
                     if (preact < -7.9375f || preact > 7.9375f) ps_sat++;
                     ps_tot++;
                 }
-                if (cw->has_silu && g_exact_silu && ci < g_exact_maxci) {
+                if (cw->has_silu && g_silu_preact && ci < g_exact_maxci) {
+                    /* PROPER SiLU LUT: index by preact at a scale that spans the
+                     * PREACT range (not the output range), so negative preacts are
+                     * resolved. silu_in_scale = SILU_STEP; the SoC would carry this
+                     * per-layer + a wider/2-point LUT. */
+                    float step = g_silu_step;
+                    float qp = roundf(preact / step) * step;   /* quantized preact, wide range */
+                    float sl = qp / (1.0f + expf(-qp));
+                    out_ch[oh*OW+ow] = clamp_round_int8(sl / cw->out_scale + cw->out_zp);
+                } else if (cw->has_silu && g_exact_silu && ci < g_exact_maxci) {
                     /* SoC SiLU LUT path. g_silu_interp=0: nearest (out-grid index,
                      * the current SoC). =1: 2-point linear interpolation between
                      * adjacent LUT entries by the sub-grid fraction of preact -- a
