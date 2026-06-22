@@ -198,7 +198,14 @@ module top_controller_fsm #(
     localparam WGT_REUSE_SETTLE = 16'd2;  // im2col window settle when skipping prefetch
     // pointwise reuses weights across the spatial sweep (1x1 weights are position
     // independent), so it joins the per-OC-tile reuse path like conv ic_groups<=4.
-    wire reuse_mode = (!i_gemm_en && (ic_groups <= ICG_BUF)) || i_pw_en;
+    // BUT only when the whole OC tile's IC groups fit wgt_buf (ic_groups<=ICG_BUF).
+    // For ic_groups>ICG_BUF, PW falls back to per-IC-group weight streaming (the
+    // same non-reuse path conv uses): S_CALC_KERNEL already re-enters S_PREFETCH_WGT
+    // per IC tile for PW, so dropping reuse here makes each IC group re-prefetch a
+    // single group into wgt_buf[*][*][0] instead of overflowing the 4-deep buffer.
+    // (Caller must NOT set oc_single for streamed PW; oc_single forces pf_all in
+    // wgt_reader, which re-imposes full IC residency.)
+    wire reuse_mode = !i_gemm_en && (ic_groups <= ICG_BUF);
 
     // Input stride in 128-bit words per row
     wire [SRAM_ADDR_W-1:0] act_row_stride;
@@ -337,7 +344,7 @@ module top_controller_fsm #(
     assign o_im2col_win_advance = !i_gemm_en &&
                              (((state == S_LOAD_ROW) && (cur_in_col < i_dim_in_w)
                                      && !i_im2col_win_vld && (load_col_cnt > 16'd0)
-                                     && (load_tile == (ic_groups[3:0] - 4'd1)))
+                                     && ({12'd0, load_tile} == (ic_groups - 16'd1)))
                              || ((state == S_NEXT_TILE) && (ko_cnt == 4'd0))
                              || (state == S_WIN_STEP));
     assign o_im2col_offset_sel = ko_cnt;
@@ -464,7 +471,7 @@ module top_controller_fsm #(
                         // the last tile.  (ic_groups==1 ⇒ one read per column.)
                         if (load_col_cnt == 16'd0) begin
                             load_col_cnt <= 16'd1;
-                        end else if (load_tile >= ic_groups[3:0] - 4'd1) begin
+                        end else if ({12'd0, load_tile} >= ic_groups - 16'd1) begin
                             load_tile  <= 4'd0;
                             cur_in_col <= cur_in_col + 16'd1;
                         end else begin

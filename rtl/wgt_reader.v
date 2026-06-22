@@ -94,8 +94,8 @@ module wgt_reader #(
     reg [4:0] pf_oc;       // Current OC being pre-fetched (0..15)
     reg [3:0] pf_ko_d;     // Delayed ko (matches SRAM 1-cycle read latency)
     reg [4:0] pf_oc_d;     // Delayed oc
-    reg [3:0] pf_icg;      // Current IC group being pre-fetched (reuse mode)
-    reg [3:0] pf_icg_d;    // Delayed (matches SRAM 1-cycle latency)
+    reg [4:0] pf_icg;      // Current IC group being pre-fetched (reuse mode)
+    reg [4:0] pf_icg_d;    // Delayed (matches SRAM 1-cycle latency)
     reg [OC_TILES_W-1:0] pf_oct;    // Current OC-tile being pre-fetched (oc_single)
     reg [OC_TILES_W-1:0] pf_oct_d;  // Delayed (matches SRAM 1-cycle latency)
     reg       pf_done_r;
@@ -118,13 +118,13 @@ module wgt_reader #(
     wire [9:0] eff_oc_base = i_oc_single ? {{(6-OC_TILES_W){1'b0}}, pf_oct, 4'd0} : i_oc_base;
     assign addr_oc_component = {{(SRAM_ADDR_W-10){1'b0}}, eff_oc_base} * oc_stride;
     // Reuse / oc_single prefetch every ic_group (pf_icg); legacy uses single i_ic_group.
-    wire [9:0] eff_icg = pf_all ? {6'd0, pf_icg} : i_ic_group;
+    wire [9:0] eff_icg = pf_all ? {5'd0, pf_icg} : i_ic_group;
     assign addr_ic_component = {{(SRAM_ADDR_W-10){1'b0}}, eff_icg}
                              * {{(SRAM_ADDR_W-8){1'b0}}, i_kernel_offsets};
 
     // Global OC store / select index = oc_tile*16 + oc_in_tile (oc_single), else oc.
     wire [6:0] pf_oc_store_idx = i_oc_single ? {pf_oct_d, pf_oc_d[3:0]} : {3'b0, pf_oc_d[3:0]};
-    wire [3:0] pf_icg_store    = pf_all ? pf_icg_d : 4'd0;
+    wire [3:0] pf_icg_store    = pf_all ? pf_icg_d[3:0] : 4'd0;
 
     wire [SRAM_ADDR_W-1:0] sram_rd_addr;
     assign sram_rd_addr = i_wgt_base
@@ -219,8 +219,8 @@ module wgt_reader #(
             pf_oc        <= 5'd0;
             pf_ko_d      <= 4'd0;
             pf_oc_d      <= 5'd0;
-            pf_icg       <= 4'd0;
-            pf_icg_d     <= 4'd0;
+            pf_icg       <= 5'd0;
+            pf_icg_d     <= 5'd0;
             pf_oct       <= {OC_TILES_W{1'b0}};
             pf_oct_d     <= {OC_TILES_W{1'b0}};
             pf_done_r    <= 1'b0;
@@ -239,7 +239,7 @@ module wgt_reader #(
                         pf_state <= PF_READING;
                         pf_ko    <= 4'd0;
                         pf_oc    <= 5'd0;
-                        pf_icg   <= 4'd0;
+                        pf_icg   <= 5'd0;
                         pf_oct   <= {OC_TILES_W{1'b0}};
                     end
                     pf_done_r <= 1'b0;
@@ -255,7 +255,7 @@ module wgt_reader #(
                     // Done after last OC of last offset; reuse/oc_single also after the
                     // last IC group; oc_single also after the last OC tile.
                     if (pf_oc == 5'd15 && pf_ko == (i_kernel_offsets[3:0] - 4'd1) &&
-                        (!pf_all || pf_icg == (i_ic_groups_total[3:0] - 4'd1)) &&
+                        (!pf_all || pf_icg == (i_ic_groups_total[4:0] - 5'd1)) &&
                         (!i_oc_single || pf_oct == (i_oc_tiles_total - {{(OC_TILES_W-1){1'b0}},1'b1}))) begin
                         pf_state <= PF_WAIT_LAST;
                     end else begin
@@ -264,11 +264,11 @@ module wgt_reader #(
                             pf_oc <= 5'd0;
                             if (pf_ko == (i_kernel_offsets[3:0] - 4'd1)) begin
                                 pf_ko  <= 4'd0;
-                                if (!pf_all || pf_icg == (i_ic_groups_total[3:0] - 4'd1)) begin
-                                    pf_icg <= 4'd0;
+                                if (!pf_all || pf_icg == (i_ic_groups_total[4:0] - 5'd1)) begin
+                                    pf_icg <= 5'd0;
                                     pf_oct <= pf_oct + {{(OC_TILES_W-1){1'b0}},1'b1}; // only in oc_single
                                 end else begin
-                                    pf_icg <= pf_icg + 4'd1;   // advances when pf_all
+                                    pf_icg <= pf_icg + 5'd1;   // advances when pf_all
                                 end
                             end else begin
                                 pf_ko <= pf_ko + 4'd1;
@@ -293,7 +293,7 @@ module wgt_reader #(
                         pf_state <= PF_READING;
                         pf_ko    <= 4'd0;
                         pf_oc    <= 5'd0;
-                        pf_icg   <= 4'd0;
+                        pf_icg   <= 5'd0;
                         pf_oct   <= {OC_TILES_W{1'b0}};
                     end else begin
                         pf_state <= PF_IDLE;
