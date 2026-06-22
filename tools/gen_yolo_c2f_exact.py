@@ -138,6 +138,23 @@ def main():
     df = np.abs(golden.astype(int) - cflat.astype(int))
     print(f"{blk} exact vs dump{cv2}: mism={int((df>0).sum())}/{golden.size} max={int(df.max())}")
 
+    # ---- per-stage checksums (logical [channel][pos], matches firmware tile-major
+    # read: word=tile*SP+pos, lane=ch&15, channel=tile*16+lane). Pure unsigned-byte
+    # arithmetic so C (uint32 wrap) and python agree bit-for-bit. ----
+    def cksum(log):  # log shape (C, SP) int8
+        C = log.shape[0]
+        ub = (log.astype(np.int64) & 0xFF)
+        ch = np.arange(C)[:, None]; ps = np.arange(SP)[None, :]
+        wt = (ch * 131 + ps * 7 + 1)
+        return int(ub.sum() & 0xFFFFFFFF), int((ub * wt).sum() & 0xFFFFFFFF)
+    cks = []
+    cks.append(("CV1", cksum(cv1c.reshape(full_c, SP))))
+    for bi, (add, _gs, _gz) in enumerate(adds):
+        cks.append((f"ADD{bi}", cksum(add.T)))
+    cks.append(("CONCAT", cksum(concat.T)))
+    cks.append(("OUT", cksum(golden.T)))
+    print(f"{blk} stage checksums: " + " ".join(f"{n}=({s},{h})" for n, (s, h) in cks))
+
     # ---- emit ----
     def pack1(w): return [pack_i8_word(w[o, g*16:g*16+16, 0, 0]) for o in range(w.shape[0]) for g in range(w.shape[1]//16)]
     def pack3(w): return [pack_i8_word(w[o, g*16:g*16+16, k//3, k%3]) for o in range(w.shape[0]) for g in range(w.shape[1]//16) for k in range(9)]
@@ -182,6 +199,10 @@ def main():
           u32a(f"yolo_{blk}_cv2_wgt", pack1(w2)), i32(f"yolo_{blk}_cv2_bias", b2),
           u32(f"yolo_{blk}_cv2_mul", m2), u32(f"yolo_{blk}_cv2_shift", [Q_SHIFT]*len(m2)),
           u8(f"yolo_{blk}_cv2_lut", build_lut(c2o_s, c2o_z)), f"#define {P}_CV2_RQ_ZP {c2o_z}", ""]
+    # per-stage checksums (for the intermediate-dump debug harness)
+    for nm, (sv, hv) in cks:
+        L += [f"#define {P}_CK_{nm}_SUM {sv}u", f"#define {P}_CK_{nm}_HASH {hv}u"]
+    L += [""]
     # golden
     L += [f"static const uint8_t yolo_{blk}_golden[{SP}][{CONVS[cv2]['oc']}] = {{"]
     L += ["    {"+", ".join(f"0x{int(x)&0xFF:02X}u" for x in golden[p])+"}," for p in range(SP)]

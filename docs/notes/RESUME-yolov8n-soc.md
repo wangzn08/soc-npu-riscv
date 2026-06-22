@@ -5,31 +5,56 @@ Read also: `CLAUDE.md`, `docs/notes/yolov8n-320-golden.md` (full detail/history)
 memory `soc-silu-lut-range-gap.md`.
 
 ## ONE-LINE STATUS
-Core accuracy bottleneck SOLVED + proven (preact-scale SiLU -> 4 correct boxes in
-C oracle, no RTL change). All infra + tooling done. Full STEM (conv0->conv1->c2f_2)
-runs end-to-end on SoC. **Blocked at backbone extension by a c2f_4 (n=2 + exact-SiLU)
-runtime bug.** MNIST baseline 10/10 / 941,155 cyc unchanged throughout.
+Core accuracy bottleneck SOLVED (preact-scale SiLU -> 4 boxes, C oracle). **c2f_4
+SOLVED (2026-06-22): root cause was PW 1x1 weight-buffer overflow, NOT the doc's old
+"half_groups=2 + exact-SiLU" guess.** Fixed via PW per-IC-group weight streaming
+(icg>ICG_BUF). c2f_4 exact maxdiff=0, c2f_6 PASS, MNIST 10/10 941,155 cyc unchanged.
+**Now blocked at c2f_8 by a SEPARATE pre-existing bug: 3x3 conv non-reuse (icg>4).**
 
-## THE BREAKPOINT (start here)
-`firmware/yolo_full_stem.c` chains conv0->conv1->c2f_2->conv6->c2f_4. Stages 0-3
-PASS (prints "[stage2 c2f_2 done]" "[stage3 conv6 done]"); **c2f_4 fails**.
-- Standalone `yolo_c2f4_320_exact_smoke.c` (baked weights, dump6 input): COMPLETES
-  (61M cyc) but WRONG (errors=64 at pos 0, all OCs) vs its own python golden.
-- In the chain (blob weights): HANGS (TIMEOUT).
-Statically NARROWED: general-gen c2f_2 constants == known-good; exact-c2f4 bn[1]
-constants == legacy c2f4 (passes on RTL, same runner). runner n=2 dataflow OK,
-exact-SiLU OK for n=1 + OC=32 (conv1). Bug = **half_groups=2 + exact-SiLU runtime
-interaction** (c2f_4 is the first exact C2f with half_groups=2; c2f_2 has 1).
+## c2f_4 RESOLUTION (done — for history)
+stage-checksum (generator bakes per-stage golden; smoke compares each DDR buffer)
+proved CV1/ADD0/ADD1/CONCAT bit-exact; bug isolated to **cv2 (1x1, IC=128, icg=8)**.
+Root cause: `top_controller_fsm.v:201` forced `reuse_mode=1` for PW unconditionally
+(`|| i_pw_en`), and `wgt_reader.v:104 pf_all = prefetch_all || oc_single`, so cv2
+tried to hold 8 IC groups in the 4-deep `wgt_buf` (ICG_BUF=4) -> groups 4-7 alias.
+Unrelated to exact-SiLU (exact just removed the saturation that masked it).
+Fix (user chose "PW weight streaming", no buffer growth):
+- RTL: `wire reuse_mode = !i_gemm_en && (ic_groups <= ICG_BUF);` (drop `|| i_pw_en`).
+  S_CALC_KERNEL already re-enters S_PREFETCH_WGT per IC tile for PW, so non-reuse
+  streams one IC group at a time into `wgt_buf[*][*][0]`. No-op for MNIST (pw_en=0).
+- FW (`yolo_run_conv2d_tiled`): 1x1 with `icg > YOLO_ICG_BUF(4)` tiles OC into <=16
+  WITHOUT oc_single (oc_single forces pf_all=full-IC residency). IC<=4 keeps the
+  fast resident oc_single path. Weight layout `[oc][icg][ko]` already matches.
+Verified: c2f4 exact maxdiff=0; c2f6 legacy PASS (cv2 icg16); c2f8 cv1 icg16 OK;
+MNIST 10/10 941,155 cyc. PW streaming covers icg<=16 (likely 24, not yet reached).
 
-### NEXT ACTION (resume here)
-Runtime intermediate dump of c2f_4 exact: in a copy of yolo_c2f4_320_exact_smoke.c,
-after the run, read+checksum (or per-pos compare) each stage buffer (CV1_OUT split
-s0/s1, BN_OUT, MCV2_DDR, ADD0_DDR, ADD1_DDR, CONCAT_DDR) and diff vs a python dump
-from gen_yolo_c2f_exact.py (add intermediate prints to compute_* there). Find the
-FIRST stage that diverges. Suspects given the narrowing: the CPU residual-add /
-concat with half_groups=2 reading EXACT-mode int8 (zp handling), or an OC-tile
-interaction in the bottleneck 3x3 (OC=32) under exact. Build/run:
-`bash run_all.sh sim yolo_c2f4_320_exact_smoke.c yolo_c2f.c yolo_ops.c` (no marker).
+## THE BREAKPOINT (start here) — 3x3 conv large IC (im2col ICG_MAX=4)
+`yolo_c2f8_320_exact_smoke.c` (stage-checksum, baked, n=1, ~27s sim): **CV1 OK** (cv1
+icg16 PW streaming correct), **ADD0 MISMATCH = all 0x80 (-128, saturated)**. ADD0 =
+residual_add(s1, mcv2), so the bottleneck **3x3 conv (m_cv1/m_cv2, half=128 => icg=8)**
+output is garbage. ROOT CAUSE: **`rtl/im2col_line_buffer.v:29 parameter ICG_MAX = 4`**
+— the im2col line buffer / window holds only 4 IC tiles (64 ch). A 3x3 conv with
+icg>4 reads garbage for IC tiles 4+. PROOF it's the im2col, not weights: forcing the
+3x3 onto the PW-style weight-streaming path (no oc_single) changed the cycle count
+(27.2M->23.4M) but produced **byte-identical wrong output** — i.e. both the resident
+and streamed weight paths fail identically, so the activation window (ICG_MAX), not
+wgt_buf, is the limit. Also `i_ic_groups` is [3:0] (caps at ~16). This is a THIRD,
+separate capacity limit (after wgt_buf ICG_BUF, fixed for PW). c2f_8 bottleneck is the
+FIRST ever icg>4 3x3 conv (MNIST/conv0-1/c2f2-6 bottlenecks all icg<=4). NOT a
+regression. Firmware IC-tiling can't fix 3x3 (int32_out is FC-single-position only).
+
+### NEXT ACTION (resume here) — needs a DECISION
+Two RTL options for 3x3 large-IC (icg>4); pick one:
+1. Bump `ICG_MAX` in im2col_line_buffer.v (+widen `i_ic_groups` past [3:0]); also the
+   3x3 conv then hits the SAME wgt_buf overflow cv2 had, so re-add the 3x3 arm of the
+   conv2d_tiled streaming (was prototyped then reverted: stream when icg>ICG_BUF, tile
+   OC<=16, drop oc_single + mask row_par). Covers icg up to the new ICG_MAX (<=16 unless
+   counters widened); BRAM cost grows (lb_bank0-3 = 4 x MAX_WIDTH x ICG_MAX x 128b).
+2. im2col IC-streaming: process IC tiles in chunks of <=ICG_MAX, re-load rows per chunk,
+   accumulate in the array across chunks (FSM change, general, no BRAM blowup).
+Affected layers: c2f8 bottleneck (icg8), downsample conv13/conv20 (icg8/16), SPPF, many
+head 3x3. Build/run the isolation smoke (no marker, ~27s):
+`bash run_all.sh sim yolo_c2f8_320_exact_smoke.c yolo_c2f.c yolo_ops.c`.
 
 ## HOW TO BUILD / RUN (Git Bash from repo root)
 - MNIST regression (must stay 10/10): `bash run_all.sh sim`

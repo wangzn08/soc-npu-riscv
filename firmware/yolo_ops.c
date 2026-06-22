@@ -5,6 +5,12 @@
 #include "firmware.h"
 #include "yolo_ops.h"
 
+/* Mirror of the RTL wgt_reader/FSM ICG_BUF (weight-reuse buffer depth in IC
+ * groups). 1x1 PW with ic_groups>ICG_BUF can't hold all IC groups resident and
+ * must stream weights per IC group (non-oc_single OC-16 tiling). Keep in sync
+ * with rtl/wgt_reader.v and rtl/top_controller_fsm.v. */
+#define YOLO_ICG_BUF 4u
+
 #define YOLO_DMA_TIMEOUT 4000000u
 #define YOLO_NPU_TIMEOUT 60000000u   /* big 320 layers (ic128/oc256, no row_par) run many M cycles */
 #define YOLO_DMA_MAX_BEATS 256u
@@ -475,25 +481,38 @@ int yolo_run_conv2d_tiled(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_ba
             }
         }
 
-        /* OC>64 chunks: weights reloaded per chunk; conv runs pad_h=0, pad_w=pad (HW). */
+        /* OC>64 chunks: weights reloaded per chunk; conv runs pad_h=0, pad_w=pad (HW).
+         * Large-IC 1x1 (ic_groups>ICG_BUF) can't hold all IC groups resident, so it
+         * uses per-IC-group weight streaming (reuse_mode=0 in the FSM). That path is
+         * incompatible with oc_single (oc_single forces full IC residency via pf_all
+         * in wgt_reader), so streamed PW tiles OC into <=16 (one OC tile per start,
+         * no oc_single). IC<=ICG_BUF keeps the fast resident oc_single path.
+         * NOTE: 3x3 convs with ic_groups>ICG_BUF are NOT yet supported -- the im2col
+         * line buffer (ICG_MAX=4) holds only 4 IC tiles, so the activation window,
+         * not the weight buffer, is the limit there (see RESUME doc). Only 1x1 PW
+         * (no im2col) streams large IC today. */
         done = 0u;
         while (done < out_c) {
             uint32_t chunk = out_c - done;
             uint32_t sg;
-            if (chunk > 64u)
-                chunk = 64u;
+            uint32_t is_pw      = (kernel_h == 1u && kernel_w == 1u);
+            uint32_t pw_stream  = is_pw && (icg > YOLO_ICG_BUF);
+            uint32_t chunk_cap  = pw_stream ? 16u : 64u;
+            if (chunk > chunk_cap)
+                chunk = chunk_cap;
             if (!yolo_dma_ddr_to_wgt(wgt_all_ddr + done * wgt_words_per_oc * 16u,
                                      wgt_base, chunk * wgt_words_per_oc))
                 return 0;
-            if (kernel_h == 1u && kernel_w == 1u) {
+            if (is_pw) {
                 /* 1x1 pointwise: no halo (strip_in_h==so), no pad; PW engine.
-                 * PW path is not row_par-aware, so mask it off. */
+                 * PW path is not row_par-aware, so mask it off. oc_single only for
+                 * the resident (small-IC) path; streamed PW runs one 16-OC tile. */
+                uint32_t pwf = ctrl_flags & ~NPU_CTRL_ROW_PAR;
+                if (!pw_stream) pwf |= NPU_CTRL_OC_SINGLE;
                 if (!yolo_run_pw_conv1x1_qparams(0u, wgt_base, 0u,
                                                  in_w, strip_in_h, in_c, chunk,
                                                  bias + done, scale_mul + done,
-                                                 scale_shift + done,
-                                                 (ctrl_flags & ~NPU_CTRL_ROW_PAR) |
-                                                 NPU_CTRL_OC_SINGLE))
+                                                 scale_shift + done, pwf))
                     return 0;
             } else if (!yolo_run_conv2d_qparams_pads(0u, wgt_base, 0u,
                                               in_w, strip_in_h, in_c, chunk,
