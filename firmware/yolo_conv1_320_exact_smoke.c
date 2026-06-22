@@ -34,7 +34,7 @@ void usercode7(void)
 
     yolo_set_pad_value(C1E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv1_320e_silu_lut);
-    yolo_set_silu_requant(0u, 0u, C1E_OUT_ZP);   /* exact: only the out zp matters */
+    yolo_set_silu_requant(0u, 0u, 0);   /* preact-scale SiLU: index zp=0 (out zp is baked into the LUT) */
 
     *(volatile uint32_t *)NPU_PERF_CLR = 1u;
 

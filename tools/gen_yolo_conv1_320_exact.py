@@ -19,6 +19,7 @@ KH = KW = 3
 STRIDE, PAD = 2, 1
 Q_SHIFT = 20
 RTL_TOL = 16
+SILU_STEP = 0.5   # SiLU LUT indexed by PREACT at this step (covers +-64), zp=0
 
 
 def s8(b): b &= 0xFF; return b - 256 if b & 0x80 else b
@@ -38,10 +39,12 @@ def read_dump(name):
 
 
 def build_silu_lut(out_scale, out_zp):
+    # PREACT-scale index (zp=0): entry i (signed) is preact = i*SILU_STEP; the LUT
+    # maps it to the output int8 grid (out_scale, out_zp).
     lut = np.zeros(256, dtype=np.uint8)
     for i in range(256):
         q = i if i < 128 else i - 256
-        realq = (q - out_zp) * out_scale
+        realq = q * SILU_STEP
         silu = realq / (1.0 + math.exp(-realq))
         lut[i] = clamp_s8(int(round(silu / out_scale + out_zp)))
     return lut
@@ -65,7 +68,7 @@ def main():
     # exact out-grid qparams: s2 == round(preact/out_scale)
     bias_q, mul = [], []
     for oc in range(OC):
-        m = int(round(in_scale * float(sc[oc]) / out_scale * (1 << Q_SHIFT)))
+        m = int(round(in_scale * float(sc[oc]) / SILU_STEP * (1 << Q_SHIFT)))
         mul.append(m)
         be = int(round(float(b[oc]) / (in_scale * float(sc[oc]))))
         bias_q.append(int(be - in_zp * int(wsum[oc])))
@@ -81,7 +84,7 @@ def main():
             for oc in range(OC):
                 acc = int(np.sum(win * w[oc].astype(np.int32)))
                 s2 = ((acc + bias_q[oc]) * mul[oc]) >> Q_SHIFT
-                idx = clamp_s8(s2 + out_zp)
+                idx = clamp_s8(s2)   # preact-grid index, zp=0
                 golden[oy*OUT_W+ox, oc] = np.int8(s8(int(lut[idx])))
 
     # self-check vs the C float dump (conv1.bin)
