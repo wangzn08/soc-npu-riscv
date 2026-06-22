@@ -3,6 +3,14 @@
 
 #include <stdint.h>
 
+/* Mirror of the RTL wgt_reader/im2col ICG capacity (IC groups held resident: the
+ * weight-reuse buffer depth AND the im2col line-buffer depth). A conv with
+ * ic_groups>YOLO_ICG_BUF must stream IC: 1x1 PW streams weights per IC group
+ * (yolo_run_conv2d_tiled), 3x3 streams via INT32 psum accumulate
+ * (yolo_run_conv2d_ic_stream). Keep in sync with rtl/wgt_reader.v ICG_BUF and
+ * rtl/im2col_line_buffer.v ICG_MAX. */
+#define YOLO_ICG_BUF 4u
+
 int yolo_dma_ddr_to_act(uint32_t ddr_addr, uint32_t act_base, uint32_t words);
 int yolo_dma_ddr_to_wgt(uint32_t ddr_addr, uint32_t wgt_base, uint32_t words);
 int yolo_dma_act_to_ddr(uint32_t ddr_addr, uint32_t act_base, uint32_t words);
@@ -77,6 +85,17 @@ int yolo_run_conv2d_tiled(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_ba
                           const uint32_t *scale_shift, uint32_t ctrl_flags,
                           uint32_t wgt_words_per_oc, uint32_t strip_out_rows,
                           int32_t pad_value);
+
+/* Large-IC im2col conv (ic_groups>ICG_MAX): IC-chunk streaming + INT32 psum
+ * accumulate on the CPU, then exact-SiLU LUT -> INT8. stride==1, whole output in
+ * one pass. psum_ddr needs (out_c/16)*out_w*out_h*4*2 128-bit words. */
+int yolo_run_conv2d_ic_stream(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_base,
+                              uint32_t out_ddr, uint32_t psum_ddr, uint32_t pad_row_ddr,
+                              uint32_t in_w, uint32_t in_h, uint32_t in_c, uint32_t out_c,
+                              uint32_t kernel_h, uint32_t kernel_w, uint32_t pad,
+                              const int32_t *bias, const uint32_t *scale_mul,
+                              const uint32_t *scale_shift, const uint8_t *silu_lut,
+                              int32_t pad_value);
 
 int yolo_run_conv2d_qparams(uint32_t act_base,
                             uint32_t wgt_base,

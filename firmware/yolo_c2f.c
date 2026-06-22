@@ -120,36 +120,60 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
         else
             prev_ddr = cfg->add_ddr[i-1u];
 
+        // Large-IC 3x3 (exact mode, half_c/16 > ICG_BUF) can't fit the im2col
+        // window: stream IC via INT32 psum accumulate (CPU final SiLU). Otherwise
+        // the resident tiled path.
+        uint32_t bn_stream = cfg->silu_exact &&
+                             (((cfg->full_c/2u) / 16u) > YOLO_ICG_BUF);
+
         // m_cv1 (3x3) -> bn_out (tiled DDR->DDR; half_c may be >64)
         yolo_set_pad_value(cfg->mcv1_pad_value[i]);
         {
             uint32_t wd = wgt_src(cfg, cfg->mcv1_wgt_ddr[i], cfg->mcv1_wgt[i], cfg->mcv1_wgt_words);
-            uint32_t f = silu_setup(cfg, cfg->mcv1_silu_lut[i], cfg->mcv1_rq_mul[i],
-                                    cfg->mcv1_rq_shift[i], cfg->mcv1_rq_zp[i]);
-            if (!yolo_run_conv2d_tiled(prev_ddr, wd, WGT_BASE, cfg->bn_out_ddr,
-                                       cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
-                                       cfg->full_c/2u, cfg->full_c/2u,
-                                       3u, 3u, 1u, 1u,
+            if (bn_stream) {
+                if (!yolo_run_conv2d_ic_stream(prev_ddr, wd, WGT_BASE, cfg->bn_out_ddr,
+                                       cfg->psum_ddr, cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                                       cfg->full_c/2u, cfg->full_c/2u, 3u, 3u, 1u,
                                        cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
-                                       f, cfg->mcv1_wgt_words / (cfg->full_c/2u), strip,
-                                       cfg->mcv1_pad_value[i]))
-                return 0;
+                                       cfg->mcv1_silu_lut[i], cfg->mcv1_pad_value[i]))
+                    return 0;
+            } else {
+                uint32_t f = silu_setup(cfg, cfg->mcv1_silu_lut[i], cfg->mcv1_rq_mul[i],
+                                        cfg->mcv1_rq_shift[i], cfg->mcv1_rq_zp[i]);
+                if (!yolo_run_conv2d_tiled(prev_ddr, wd, WGT_BASE, cfg->bn_out_ddr,
+                                           cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                                           cfg->full_c/2u, cfg->full_c/2u,
+                                           3u, 3u, 1u, 1u,
+                                           cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
+                                           f, cfg->mcv1_wgt_words / (cfg->full_c/2u), strip,
+                                           cfg->mcv1_pad_value[i]))
+                    return 0;
+            }
         }
 
         // m_cv2 (3x3) requant to glue[i] -> mcv2_ddr (tiled DDR->DDR)
         yolo_set_pad_value(cfg->mcv2_pad_value[i]);
         {
             uint32_t wd = wgt_src(cfg, cfg->mcv2_wgt_ddr[i], cfg->mcv2_wgt[i], cfg->mcv2_wgt_words);
-            uint32_t f = silu_setup(cfg, cfg->mcv2_silu_lut[i], cfg->glue_rq_mul[i],
-                                    cfg->glue_rq_shift[i], cfg->glue_zp[i]);
-            if (!yolo_run_conv2d_tiled(cfg->bn_out_ddr, wd, WGT_BASE, cfg->mcv2_ddr,
-                                       cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
-                                       cfg->full_c/2u, cfg->full_c/2u,
-                                       3u, 3u, 1u, 1u,
+            if (bn_stream) {
+                if (!yolo_run_conv2d_ic_stream(cfg->bn_out_ddr, wd, WGT_BASE, cfg->mcv2_ddr,
+                                       cfg->psum_ddr, cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                                       cfg->full_c/2u, cfg->full_c/2u, 3u, 3u, 1u,
                                        cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
-                                       f, cfg->mcv2_wgt_words / (cfg->full_c/2u), strip,
-                                       cfg->mcv2_pad_value[i]))
-                return 0;
+                                       cfg->mcv2_silu_lut[i], cfg->mcv2_pad_value[i]))
+                    return 0;
+            } else {
+                uint32_t f = silu_setup(cfg, cfg->mcv2_silu_lut[i], cfg->glue_rq_mul[i],
+                                        cfg->glue_rq_shift[i], cfg->glue_zp[i]);
+                if (!yolo_run_conv2d_tiled(cfg->bn_out_ddr, wd, WGT_BASE, cfg->mcv2_ddr,
+                                           cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                                           cfg->full_c/2u, cfg->full_c/2u,
+                                           3u, 3u, 1u, 1u,
+                                           cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
+                                           f, cfg->mcv2_wgt_words / (cfg->full_c/2u), strip,
+                                           cfg->mcv2_pad_value[i]))
+                    return 0;
+            }
         }
 
         // residual add (CPU) -> add_ddr[i]; or pass-through when !shortcut.

@@ -31,6 +31,9 @@ typedef struct {
     uint32_t concat_ddr, out_ddr, wgt_ddr;
     uint32_t pad_row_ddr;           // one-row scratch for tiled vertical padding
     uint32_t strip;                 // tiled output-row strip height (0 => default 16)
+    uint32_t psum_ddr;              // INT32 psum scratch for large-IC 3x3 streaming
+                                    // (exact mode, half_c/16 > YOLO_ICG_BUF); needs
+                                    // (half_c/16)*in_w*in_h*4*2 128-bit words
 
     // ----- exact per-layer SiLU LUT (0 = legacy Q4.4 SiLU + requant) -----
     // When silu_exact != 0, each conv loads its 256-entry out-grid SiLU LUT,

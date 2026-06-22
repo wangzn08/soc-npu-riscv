@@ -18,6 +18,7 @@
 #define CONCAT_DDR 0x40200000u
 #define OUT_DDR    0x40280000u
 #define WGT_DDR    0x402C0000u
+#define PSUM_DDR   0x40300000u   /* INT32 psum scratch for large-IC 3x3 streaming */
 
 static void wrw(uint32_t a, uint32_t w, const uint32_t l[4])
 { volatile uint32_t *p=(volatile uint32_t*)(a+w*16u); p[0]=l[0];p[1]=l[1];p[2]=l[2];p[3]=l[3]; }
@@ -56,6 +57,7 @@ void usercode7(void)
     cfg.bn_out_ddr=BN_OUT; cfg.mcv2_ddr=MCV2_DDR; cfg.add_ddr[0]=ADD0_DDR; cfg.add_ddr[1]=ADD1_DDR;
     cfg.concat_ddr=CONCAT_DDR; cfg.out_ddr=OUT_DDR; cfg.wgt_ddr=WGT_DDR;
     cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=1u; cfg.wgt_in_blob=0u;
+    cfg.psum_ddr=PSUM_DDR;
     cfg.cv1_wgt=yolo_c2f8_cv1_wgt; cfg.cv1_wgt_words=YOLO_C2F8_CV1_WGT_WORDS;
     cfg.cv1_bias=yolo_c2f8_cv1_bias; cfg.cv1_mul=yolo_c2f8_cv1_mul; cfg.cv1_shift=yolo_c2f8_cv1_shift;
     cfg.cv1_silu_lut=yolo_c2f8_cv1_lut; cfg.cv1_rq_zp=YOLO_C2F8_CV1_RQ_ZP;

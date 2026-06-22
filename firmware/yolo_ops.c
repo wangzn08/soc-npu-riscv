@@ -5,11 +5,9 @@
 #include "firmware.h"
 #include "yolo_ops.h"
 
-/* Mirror of the RTL wgt_reader/FSM ICG_BUF (weight-reuse buffer depth in IC
- * groups). 1x1 PW with ic_groups>ICG_BUF can't hold all IC groups resident and
- * must stream weights per IC group (non-oc_single OC-16 tiling). Keep in sync
- * with rtl/wgt_reader.v and rtl/top_controller_fsm.v. */
-#define YOLO_ICG_BUF 4u
+/* YOLO_ICG_BUF is defined in yolo_ops.h (mirrors RTL wgt_reader ICG_BUF /
+ * im2col ICG_MAX). 1x1 PW with ic_groups>ICG_BUF streams weights per IC group
+ * (non-oc_single OC-16 tiling); 3x3 streams via yolo_run_conv2d_ic_stream. */
 
 #define YOLO_DMA_TIMEOUT 4000000u
 #define YOLO_NPU_TIMEOUT 60000000u   /* big 320 layers (ic128/oc256, no row_par) run many M cycles */
@@ -531,6 +529,134 @@ int yolo_run_conv2d_tiled(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_ba
                     return 0;
             }
             done += chunk;
+        }
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------------
+ * Large-IC im2col conv via IC-chunk streaming + INT32 psum accumulate.
+ * The im2col line buffer holds only ICG_MAX IC tiles, so a 3x3 conv with
+ * ic_groups>ICG_MAX must process IC in chunks of <=ICG_MAX tiles. Each chunk is
+ * a normal serial conv emitting RAW INT32 psum (bias=0, mul=1, shift=0, with
+ * int32_out + ic_stream so each output position owns 4 x4-spaced Out-SRAM words);
+ * the chunk is drained to DDR. The CPU sums the chunks' INT32 partials, then
+ * applies (acc+bias)*mul>>shift + the exact-SiLU LUT -> INT8 (bit-identical to the
+ * HW exact post-process). Whole output computed in one pass (no row strip), which
+ * is valid for the small-spatial deep layers that need large-IC 3x3 (c2f8/conv20/
+ * SPPF-area). stride==1 only. psum_ddr scratch must hold
+ * (out_c/16)*out_spatial*4 *2 words (accumulator + per-chunk temp). */
+static const int32_t  YOLO_ZERO_BIAS[16]  = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+static const uint32_t YOLO_UNIT_MUL[16]   = {1u,1u,1u,1u,1u,1u,1u,1u,1u,1u,1u,1u,1u,1u,1u,1u};
+static const uint32_t YOLO_ZERO_SHIFT[16] = {0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u};
+
+int yolo_run_conv2d_ic_stream(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_base,
+                              uint32_t out_ddr, uint32_t psum_ddr, uint32_t pad_row_ddr,
+                              uint32_t in_w, uint32_t in_h, uint32_t in_c, uint32_t out_c,
+                              uint32_t kernel_h, uint32_t kernel_w, uint32_t pad,
+                              const int32_t *bias, const uint32_t *scale_mul,
+                              const uint32_t *scale_shift, const uint8_t *silu_lut,
+                              int32_t pad_value)
+{
+    uint32_t icg = in_c / 16u;
+    uint32_t ko  = kernel_h * kernel_w;
+    uint32_t wpoc_full = icg * ko;          /* weight words per OC, full IC */
+    uint32_t out_w, out_h, out_sp, ocg_total;
+    uint32_t nchunks, c, oc_done, ocg, p, l, g, ri;
+    uint32_t acc_words, acc_i32, temp_ddr;
+
+    if (icg == 0u || in_w == 0u || in_h == 0u || out_c == 0u || (out_c & 15u) != 0u ||
+        kernel_h == 0u || kernel_w == 0u)
+        return 0;
+
+    out_w = in_w + 2u * pad - kernel_w + 1u;
+    out_h = in_h + 2u * pad - kernel_h + 1u;
+    out_sp = out_w * out_h;
+    ocg_total = out_c / 16u;
+    nchunks = (icg + YOLO_ICG_BUF - 1u) / YOLO_ICG_BUF;
+    acc_words = ocg_total * out_sp * 4u;     /* 128-bit words for the INT32 accumulator */
+    acc_i32 = acc_words * 4u;                 /* int32 count */
+    temp_ddr = psum_ddr + acc_words * 16u;    /* per-chunk temp region */
+
+    /* Materialize one pad row in DDR (HW handles horizontal pad; vertical via rows). */
+    {
+        uint32_t lane = (uint32_t)pad_value & 0xFFu;
+        uint32_t word = lane | (lane << 8) | (lane << 16) | (lane << 24);
+        volatile uint32_t *pr = (volatile uint32_t *)pad_row_ddr;
+        uint32_t i;
+        for (i = 0u; i < in_w * 4u; i++) pr[i] = word;
+    }
+
+    for (c = 0u; c < nchunks; c++) {
+        uint32_t g0   = c * YOLO_ICG_BUF;
+        uint32_t cicg = (icg - g0 < YOLO_ICG_BUF) ? (icg - g0) : YOLO_ICG_BUF;
+        uint32_t cic  = cicg * 16u;
+        uint32_t wpoc_chunk = cicg * ko;
+        uint32_t dst_psum = (c == 0u) ? psum_ddr : temp_ddr;
+        uint32_t strip_in_h = (out_h - 1u) + kernel_h;   /* stride 1 */
+        int32_t  ir0 = -(int32_t)pad;
+
+        /* Stage this chunk's IC groups (tile-major) into Act SRAM with vertical pad. */
+        for (g = 0u; g < cicg; g++) {
+            for (ri = 0u; ri < strip_in_h; ri++) {
+                int32_t r = ir0 + (int32_t)ri;
+                uint32_t dst = (g * strip_in_h + ri) * in_w;
+                uint32_t src = (r >= 0 && r < (int32_t)in_h)
+                    ? in_ddr + ((g0 + g) * in_h + (uint32_t)r) * in_w * 16u
+                    : pad_row_ddr;
+                if (!yolo_dma_ddr_to_act(src, dst, in_w))
+                    return 0;
+            }
+        }
+
+        /* Per 16-OC tile: gather this chunk's weights, run raw-INT32 conv, drain. */
+        for (oc_done = 0u; oc_done < out_c; oc_done += 16u) {
+            uint32_t o;
+            for (o = 0u; o < 16u; o++) {
+                if (!yolo_dma_ddr_to_wgt(wgt_all_ddr + ((oc_done + o) * wpoc_full + g0 * ko) * 16u,
+                                         wgt_base + o * wpoc_chunk, wpoc_chunk))
+                    return 0;
+            }
+            if (!yolo_run_conv2d_qparams_pads(0u, wgt_base, 0u, in_w, strip_in_h, cic, 16u,
+                                              kernel_h, kernel_w, 1u, 0u, pad,
+                                              YOLO_ZERO_BIAS, YOLO_UNIT_MUL, YOLO_ZERO_SHIFT,
+                                              NPU_CTRL_INT32_OUT | NPU_CTRL_IC_STREAM))
+                return 0;
+            /* drain 4 INT32 words/position for this OC group */
+            if (!yolo_dma_out_to_ddr(dst_psum + (oc_done / 16u) * out_sp * 4u * 16u,
+                                     0u, out_sp * 4u, 0u))
+                return 0;
+        }
+
+        /* CPU: accumulate this chunk's partial into the running INT32 sum. */
+        if (c != 0u) {
+            volatile int32_t *pa = (volatile int32_t *)psum_ddr;
+            volatile int32_t *pt = (volatile int32_t *)temp_ddr;
+            uint32_t w;
+            for (w = 0u; w < acc_i32; w++) pa[w] += pt[w];
+        }
+    }
+
+    /* CPU final: (acc+bias)*mul>>shift, clamp INT8, exact-SiLU LUT -> tile-major INT8. */
+    for (ocg = 0u; ocg < ocg_total; ocg++) {
+        for (p = 0u; p < out_sp; p++) {
+            uint32_t outw[4] = {0u, 0u, 0u, 0u};
+            for (l = 0u; l < 16u; l++) {
+                uint32_t oc = ocg * 16u + l;
+                volatile int32_t *pp =
+                    (volatile int32_t *)(psum_ddr + ((ocg * out_sp + p) * 4u + (l >> 2)) * 16u);
+                int32_t acc = pp[l & 3u];
+                int64_t v = ((int64_t)(acc + bias[oc]) * (int64_t)(int32_t)scale_mul[oc])
+                            >> scale_shift[oc];
+                int32_t s2 = (int32_t)v;
+                if (s2 > 127) s2 = 127; else if (s2 < -128) s2 = -128;
+                outw[l >> 2] |= ((uint32_t)silu_lut[s2 & 0xFF]) << ((l & 3u) * 8u);
+            }
+            {
+                volatile uint32_t *od =
+                    (volatile uint32_t *)(out_ddr + (ocg * out_sp + p) * 16u);
+                od[0] = outw[0]; od[1] = outw[1]; od[2] = outw[2]; od[3] = outw[3];
+            }
         }
     }
     return 1;
