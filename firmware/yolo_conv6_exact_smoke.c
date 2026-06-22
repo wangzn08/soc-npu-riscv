@@ -32,7 +32,7 @@ void usercode7(void)
 
     yolo_set_pad_value(C6E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv6e_silu_lut);
-    yolo_set_silu_requant(0u, 0u, C6E_OUT_ZP);
+    yolo_set_silu_requant(0u, 0u, 0);
 
     if (!yolo_run_conv2d_tiled(ACT_DDR, WGT_OF(6), WGT_BASE, OUT_DDR, PAD_ROW_DDR,
                                C6E_IN_W, C6E_IN_H, C6E_IC, C6E_OC,

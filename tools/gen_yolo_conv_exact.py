@@ -18,6 +18,7 @@ DUMP = ROOT / "yolov8n_int8" / "dump320"
 META = json.load(open(ROOT / "yolov8n_int8" / "act_quant_meta.json"))
 CONVS = META["convs"] if isinstance(META, dict) else META
 Q_SHIFT = 20
+SILU_STEP = 0.5  # SiLU LUT indexed by preact (zp=0)
 
 
 def clamp_s8(v): return -128 if v < -128 else (127 if v > 127 else v)
@@ -33,7 +34,7 @@ def build_silu_lut(out_scale, out_zp):
     lut = np.zeros(256, dtype=np.uint8)
     for i in range(256):
         q = i if i < 128 else i - 256
-        realq = (q - out_zp) * out_scale
+        realq = q * SILU_STEP
         silu = realq / (1.0 + math.exp(-realq))
         lut[i] = clamp_s8(int(round(silu / out_scale + out_zp))) & 0xFF
     return lut
@@ -65,7 +66,7 @@ def main():
 
     mul, bias_q = [], []
     for oc in range(OC):
-        m = int(round(in_scale * float(sc[oc]) / out_scale * (1 << Q_SHIFT)))
+        m = int(round(in_scale * float(sc[oc]) / SILU_STEP * (1 << Q_SHIFT)))
         mul.append(m); bias_q.append(int(round(float(b[oc]) / (in_scale * float(sc[oc]))) - in_zp * int(wsum[oc])))
 
     golden = np.zeros((SP_OUT, OC), dtype=np.int8)
@@ -77,7 +78,7 @@ def main():
             for oc in range(OC):
                 acc = int(np.sum(win * w[oc].astype(np.int64)))
                 s2 = ((acc + bias_q[oc]) * mul[oc]) >> Q_SHIFT
-                golden[oy*OUT_W+ox, oc] = np.int8(s8(int(lut[clamp_s8(s2 + out_zp) & 0xFF])))
+                golden[oy*OUT_W+ox, oc] = np.int8(s8(int(lut[clamp_s8(s2) & 0xFF])))
 
     cflat = outd.transpose(1, 2, 0).reshape(SP_OUT, OC)
     df = np.abs(golden.astype(int) - cflat.astype(int))

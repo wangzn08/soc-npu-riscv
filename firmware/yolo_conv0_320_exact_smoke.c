@@ -33,7 +33,7 @@ void usercode7(void)
 
     yolo_set_pad_value(C0E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv0_320e_silu_lut);
-    yolo_set_silu_requant(0u, 0u, C0E_OUT_ZP);
+    yolo_set_silu_requant(0u, 0u, 0);
 
     *(volatile uint32_t *)NPU_PERF_CLR = 1u;
 

@@ -27,6 +27,7 @@ CONV0_GEN = ROOT / "tools" / "gen_yolo_conv0_strip_real_smoke.py"
 IN_W, IN_H = 80, 80
 SP = IN_W * IN_H
 Q_SHIFT = 20
+SILU_STEP = 0.5   # SiLU LUT indexed by preact at this step (zp=0)
 REQ_SHIFT = 12          # conv SiLU-requant shift
 CAT_SHIFT = 16          # CPU concat-requant fixed-point shift
 RATIO_SHIFT = 16        # residual-add ratio shift
@@ -63,7 +64,7 @@ def make_qparams(conv0, w, b, s, in_scale, in_zp, out_scale):
     wsum = w.astype(np.int32).sum(axis=(1, 2, 3))
     bias_q, mul = [], []
     for oc in range(w.shape[0]):
-        m = int(round(in_scale * float(s[oc]) / out_scale * (1 << Q_SHIFT)))
+        m = int(round(in_scale * float(s[oc]) / SILU_STEP * (1 << Q_SHIFT)))
         if m == 0:
             raise SystemExit("zero mul")
         mul.append(m)
@@ -79,7 +80,7 @@ def build_silu_lut(conv0, out_scale, out_zp):
     lut = np.zeros(256, dtype=np.uint8)
     for i in range(256):
         q = i if i < 128 else i - 256
-        realq = (q - out_zp) * out_scale
+        realq = q * SILU_STEP
         silu = realq / (1.0 + math.exp(-realq))
         lut[i] = np.uint8(conv0.s8(conv0.clamp_s8(int(round(silu / out_scale + out_zp)))) & 0xFF)
     return lut
@@ -105,7 +106,7 @@ def conv_rtl(conv0, act, w, bias_q, mul, lut, kh, kw, stride, pad, in_zp, out_zp
                             av = int(act[ic, iy, ix]) if 0 <= iy < act.shape[1] and 0 <= ix < act.shape[2] else in_zp
                             acc += av * int(w[oc, ic, ky, kx])
                 s2 = ((acc + bias_q[oc]) * mul[oc]) >> Q_SHIFT
-                idx = conv0.clamp_s8(s2 + out_zp) & 0xFF
+                idx = conv0.clamp_s8(s2) & 0xFF
                 out[pos, oc] = np.int8(conv0.s8(int(lut[idx])))
     return out
 

@@ -23,6 +23,7 @@ OUT_PATH = ROOT / "firmware" / "yolo_conv0_320_exact_data.h"
 KH = KW = 3
 STRIDE, PAD = 2, 1
 Q_SHIFT = 20
+SILU_STEP = 0.5  # SiLU LUT indexed by preact (zp=0)
 RTL_TOL = 16
 IN_SCALE, IN_ZP = 0.0039215689, -128   # conv0 act_quant input (= 1/255 image quant)
 
@@ -63,7 +64,7 @@ def build_silu_lut(out_scale, out_zp):
     lut = np.zeros(256, dtype=np.uint8)
     for i in range(256):
         q = i if i < 128 else i - 256
-        realq = (q - out_zp) * out_scale
+        realq = q * SILU_STEP
         silu = realq / (1.0 + math.exp(-realq))
         lut[i] = clamp_s8(int(round(silu / out_scale + out_zp))) & 0xFF
     return lut
@@ -91,7 +92,7 @@ def main():
 
     bias_q, mul = [], []
     for oc in range(OC):
-        m = int(round(IN_SCALE * float(sc[oc]) / out_scale * (1 << Q_SHIFT)))
+        m = int(round(IN_SCALE * float(sc[oc]) / SILU_STEP * (1 << Q_SHIFT)))
         mul.append(m)
         be = int(round(float(b[oc]) / (IN_SCALE * float(sc[oc]))))
         bias_q.append(int(be - IN_ZP * int(wsum[oc])))
@@ -107,7 +108,7 @@ def main():
             for oc in range(OC):
                 acc = int(np.sum(win * w[oc].astype(np.int64)))
                 s2 = ((acc + bias_q[oc]) * mul[oc]) >> Q_SHIFT
-                idx = clamp_s8(s2 + out_zp)
+                idx = clamp_s8(s2)
                 golden[oy*OUT_W+ox, oc] = np.int8(s8(int(lut[idx & 0xFF])))
 
     if CROP == 0:

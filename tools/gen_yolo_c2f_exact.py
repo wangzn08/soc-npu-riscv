@@ -17,6 +17,7 @@ import struct
 META = json.load(open(ROOT / "yolov8n_int8" / "act_quant_meta.json"))
 CONVS = META["convs"]; GLUE = {g["name"]: g for g in META["glue_ops"]}
 Q_SHIFT = 20; REQ_SHIFT = 12; CAT_SHIFT = 16; RATIO_SHIFT = 16; RTL_TOL = 24
+SILU_STEP = 0.5  # SiLU LUT indexed by preact (zp=0)
 
 BLOCKS = {
     "c2f2": dict(in_dump=1, cv1=2, bns=[(3, 4, "/model.2/m.0/Add")], cv2=5, full_c=32),
@@ -40,7 +41,7 @@ def build_lut(out_scale, out_zp):
     lut = np.zeros(256, dtype=np.uint8)
     for i in range(256):
         q = i if i < 128 else i - 256
-        r = (q - out_zp) * out_scale
+        r = q * SILU_STEP
         lut[i] = clamp_s8(int(round((r / (1 + math.exp(-r))) / out_scale + out_zp))) & 0xFF
     return lut
 
@@ -51,7 +52,7 @@ def qp(ci, in_scale, in_zp, out_scale, kh, kw):
     w = np.fromfile(WDIR / f"conv{ci}_w.bin", dtype=np.int8).reshape(oc, ic, kh, kw)
     s = fwf(ci, "s")[:oc]; b = fwf(ci, "b")[:oc]
     wsum = w.astype(np.int64).sum(axis=(1, 2, 3))
-    mul = [int(round(in_scale * float(s[o]) / out_scale * (1 << Q_SHIFT))) for o in range(oc)]
+    mul = [int(round(in_scale * float(s[o]) / SILU_STEP * (1 << Q_SHIFT))) for o in range(oc)]
     bias = [int(round(float(b[o]) / (in_scale * float(s[o]))) - in_zp * int(wsum[o])) for o in range(oc)]
     return w, bias, mul
 
@@ -68,7 +69,7 @@ def conv_exact(act, w, bias, mul, lut, kh, kw, stride, pad, in_zp, out_zp):
             for o in range(OC):
                 acc = int(np.sum(win * w[o].astype(np.int64)))
                 s2 = ((acc + bias[o]) * mul[o]) >> Q_SHIFT
-                out[oy*ow+ox, o] = np.int8(s8(int(lut[clamp_s8(s2 + out_zp) & 0xFF])))
+                out[oy*ow+ox, o] = np.int8(s8(int(lut[clamp_s8(s2) & 0xFF])))
     return out
 
 

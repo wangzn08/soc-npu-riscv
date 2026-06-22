@@ -28,8 +28,12 @@ static uint32_t silu_setup(const yolo_c2f_cfg_t *cfg, const uint8_t *lut,
                            uint32_t rq_mul, uint32_t rq_shift, int32_t zp)
 {
     if (cfg->silu_exact) {
+        /* preact-scale exact SiLU: the LUT index is preact-centered, so the index
+         * zero-point is ALWAYS 0 (the output zp is baked into the LUT content). The
+         * per-conv zp arg is then only the output zp used by the CPU add/concat. */
+        (void)zp;
         yolo_load_silu_lut(lut);
-        yolo_set_silu_requant(0u, 0u, zp);
+        yolo_set_silu_requant(0u, 0u, 0);
         return NPU_CTRL_SILU_EXACT_EN;
     }
     yolo_set_silu_requant(rq_mul, rq_shift, zp);
