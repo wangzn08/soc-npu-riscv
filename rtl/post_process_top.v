@@ -69,11 +69,41 @@ module post_process_top #(
     output wire [DATA_W-1:0]                o_feat,
     output wire                             o_feat_vld,
 
+    // INT32 psum accumulate modes (IC-chunk streaming): a conv's IC dimension
+    // can be split across multiple NPU passes and accumulated in INT32.
+    //   0 = NONE  : legacy single-pass (bit-identical when tied to 0)
+    //   1 = FIRST : first IC chunk -> o_feat32 = raw i_psum (no bias, no readback)
+    //   2 = ADD   : middle IC chunk -> o_feat32 = i_psum + i_psum_readback (no bias)
+    //   3 = FINAL : last IC chunk  -> normal requant+SiLU on (i_psum +
+    //               i_psum_readback + bias) -> o_feat (INT8)
+    // i_psum_readback carries the prior accumulated INT32 (one per OC lane),
+    // read back from Out SRAM by the FSM (wired in a later task).
+    input  wire [1:0]                       i_acc_mode,
+    input  wire [NUM_OC*PSUM_WIDTH-1:0]     i_psum_readback,
+
     // Decision Q: raw INT32 output — the scaled, un-clamped stage-2 result
     // (16 channels × 32 bit), delay-matched to o_feat/o_feat_vld. Used by the
     // int32 write sequencer in npu_top for final-classifier FC (FC2).
     output wire [NUM_OC*PSUM_WIDTH-1:0]     o_feat32
 );
+
+    localparam [1:0] ACC_NONE  = 2'd0;
+    localparam [1:0] ACC_FIRST = 2'd1;
+    localparam [1:0] ACC_ADD   = 2'd2;
+    localparam [1:0] ACC_FINAL = 2'd3;
+
+    // acc_in[oc] = i_psum[oc] + (ADD/FINAL ? readback : 0). NONE selects the
+    // plain i_psum so the rest of the pipeline is bit-identical to legacy.
+    wire add_readback = (i_acc_mode == ACC_ADD) || (i_acc_mode == ACC_FINAL);
+    wire [NUM_OC-1:0][PSUM_WIDTH-1:0] acc_in;
+    genvar ga;
+    generate
+        for (ga = 0; ga < NUM_OC; ga = ga + 1) begin : gen_acc_in
+            assign acc_in[ga] = add_readback
+                ? (i_psum[ga] + i_psum_readback[ga*PSUM_WIDTH +: PSUM_WIDTH])
+                : i_psum[ga];
+        end
+    endgenerate
 
     // -------------------------------------------------------------------
     // Stage 1: PSUM + Bias → s1_sum
@@ -88,7 +118,9 @@ module post_process_top #(
                 if (!rst_n)
                     s1_sum[gi] <= {PSUM_WIDTH{1'b0}};
                 else if (i_psum_vld) begin
-                    s1_sum[gi] <= i_psum[gi] + i_bias[gi];
+                    // acc_in == i_psum in ACC_NONE/FIRST; == i_psum+readback in
+                    // ACC_ADD/FINAL. ACC_FINAL adds bias for the final requant.
+                    s1_sum[gi] <= acc_in[gi] + i_bias[gi];
                 end
             end
         end
@@ -99,6 +131,28 @@ module post_process_top #(
             s1_vld <= 1'b0;
         else
             s1_vld <= i_psum_vld;
+    end
+
+    // ACC FIRST/ADD raw INT32 sum (no bias, no requant), registered at the
+    // s1 stage so it aligns with s2_quant timing. Captured every i_psum_vld
+    // like s1_sum; only consumed when i_acc_mode is FIRST/ADD.
+    reg [NUM_OC-1:0][PSUM_WIDTH-1:0] s1_acc_raw;
+    reg                               s1_acc_int32;   // FIRST/ADD: route raw to o_feat32
+    generate
+        for (gi = 0; gi < NUM_OC; gi = gi + 1) begin : gen_s1acc
+            always @(posedge clk or negedge rst_n) begin
+                if (!rst_n)
+                    s1_acc_raw[gi] <= {PSUM_WIDTH{1'b0}};
+                else if (i_psum_vld)
+                    s1_acc_raw[gi] <= acc_in[gi];
+            end
+        end
+    endgenerate
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            s1_acc_int32 <= 1'b0;
+        else if (i_psum_vld)
+            s1_acc_int32 <= (i_acc_mode == ACC_FIRST) || (i_acc_mode == ACC_ADD);
     end
 
     // -------------------------------------------------------------------
@@ -404,10 +458,29 @@ module post_process_top #(
     // (s3 register + POOL_LATENCY) so o_feat32 aligns with o_feat_vld. Used only
     // in int32_out mode (GEMM/final-FC, non-pool); off ⇒ unused ⇒ byte-identical.
     // -------------------------------------------------------------------
+    // Align the raw-acc INT32 value (FIRST/ADD) to the s2 stage: s2_quant is
+    // captured from s1 on s1_vld, so register s1_acc_raw/flag forward one
+    // stage with the same enable to land in the same cycle as s2_quant.
+    reg [NUM_OC-1:0][PSUM_WIDTH-1:0] s2_acc_raw;
+    reg                               s2_acc_int32;
+    generate
+        for (gi = 0; gi < NUM_OC; gi = gi + 1) begin : gen_s2acc
+            always @(posedge clk) begin
+                if (s1_vld) s2_acc_raw[gi] <= s1_acc_raw[gi];
+            end
+        end
+    endgenerate
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)       s2_acc_int32 <= 1'b0;
+        else if (s1_vld)  s2_acc_int32 <= s1_acc_int32;
+    end
+
+    // o_feat32 source: requant (s2_quant) by default; raw acc sum in FIRST/ADD.
     wire [NUM_OC*PSUM_WIDTH-1:0] s2_flat;
     generate
         for (gi = 0; gi < NUM_OC; gi = gi + 1) begin : gen_s2flat
-            assign s2_flat[gi*PSUM_WIDTH +: PSUM_WIDTH] = s2_quant[gi];
+            assign s2_flat[gi*PSUM_WIDTH +: PSUM_WIDTH] =
+                s2_acc_int32 ? s2_acc_raw[gi] : s2_quant[gi];
         end
     endgenerate
 

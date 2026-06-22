@@ -1046,6 +1046,10 @@ module npu_top #(
         .i_group_size  (fsm_group_size),
         .i_rows_per_grp(fsm_rows_per_grp),
         .i_oc_tile     (fsm_oc_tile_sel[1:0]),
+        // INT32 psum accumulate modes: tied OFF here (wired by a later task);
+        // ACC_NONE = byte-identical legacy post-process.
+        .i_acc_mode     (2'd0),
+        .i_psum_readback({(16*32){1'b0}}),
         .o_pool_tile   (pp_pool_tile),
         .o_rp_pool_done(rp_pool_done),
         .o_feat        (pp_feat),
