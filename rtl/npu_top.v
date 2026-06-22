@@ -1181,7 +1181,12 @@ module npu_top #(
             i32_active <= 1'b0; i32_base <= {SRAM_ADDR_W{1'b0}};
         end else if (cfg_int32_out && fsm_out_wr_en && !i32_active) begin
             i32_buf    <= pp_feat32;                    // 16×INT32 latched at the GEMM write
-            i32_base   <= fsm_out_wr_addr;
+            // FC (single position): base = addr. Spatial INT32 (ic_stream, large-IC
+            // streaming partials): each output position owns 4 words, so space the
+            // base x4 to avoid overlap with the next position. Positions in a conv
+            // sweep are >>4 cycles apart, so the 4-cycle serialize never drops.
+            i32_base   <= cfg_ic_stream ? {fsm_out_wr_addr[SRAM_ADDR_W-3:0], 2'b00}
+                                        : fsm_out_wr_addr;
             i32_cnt    <= 2'd0;
             i32_active <= 1'b1;
         end else if (i32_active) begin

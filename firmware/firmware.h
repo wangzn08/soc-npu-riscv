@@ -141,6 +141,15 @@ void usercode7(void);
 #define NPU_CTRL_SILU_EXACT_EN (1 << 22) // per-layer exact SiLU LUT (out-grid indexed; no +-8 clamp)
 #define NPU_CTRL_IC_STREAM   (1 << 23) // large-IC conv streaming (IC-chunk loop + INT32 psum accumulate)
 
+/* INT32 psum accumulate (large-IC conv streaming): partial passes write/accumulate
+ * INT32 psum to an Out-SRAM region; the final pass requant+SiLU reads it back. */
+#define NPU_ACC_MODE     (NPU_BASE + 0x3F8)  // [1:0] 0=NONE,1=FIRST,2=ADD,3=FINAL
+#define NPU_PSUM_RD_BASE (NPU_BASE + 0x3FC)  // Out-SRAM INT32 psum readback base (ADD/FINAL)
+#define NPU_ACC_NONE   0u
+#define NPU_ACC_FIRST  1u
+#define NPU_ACC_ADD    2u
+#define NPU_ACC_FINAL  3u
+
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)
 #define NPU_STATUS_BUSY       (1 << 1)

@@ -105,6 +105,8 @@ module param_regfile #(
     output wire [7:0]                   o_pad_value,     // NPU_PAD_VALUE: border fill byte, default 0
     output wire [7:0]                   o_clip_max,      // NPU_CLIP_MAX (0x118): post-process upper clamp (default 127 = ReLU; ReLU6 = q(6.0))
     output wire [SRAM_ADDR_W-1:0]       o_skip_base,     // NPU_SKIP_BASE (0x11C): residual skip source Out-SRAM base (0 = same-addr legacy)
+    output wire [1:0]                   o_acc_mode,      // NPU_ACC_MODE (0x3F8): INT32 psum accumulate (0=NONE,1=FIRST,2=ADD,3=FINAL)
+    output wire [SRAM_ADDR_W-1:0]       o_psum_rd_base,  // NPU_PSUM_RD_BASE (0x3FC): Out-SRAM INT32 psum readback base (ADD/FINAL)
     output wire                         o_elt_signed,    // CTRL[20]: signed INT8 + zero-point eltwise add (YOLO C2f residual)
     output wire [7:0]                   o_elt_zp,        // NPU_ELTWISE_ZP (0x3D4): glue zero-point for signed eltwise add
 
@@ -255,6 +257,8 @@ module param_regfile #(
     reg [7:0]  pad_value;       // NPU_PAD_VALUE: hardware padding fill byte
     reg [7:0]  clip_max;        // NPU_CLIP_MAX: post-process upper clamp value
     reg [SRAM_ADDR_W-1:0] skip_base;  // NPU_SKIP_BASE: residual skip source base
+    reg [1:0]  acc_mode;       // NPU_ACC_MODE: INT32 psum accumulate mode (0=NONE)
+    reg [SRAM_ADDR_W-1:0] psum_rd_base; // NPU_PSUM_RD_BASE: INT32 psum readback base
     reg        ctrl_elt_signed;       // CTRL[20]: signed INT8 + zero-point eltwise add
     reg [7:0]  elt_zp;                // NPU_ELTWISE_ZP: glue zero-point for signed eltwise
 
@@ -405,6 +409,8 @@ module param_regfile #(
             pad_value       <= 8'd0;
             clip_max        <= 8'd127;   // default = legacy ReLU clamp [0,127]
             skip_base       <= {SRAM_ADDR_W{1'b0}};  // default 0 = same-addr legacy residual
+            acc_mode        <= 2'd0;     // default NONE = legacy (byte-identical)
+            psum_rd_base    <= {SRAM_ADDR_W{1'b0}};
             ctrl_elt_signed <= 1'b0;   // default 0 = legacy unsigned eltwise (MNIST byte-identical)
             elt_zp          <= 8'd0;
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -575,6 +581,8 @@ module param_regfile #(
                     10'h114: total_ops_w <= s_axi_wdata[15:0];
                     10'h118: clip_max    <= s_axi_wdata[7:0];   // NPU_CLIP_MAX
                     10'h11C: skip_base   <= s_axi_wdata[SRAM_ADDR_W-1:0];  // NPU_SKIP_BASE
+                    10'h3F8: acc_mode    <= s_axi_wdata[1:0];   // NPU_ACC_MODE
+                    10'h3FC: psum_rd_base <= s_axi_wdata[SRAM_ADDR_W-1:0];  // NPU_PSUM_RD_BASE
 
                     // DMA control registers (0x120-0x13C)
                     10'h120: dma_rd_req_d     <= 1'b1;  // Write triggers DMA read pulse
@@ -904,6 +912,8 @@ module param_regfile #(
     assign o_sigm_load_val    = sigm_load_val;
     assign o_silu_exact_en    = ctrl_silu_exact_en;
     assign o_ic_stream        = ctrl_ic_stream;
+    assign o_acc_mode         = acc_mode;
+    assign o_psum_rd_base     = psum_rd_base;
     assign o_silu_load_en     = silu_load_en_d;
     assign o_silu_load_idx    = silu_load_idx;
     assign o_silu_load_val    = silu_load_val;
