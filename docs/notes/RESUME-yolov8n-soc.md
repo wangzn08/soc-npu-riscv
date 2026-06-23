@@ -11,9 +11,10 @@ SOLVED (2026-06-22): root cause was PW 1x1 weight-buffer overflow, NOT the doc's
 (icg>ICG_BUF). c2f_4 exact maxdiff=0, c2f_6 PASS, MNIST 10/10 941,155 cyc unchanged.
 **3x3 large-IC also SOLVED** (CPU INT32-psum accumulate). **FULL CSPDarknet backbone
 (model.0..8) now runs end-to-end on RTL** in `yolo_full_stem.c`: conv0->conv1->c2f2->
-conv6->c2f4->conv13->c2f6->conv20->c2f8, DDR-preloaded image + blob weights + exact-SiLU,
-maxdiff=96 vs c2f8 golden. conv20 (large-IC stride2 3x3) was the last unproven datapath
--> now validated in-chain. **Next: SPPF (model.9) -> neck -> heads -> CPU decode + NMS.**
+conv6->c2f4->conv13->c2f6->conv20->c2f8->SPPF, DDR-preloaded image + blob weights +
+exact-SiLU, maxdiff=73 vs SPPF golden. **FULL feature extractor (model.0..9) runs on RTL.**
+conv20 (large-IC stride2 3x3) + conv26 (icg32 PW) were the last unproven datapaths ->
+validated in-chain. **Next: neck (FPN/PAN: upsample+concat+C2f x3) -> heads -> decode + NMS.**
 
 ## c2f_4 RESOLUTION (done — for history)
 stage-checksum (generator bakes per-stage golden; smoke compares each DDR buffer)
@@ -62,22 +63,24 @@ separate capacity limit (after wgt_buf ICG_BUF, fixed for PW). c2f_8 bottleneck 
 FIRST ever icg>4 3x3 conv (MNIST/conv0-1/c2f2-6 bottlenecks all icg<=4). NOT a
 regression. Firmware IC-tiling can't fix 3x3 (int32_out is FC-single-position only).
 
-### NEXT ACTION (resume here) — SPPF, then neck/heads/decode
-Full backbone (conv0..c2f8) is DONE in yolo_full_stem.c. Remaining for a full image:
-1. **SPPF (model.9)**: conv25 (1x1, 256->128) -> 3x serial 5x5 maxpool (stride1, pad2,
-   each fed by the previous) -> concat(x, p1, p2, p3 = 512ch) -> conv26 (1x1, 512->256).
-   The NPU has 2x2 pool only; 5x5 maxpool needs either a maxpool helper or CPU. Check
-   yolo_sppf_smoke.c / gen_yolo_sppf_smoke.py (assets exist: yolo_sppf_data.h). conv25/26
-   are 1x1 (cv2 ic=512 -> icg32 PW stream, already supported). Append as stage 9, chain
-   from C2F8_OUT.
-2. Neck: upsample2x (HW yolo_run_upsample2x exists) + concat + 3 more C2f (P3/P4/P5).
-3. Heads: per-scale conv (3x3 exact) + 1x1 cls/reg output convs + DFL conv63.
-4. CPU decode (DFL + sigmoid HW exist) + NMS. Validate FINAL boxes vs C oracle (4 persons),
-   NOT per-layer (LUT SiLU over-constrains).
+### NEXT ACTION (resume here) — neck (FPN/PAN), then heads/decode
+Full feature extractor (conv0..SPPF, model.0..9) is DONE in yolo_full_stem.c (stages 0-9).
+SPPF output = SPPF_OUT (0x40780000, 10x10x256). Remaining for a full image:
+1. **Neck (model.10..21, FPN/PAN top-down + bottom-up)**: upsample2x (HW yolo_run_upsample2x
+   exists) + concat (CPU concat helper, same-scale or requant) + C2f blocks (yolo_run_c2f_block,
+   no shortcut in neck C2f -- set cfg.shortcut=0). Needs exact data for each neck conv/C2f
+   (extend gen_yolo_c2f_exact.py BLOCKS with the neck c2f indices, + a conv-exact gen for the
+   neck 1x1/concat-feeding convs). Concat sources are P3/P4/P5 backbone taps (save c2f4/c2f6
+   outputs = the P3/P4 skip tensors before they're overwritten -- mind DDR buffer reuse).
+2. Heads (model.22): per-scale (P3/P4/P5) detect branch = 2x (3x3 conv exact) + 1x1 cls conv
+   + 1x1 reg conv; DFL conv63 (1x1 16->1). 3. CPU decode: DFL (HW dfl_unit exists) + sigmoid
+   (HW exists) + box decode + NMS. Validate FINAL boxes vs C oracle (4 persons @ conf0.25/
+   nms0.45), NOT per-layer.
 Reusable: yolo_run_conv2d_tiled (small-IC + large-IC 1x1 PW stream), yolo_run_conv2d_ic_stream
-(large-IC 3x3, any stride), yolo_run_c2f_block, yolo_run_upsample2x, DFL/sigmoid. Large-IC
-3x3 needs a psum_ddr scratch = (out_c/16)*out_w*out_h*4*2 128-bit words; pick DDR clear of
-the image (0x40400000..0x405A0000) and blob (0x40800000..0x40B01000).
+(large-IC 3x3, any stride), yolo_run_c2f_block (cfg.shortcut=0 for neck), yolo_run_upsample2x,
+maxpool5/concat4 (in yolo_full_stem.c), DFL/sigmoid HW. Large-IC 3x3 needs psum_ddr scratch =
+(out_c/16)*out_w*out_h*4*2 128-bit words; keep DDR clear of image (0x40400000..0x405A0000) +
+blob (0x40800000..0x40B01000). gen_yolo_sppf_exact.py shows the pattern for a non-C2f exact gen.
 
 ## HOW TO BUILD / RUN (Git Bash from repo root)
 - MNIST regression (must stay 10/10): `bash run_all.sh sim`
