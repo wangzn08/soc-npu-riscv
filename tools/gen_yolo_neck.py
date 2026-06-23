@@ -29,10 +29,10 @@ def ups2x(x):  # [C,H,W] int8 nearest 2x (scale/zp unchanged)
 
 
 def cat_req(q_sp_c, in_zp, src_sc, cat_s, cat_z):  # q [SP,C] -> int8 at cat scale
-    mul = int(round((src_sc / cat_s) * (1 << CAT)))
+    mul = int(round((src_sc / cat_s) * (1 << CAT))); h = 1 << (CAT - 1)
     out = np.zeros_like(q_sp_c, dtype=np.int8)
     for idx in np.ndindex(q_sp_c.shape):
-        out[idx] = np.int8(s8(clamp((((int(q_sp_c[idx]) - in_zp) * mul) >> CAT) + cat_z) & 0xFF))
+        out[idx] = np.int8(s8(clamp((((int(q_sp_c[idx]) - in_zp) * mul + h) >> CAT) + cat_z) & 0xFF))
     return out, mul
 
 
@@ -96,7 +96,7 @@ def c2f_neck(act, cv1, bns, cv2):
     out = C.conv_exact(concat_c, w2, b2, m2, C.build_lut(c2o_s, c2o_z), 1, 1, 1, 0, cat_z, c2o_z)
     E["cv2"] = (b2, m2, c2o_z, C.build_lut(c2o_s, c2o_z))
     E["cat"] = (cm_s, cv1_z, cat_z, cat_add)   # cat_mul_s0s1, inzp_s0s1, cat_zp, [(mul,zp)..]
-    E["dims"] = (W, H, SP, full_c, cv2_ic, C.CONVS[cv2]["oc"], n)
+    E["dims"] = (W, H, SP, full_c, cv2_ic, C.CONVS[cv2]["oc"], n, C.CONVS[cv1]["ic"])
     return out, E, c2o_s, c2o_z
 
 
@@ -107,11 +107,12 @@ def u8(nm, v):  return f"static const uint8_t {nm}[{len(v)}] = {{ {', '.join(f'0
 L = []
 def emit_c2f(pfx, E):
     P = pfx.upper()
-    W, H, SP, full_c, cv2_ic, cv2_oc, n = E["dims"]
+    W, H, SP, full_c, cv2_ic, cv2_oc, n, cv1_ic = E["dims"]
     L.append(f"#define {P}_IN_W {W}u")
     L.append(f"#define {P}_IN_H {H}u")
     L.append(f"#define {P}_SPATIAL {SP}u")
     L.append(f"#define {P}_FULL_C {full_c}u")
+    L.append(f"#define {P}_CV1_IC {cv1_ic}u")
     L.append(f"#define {P}_CV2_IC {cv2_ic}u")
     L.append(f"#define {P}_CV2_OC {cv2_oc}u")
     L.append(f"#define {P}_N {n}u")

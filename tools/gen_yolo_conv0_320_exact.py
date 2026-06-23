@@ -95,7 +95,7 @@ def main():
         m = int(round(IN_SCALE * float(sc[oc]) / SILU_STEP * (1 << Q_SHIFT)))
         mul.append(m)
         be = int(round(float(b[oc]) / (IN_SCALE * float(sc[oc]))))
-        bias_q.append(int(be - IN_ZP * int(wsum[oc])))
+        bias_q.append(int(be - IN_ZP * int(wsum[oc]) + (round((1 << (Q_SHIFT-1)) / m) if m else 0)))
 
     # exact golden (3-channel conv, pad with in_zp)
     golden = np.zeros((SP_OUT, OC), dtype=np.int8)

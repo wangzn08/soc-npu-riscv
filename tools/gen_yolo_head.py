@@ -30,7 +30,8 @@ def qp_std(ci, kh, kw):
     s = C.fwf(ci, "s")[:oc]; b = C.fwf(ci, "b")[:oc]
     wsum = w.astype(np.int64).sum(axis=(1, 2, 3))
     mul = [int(round(i_s * float(s[o]) / o_s * (1 << Q))) for o in range(oc)]
-    bias = [int(round(float(b[o]) / (i_s * float(s[o]))) - i_z * int(wsum[o])) for o in range(oc)]
+    bias = [int(round(float(b[o]) / (i_s * float(s[o]))) - i_z * int(wsum[o])
+                + (round((1 << (Q - 1)) / mul[o]) if mul[o] else 0)) for o in range(oc)]
     return w, bias, mul
 
 

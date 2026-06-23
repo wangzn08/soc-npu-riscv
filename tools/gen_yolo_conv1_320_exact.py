@@ -71,7 +71,7 @@ def main():
         m = int(round(in_scale * float(sc[oc]) / SILU_STEP * (1 << Q_SHIFT)))
         mul.append(m)
         be = int(round(float(b[oc]) / (in_scale * float(sc[oc]))))
-        bias_q.append(int(be - in_zp * int(wsum[oc])))
+        bias_q.append(int(be - in_zp * int(wsum[oc]) + (round((1 << (Q_SHIFT-1)) / m) if m else 0)))
 
     # exact-SiLU golden at full resolution
     golden = np.zeros((SP_OUT, OC), dtype=np.int8)

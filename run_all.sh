@@ -151,7 +151,10 @@ compile_fw() {
     BIN="$BUILD_DIR/firmware7.bin"
 
     info "链接: $ELF"
-    "${RISCV_PREFIX}gcc" "${LDFLAGS[@]}" -o "$ELF" "${OBJS[@]}"
+    # -lgcc (after objects) provides soft-float routines (__addsf3 etc.) for the
+    # YOLO CPU decode; only referenced symbols are pulled in, so float-free builds
+    # (MNIST) are unaffected. -nostdlib otherwise omits libgcc.
+    "${RISCV_PREFIX}gcc" "${LDFLAGS[@]}" -o "$ELF" "${OBJS[@]}" -lgcc
     chmod -x "$ELF"
 
     info "生成BIN: $BIN"

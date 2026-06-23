@@ -53,7 +53,11 @@ def qp(ci, in_scale, in_zp, out_scale, kh, kw):
     s = fwf(ci, "s")[:oc]; b = fwf(ci, "b")[:oc]
     wsum = w.astype(np.int64).sum(axis=(1, 2, 3))
     mul = [int(round(in_scale * float(s[o]) / SILU_STEP * (1 << Q_SHIFT))) for o in range(oc)]
-    bias = [int(round(float(b[o]) / (in_scale * float(s[o]))) - in_zp * int(wsum[o])) for o in range(oc)]
+    # +round(2^(Q-1)/mul) folds a rounding bias into the integer bias so the RTL's
+    # floor((acc+bias)*mul>>Q) approximates round(...). Without it the per-conv floor
+    # bias accumulates over the deep chain and collapses detection confidence.
+    bias = [int(round(float(b[o]) / (in_scale * float(s[o]))) - in_zp * int(wsum[o])
+                + (round((1 << (Q_SHIFT - 1)) / mul[o]) if mul[o] else 0)) for o in range(oc)]
     return w, bias, mul
 
 
@@ -107,7 +111,7 @@ def main():
         rmul = int(round((prev_sc / gsc) * (1 << RATIO_SHIFT)))
         add = np.zeros((SP, half), dtype=np.int8)
         for idx in np.ndindex(prev.shape):
-            v = (((int(prev[idx]) - prev_zp) * rmul) >> RATIO_SHIFT) + int(c_b[idx])
+            v = (((int(prev[idx]) - prev_zp) * rmul + (1 << (RATIO_SHIFT-1))) >> RATIO_SHIFT) + int(c_b[idx])
             add[idx] = np.int8(s8(clamp_s8(v) & 0xFF))
         adds.append((add, gsc, gzp)); bn_data.append((w_a, b_a, m_a, ao_s, ao_z, w_b, b_b, m_b, gsc, gzp, rmul, prev_zp))
         prev = add; prev_sc, prev_zp = gsc, gzp
@@ -116,9 +120,10 @@ def main():
     cat_s, cat_z = CONVS[cv2]["in_scale"], CONVS[cv2]["in_zp"]
     def cat_req(q, in_zp_, src_sc):
         mul = int(round((src_sc / cat_s) * (1 << CAT_SHIFT)))
+        h = 1 << (CAT_SHIFT - 1)
         out = np.zeros_like(q, dtype=np.int8)
         for idx in np.ndindex(q.shape):
-            out[idx] = np.int8(s8(clamp_s8((((int(q[idx]) - in_zp_) * mul) >> CAT_SHIFT) + cat_z) & 0xFF))
+            out[idx] = np.int8(s8(clamp_s8((((int(q[idx]) - in_zp_) * mul + h) >> CAT_SHIFT) + cat_z) & 0xFF))
         return out, mul
     s0f = s0.transpose(1, 2, 0).reshape(SP, half); s1f = s1.transpose(1, 2, 0).reshape(SP, half)
     s0c, cm_s = cat_req(s0f, cv1_zp, cv1_scale); s1c, _ = cat_req(s1f, cv1_zp, cv1_scale)

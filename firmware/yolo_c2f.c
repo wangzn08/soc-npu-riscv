@@ -56,7 +56,7 @@ static void add_word(uint32_t prev_ddr, uint32_t mcv2_ddr, uint32_t widx,
     for (k = 0u; k < 16u; k++) {
         int32_t prev = lane_s8(pv[k>>2], k);
         int32_t conv = lane_s8(cv[k>>2], k);
-        int32_t v = (((prev - prev_zp) * (int32_t)ratio_mul) >> ratio_sh) + conv;
+        int32_t v = (((prev - prev_zp) * (int32_t)ratio_mul + (1 << (ratio_sh-1u))) >> ratio_sh) + conv;
         out[k>>2] |= ((uint32_t)(s8c(v) & 0xFF)) << ((k&3u)*8u);
     }
     wr_word(dst, dw, out);
@@ -70,7 +70,7 @@ static void requant_word(uint32_t src, uint32_t sw, uint32_t mul, int32_t in_zp,
     rd_word(src, sw, in);
     for (k = 0u; k < 16u; k++) {
         int32_t q = lane_s8(in[k>>2], k);
-        int32_t v = (((q - in_zp) * (int32_t)mul) >> shift) + cat_zp;
+        int32_t v = (((q - in_zp) * (int32_t)mul + (1 << (shift-1u))) >> shift) + cat_zp;
         out[k>>2] |= ((uint32_t)(s8c(v) & 0xFF)) << ((k&3u)*8u);
     }
     wr_word(dst, dw, out);

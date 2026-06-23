@@ -67,7 +67,7 @@ def main():
     mul, bias_q = [], []
     for oc in range(OC):
         m = int(round(in_scale * float(sc[oc]) / SILU_STEP * (1 << Q_SHIFT)))
-        mul.append(m); bias_q.append(int(round(float(b[oc]) / (in_scale * float(sc[oc]))) - in_zp * int(wsum[oc])))
+        mul.append(m); bias_q.append(int(round(float(b[oc]) / (in_scale * float(sc[oc]))) - in_zp * int(wsum[oc]) + (round((1 << (Q_SHIFT-1)) / m) if m else 0)))
 
     golden = np.zeros((SP_OUT, OC), dtype=np.int8)
     ap = np.full((IC, IN_H + 2*PAD, IN_W + 2*PAD), in_zp, dtype=np.int64)
