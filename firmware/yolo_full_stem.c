@@ -19,6 +19,7 @@
 #include "yolo_c2f6_exact_data.h"
 #include "yolo_conv20_exact_data.h"
 #include "yolo_c2f8_exact_data.h"
+#include "yolo_sppf_exact_data.h"
 #include "yolo_weight_map.h"
 #include <stdint.h>
 
@@ -68,8 +69,15 @@
 #define E_MCV2    0x40670000u
 #define E_ADD0    0x40680000u
 #define E_CONCAT  0x40690000u   // 384ch @ 10x10
-#define C2F8_OUT  0x406C0000u   // c2f_8 out 10x10x256
+#define C2F8_OUT  0x406C0000u   // c2f_8 out 10x10x256 = SPPF input
 #define E_PSUM    0x40700000u   // c2f_8 bottleneck (icg8) ic_stream INT32 psum
+// ---- SPPF (model.9): conv25 -> 3x maxpool5 -> concat -> conv26 (10x10) ----
+#define S_CV1     0x40720000u   // conv25 out 128ch
+#define S_M0      0x40730000u
+#define S_M1      0x40740000u
+#define S_M2      0x40750000u
+#define S_CAT     0x40760000u   // concat 512ch
+#define SPPF_OUT  0x40780000u   // conv26 out 256ch
 #define WGT_BASE  0u
 
 static int32_t rs8(uint32_t a, uint32_t w, uint32_t b)
@@ -77,12 +85,48 @@ static int32_t rs8(uint32_t a, uint32_t w, uint32_t b)
 static int32_t s8(uint32_t b){ b&=0xFFu; return (b&0x80u)?((int32_t)b-256):(int32_t)b; }
 static uint32_t ad(int32_t a,int32_t b){ int32_t d=a-b; return (uint32_t)(d<0?-d:d); }
 
+// SPPF 5x5 stride-1 pad-2 int8 max-pool, tile-major DDR (groups of 16 channels).
+static void maxpool5(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, uint32_t W)
+{
+    uint32_t SP = H*W, g, oh, ow, kh, kw, k;
+    for (g = 0u; g < groups; g++)
+        for (oh = 0u; oh < H; oh++)
+            for (ow = 0u; ow < W; ow++) {
+                int32_t mx[16]; uint32_t o[4] = {0u,0u,0u,0u};
+                for (k = 0u; k < 16u; k++) mx[k] = -128;
+                for (kh = 0u; kh < 5u; kh++)
+                    for (kw = 0u; kw < 5u; kw++) {
+                        int32_t ih = (int32_t)oh-2+(int32_t)kh, iw = (int32_t)ow-2+(int32_t)kw;
+                        if (ih>=0 && ih<(int32_t)H && iw>=0 && iw<(int32_t)W) {
+                            volatile uint32_t *p=(volatile uint32_t*)(src+(g*SP+(uint32_t)ih*W+(uint32_t)iw)*16u);
+                            for (k = 0u; k < 16u; k++) { int32_t v=s8(p[k>>2]>>((k&3u)*8u)); if (v>mx[k]) mx[k]=v; }
+                        }
+                    }
+                for (k = 0u; k < 16u; k++) o[k>>2] |= ((uint32_t)(mx[k]&0xFF))<<((k&3u)*8u);
+                { volatile uint32_t *q=(volatile uint32_t*)(dst+(g*SP+oh*W+ow)*16u); q[0]=o[0];q[1]=o[1];q[2]=o[2];q[3]=o[3]; }
+            }
+}
+// concat 4 same-scale tile-major parts -> [4*groups] tensor.
+static void concat4(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t dst,
+                    uint32_t groups, uint32_t SP)
+{
+    uint32_t srcs[4]; uint32_t i, n; srcs[0]=a;srcs[1]=b;srcs[2]=c;srcs[3]=d;
+    for (i = 0u; i < 4u; i++)
+        for (n = 0u; n < groups*SP; n++) {
+            volatile uint32_t *s=(volatile uint32_t*)(srcs[i]+n*16u);
+            volatile uint32_t *t=(volatile uint32_t*)(dst+(i*groups*SP+n)*16u);
+            t[0]=s[0];t[1]=s[1];t[2]=s[2];t[3]=s[3];
+        }
+}
+
 void usercode7(void)
 {
     uint32_t pos, oc, errors = 0u, maxd = 0u;
     yolo_c2f_cfg_t cfg;
 
-    print_str("YOLO FULL STEM: conv0 -> conv1 -> c2f_2 (on-SoC, DDR, preloaded img)\n");
+    print_str("YOLO FULL STEM: conv0 -> ... -> SPPF (on-SoC, DDR, preloaded img)\n");
+    /* intermediate goldens are checkpoints; only the final (SPPF) one is validated */
+    (void)yolo_c2f4_golden; (void)yolo_c2f6_golden; (void)yolo_c2f8_golden;
 
     // ---------- Stage 0: conv0 (preloaded image, weights from DDR blob) -> C0_OUT ----------
     yolo_set_pad_value(C0E_PAD_VALUE);
@@ -293,15 +337,44 @@ void usercode7(void)
     cfg.cv2_bias=yolo_c2f8_cv2_bias; cfg.cv2_mul=yolo_c2f8_cv2_mul; cfg.cv2_shift=yolo_c2f8_cv2_shift;
     cfg.cv2_silu_lut=yolo_c2f8_cv2_lut; cfg.cv2_rq_zp=YOLO_C2F8_CV2_RQ_ZP;
     if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f8 fail\n"); errors++; }
+    print_str("  [stage8 c2f_8 done]\n");
 
-    // ---------- validate c2f_8 output vs golden (integration; 8-block drift propagates) ----------
-    for (pos = 0u; pos < YOLO_C2F8_SPATIAL && errors <= 16u; pos++)
-        for (oc = 0u; oc < YOLO_C2F8_CV2_OC; oc++) {
-            int32_t got = rs8(C2F8_OUT, (oc>>4)*YOLO_C2F8_SPATIAL + pos, oc&15u);
-            int32_t exp = s8(yolo_c2f8_golden[pos][oc]);
+    // ---------- Stage 9: SPPF (model.9) conv25 -> 3x maxpool5 -> concat -> conv26 ----------
+    // conv25 (1x1 256->128, icg16 PW stream, exact); maxpool/concat on CPU (scale-
+    // preserving); conv26 (1x1 512->256, icg32 PW stream, exact). Reads C2F8_OUT.
+    yolo_load_silu_lut(yolo_sppf_e_c25_lut);
+    yolo_set_silu_requant(0u, 0u, 0);
+    if (errors == 0u && !yolo_run_conv2d_tiled(C2F8_OUT, WGT_OF(25), WGT_BASE, S_CV1, PAD_ROW,
+                               SPPFE_IN_W, SPPFE_IN_H, SPPFE_C25_IC, SPPFE_C25_OC, 1u, 1u, 1u, 0u,
+                               yolo_sppf_e_c25_bias, yolo_sppf_e_c25_mul, yolo_sppf_e_c25_shift,
+                               NPU_CTRL_SILU_EXACT_EN, SPPFE_C25_IC/16u, 16u, 0)) {
+        print_str("  conv25 fail\n"); errors++;
+    }
+    if (errors == 0u) {
+        uint32_t g25 = SPPFE_C25_OC / 16u;
+        maxpool5(S_CV1, S_M0, g25, SPPFE_IN_H, SPPFE_IN_W);
+        maxpool5(S_M0,  S_M1, g25, SPPFE_IN_H, SPPFE_IN_W);
+        maxpool5(S_M1,  S_M2, g25, SPPFE_IN_H, SPPFE_IN_W);
+        concat4(S_CV1, S_M0, S_M1, S_M2, S_CAT, g25, SPPFE_SPATIAL);
+    }
+    yolo_load_silu_lut(yolo_sppf_e_c26_lut);
+    yolo_set_silu_requant(0u, 0u, 0);
+    if (errors == 0u && !yolo_run_conv2d_tiled(S_CAT, WGT_OF(26), WGT_BASE, SPPF_OUT, PAD_ROW,
+                               SPPFE_IN_W, SPPFE_IN_H, SPPFE_C26_IC, SPPFE_C26_OC, 1u, 1u, 1u, 0u,
+                               yolo_sppf_e_c26_bias, yolo_sppf_e_c26_mul, yolo_sppf_e_c26_shift,
+                               NPU_CTRL_SILU_EXACT_EN, SPPFE_C26_IC/16u, 16u, 0)) {
+        print_str("  conv26 fail\n"); errors++;
+    }
+    print_str("  [stage9 SPPF done]\n");
+
+    // ---------- validate SPPF output vs golden (integration; 9-block drift) ----------
+    for (pos = 0u; pos < SPPFE_SPATIAL && errors <= 16u; pos++)
+        for (oc = 0u; oc < SPPFE_C26_OC; oc++) {
+            int32_t got = rs8(SPPF_OUT, (oc>>4)*SPPFE_SPATIAL + pos, oc&15u);
+            int32_t exp = s8(yolo_sppf_e_golden[pos][oc]);
             uint32_t d = ad(got, exp);
             if (d > maxd) maxd = d;
-            if (d > 120u) {   /* integration: 8-block preact-scale drift accumulates */
+            if (d > 120u) {   /* integration: 9-block preact-scale drift accumulates */
                 errors++;
                 if (errors <= 8u) {
                     print_str("  pos="); print_dec(pos); print_str(" oc="); print_dec(oc);
@@ -310,8 +383,8 @@ void usercode7(void)
             }
         }
 
-    print_str("backbone c2f_8 vs golden maxdiff="); print_dec(maxd); print_str("\n");
-    if (errors == 0u) { print_str("YOLO BACKBONE PASS (conv0->...->c2f_8 chained)\n"); return; }
-    print_str("YOLO BACKBONE FAIL errors="); print_dec(errors); print_str("\n");
+    print_str("backbone+SPPF vs golden maxdiff="); print_dec(maxd); print_str("\n");
+    if (errors == 0u) { print_str("YOLO BACKBONE+SPPF PASS (conv0->...->SPPF chained)\n"); return; }
+    print_str("YOLO BACKBONE+SPPF FAIL errors="); print_dec(errors); print_str("\n");
     __asm__ volatile ("ebreak");
 }
