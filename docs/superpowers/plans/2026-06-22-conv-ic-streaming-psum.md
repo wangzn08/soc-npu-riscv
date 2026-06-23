@@ -10,6 +10,32 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-22-conv-ic-streaming-psum-design.md`. Read it first.
 
+## STATUS: FEATURE COMPLETE (2026-06-22) — via CPU accumulate, not HW psum
+The large-IC 3x3 conv works and is verified (c2f8 exact maxdiff=0, c2f4/c2f6/MNIST
+regress clean). It was implemented via **CPU INT32-psum accumulation**, NOT the
+HW Out-SRAM-psum readback this plan specced: hands-on, the HW readback must align
+4 INT32 words to the post_process INPUT stage across the row_par/multi-cycle drain
+(high-risk timing), whereas CPU accumulate needed only a tiny HW change (int32
+sequencer i32_base x4 when cfg_ic_stream) + firmware. See commit c03f2b1 and
+docs/notes/RESUME-yolov8n-soc.md "3x3 LARGE-IC RESOLUTION". The HW-accumulate
+primitives below (Tasks 2-5: post_process ACC modes, acc_mode/psum_rd_base regs,
+CTRL[23]) are committed and OFF-by-default, available as a future perf optimization.
+The original task breakdown is retained below as the design-of-record for that
+optimization.
+
+## STATUS: COMPLETE (2026-06-22) — via CPU-accumulate, not the HW-accumulate spec
+The large-IC 3x3 feature is DONE and verified, but implemented with a SIMPLER, lower-risk
+mechanism than this plan/spec proposed: **CPU INT32-psum accumulate** instead of HW
+post_process accumulate + Out-SRAM readback. Reason: the HW readback timing (4-word INT32
+aligned to the post_process input across the row_par-style drain) was high-risk; the deep
+layers needing large-IC 3x3 are small-spatial, so CPU accumulation is cheap and reliable.
+Implementation: `firmware/yolo_run_conv2d_ic_stream` (yolo_ops.c) + `i32_base` x4 in
+npu_top (commit dbe7fc2). The HW-accumulate primitives below (Tasks 2/5 acc_mode,
+NPU_ACC_MODE/PSUM_RD_BASE, post_process ACC modes + TB) are committed but UNUSED — they
+remain as scaffolding if a future pass wants to move the accumulate into HW for speed.
+Verified: c2f8 exact maxdiff=0, c2f4 maxdiff=0, c2f6 PASS, MNIST 10/10 941,155.
+Commits: 6772ff6, 74e4224, 0a27a20, 72f104f, dbe7fc2, c03f2b1.
+
 ## PROGRESS (2026-06-22, update before resuming)
 - **Task 1 DONE** (commit `6772ff6`): IC-group counters widened (`pf_icg`→[4:0] etc.); MNIST 941,155 byte-identical. NOTE the implementer flagged: `load_tile`/`o_im2col_load_tile` (FSM, [3:0]) were NOT widened — widen them WITH the im2col consumer in Task 5 if streaming needs >16 within-column tiles (3x3 chunk tiles are <=ICG_MAX=4, so likely fine).
 - **Task 2 DONE** (commit `74e4224`): `rtl/post_process_top.v` has `i_acc_mode[1:0]` (0=NONE/1=FIRST/2=ADD/3=FINAL) + `i_psum_readback`; directed TB `tests/tb_post_process_acc.v` PASS; MNIST byte-identical. In `npu_top.v` these are currently tied off: `.i_acc_mode(2'd0)`, `.i_psum_readback({(16*32){1'b0}})` (~line 1051) — Task 5 replaces with FSM-driven values.

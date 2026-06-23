@@ -9,7 +9,10 @@ Core accuracy bottleneck SOLVED (preact-scale SiLU -> 4 boxes, C oracle). **c2f_
 SOLVED (2026-06-22): root cause was PW 1x1 weight-buffer overflow, NOT the doc's old
 "half_groups=2 + exact-SiLU" guess.** Fixed via PW per-IC-group weight streaming
 (icg>ICG_BUF). c2f_4 exact maxdiff=0, c2f_6 PASS, MNIST 10/10 941,155 cyc unchanged.
-**Now blocked at c2f_8 by a SEPARATE pre-existing bug: 3x3 conv non-reuse (icg>4).**
+**3x3 large-IC also SOLVED** (CPU INT32-psum accumulate). c2f8 exact maxdiff=0
+(PW icg16/24 + 3x3 icg8). All C2f blocks (c2f2/4/6/8) now RTL-clean. **Next: assemble
+the full backbone/neck/head chain** (the per-layer datapaths are proven; remaining work
+is firmware assembly + decode + NMS, validated at detection level vs the C oracle).
 
 ## c2f_4 RESOLUTION (done — for history)
 stage-checksum (generator bakes per-stage golden; smoke compares each DDR buffer)
@@ -28,7 +31,22 @@ Fix (user chose "PW weight streaming", no buffer growth):
 Verified: c2f4 exact maxdiff=0; c2f6 legacy PASS (cv2 icg16); c2f8 cv1 icg16 OK;
 MNIST 10/10 941,155 cyc. PW streaming covers icg<=16 (likely 24, not yet reached).
 
-## THE BREAKPOINT (start here) — 3x3 conv large IC (im2col ICG_MAX=4)
+## 3x3 LARGE-IC RESOLUTION (done 2026-06-22 — for history)
+c2f_8 bottleneck 3x3 (half_c=128, icg=8) overflowed the im2col line buffer
+(ICG_MAX=4). SOLVED via **CPU INT32-psum accumulation** (not the HW-accumulate the
+spec first proposed — the HW readback timing was high-risk; CPU is reliable and the
+deep layers are small-spatial). `firmware/yolo_run_conv2d_ic_stream` (yolo_ops.c):
+chunks IC into <=ICG_BUF groups, each chunk a raw-INT32 conv (bias0/mul1/shift0 +
+`NPU_CTRL_INT32_OUT|NPU_CTRL_IC_STREAM` -> x4-spaced Out SRAM, drained to DDR), CPU
+sums chunk partials, then `(acc+bias)*mul>>shift` + exact-SiLU LUT -> INT8. HW change
+was tiny: `npu_top.v` int32 sequencer `i32_base` x4 when `cfg_ic_stream` (commit
+dbe7fc2). c2f runner routes exact 3x3 with `icg>YOLO_ICG_BUF` to it. Scaffolding for
+a future HW-accumulate optimization (CTRL[23] ic_stream FSM input, NPU_ACC_MODE/
+NPU_PSUM_RD_BASE regs, post_process ACC_FIRST/ADD/FINAL + TB) is in place but unused.
+VERIFIED: c2f8 exact maxdiff=0 (covers PW icg16/24 + 3x3 icg8), c2f4 maxdiff=0,
+c2f6 PASS, MNIST 10/10 941,155 byte-identical.
+
+## (OLD) THE BREAKPOINT — 3x3 conv large IC (im2col ICG_MAX=4) [RESOLVED above]
 `yolo_c2f8_320_exact_smoke.c` (stage-checksum, baked, n=1, ~27s sim): **CV1 OK** (cv1
 icg16 PW streaming correct), **ADD0 MISMATCH = all 0x80 (-128, saturated)**. ADD0 =
 residual_add(s1, mcv2), so the bottleneck **3x3 conv (m_cv1/m_cv2, half=128 => icg=8)**
@@ -43,18 +61,18 @@ separate capacity limit (after wgt_buf ICG_BUF, fixed for PW). c2f_8 bottleneck 
 FIRST ever icg>4 3x3 conv (MNIST/conv0-1/c2f2-6 bottlenecks all icg<=4). NOT a
 regression. Firmware IC-tiling can't fix 3x3 (int32_out is FC-single-position only).
 
-### NEXT ACTION (resume here) — needs a DECISION
-Two RTL options for 3x3 large-IC (icg>4); pick one:
-1. Bump `ICG_MAX` in im2col_line_buffer.v (+widen `i_ic_groups` past [3:0]); also the
-   3x3 conv then hits the SAME wgt_buf overflow cv2 had, so re-add the 3x3 arm of the
-   conv2d_tiled streaming (was prototyped then reverted: stream when icg>ICG_BUF, tile
-   OC<=16, drop oc_single + mask row_par). Covers icg up to the new ICG_MAX (<=16 unless
-   counters widened); BRAM cost grows (lb_bank0-3 = 4 x MAX_WIDTH x ICG_MAX x 128b).
-2. im2col IC-streaming: process IC tiles in chunks of <=ICG_MAX, re-load rows per chunk,
-   accumulate in the array across chunks (FSM change, general, no BRAM blowup).
-Affected layers: c2f8 bottleneck (icg8), downsample conv13/conv20 (icg8/16), SPPF, many
-head 3x3. Build/run the isolation smoke (no marker, ~27s):
-`bash run_all.sh sim yolo_c2f8_320_exact_smoke.c yolo_c2f.c yolo_ops.c`.
+### NEXT ACTION (resume here) — assemble the full network
+All per-layer/per-block datapaths are now RTL-clean (conv0/1, c2f2/4/6/8, large-IC PW
+and 3x3). Remaining to run a full image:
+1. Backbone conv0..SPPF chain (extend yolo_full_stem.c). SPPF needs conv25/26 exact +
+   maxpools. Downsample conv13/conv20 are large-IC 3x3 (icg8/16) -> use
+   yolo_run_conv2d_ic_stream (provide a psum_ddr scratch, avoid the DDR image/weight
+   regions). 2. Neck (upsample2x HW + concat + P3/P4/P5). 3. Heads (conv exact + 1x1
+   output convs + DFL conv63). 4. CPU decode (DFL/sigmoid HW exist) + NMS. Validate
+   FINAL boxes vs the C oracle (4 persons), NOT per-layer (LUT SiLU over-constrains).
+Reusable helpers: yolo_run_conv2d_tiled (small-IC + large-IC 1x1 PW streaming),
+yolo_run_conv2d_ic_stream (large-IC 3x3), the c2f runner (yolo_c2f.c), DFL/sigmoid.
+A large-IC 3x3 conv needs a psum_ddr scratch = (out_c/16)*out_w*out_h*4*2 128-bit words.
 
 ## HOW TO BUILD / RUN (Git Bash from repo root)
 - MNIST regression (must stay 10/10): `bash run_all.sh sim`
