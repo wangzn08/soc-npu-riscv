@@ -9,10 +9,11 @@ Core accuracy bottleneck SOLVED (preact-scale SiLU -> 4 boxes, C oracle). **c2f_
 SOLVED (2026-06-22): root cause was PW 1x1 weight-buffer overflow, NOT the doc's old
 "half_groups=2 + exact-SiLU" guess.** Fixed via PW per-IC-group weight streaming
 (icg>ICG_BUF). c2f_4 exact maxdiff=0, c2f_6 PASS, MNIST 10/10 941,155 cyc unchanged.
-**3x3 large-IC also SOLVED** (CPU INT32-psum accumulate). c2f8 exact maxdiff=0
-(PW icg16/24 + 3x3 icg8). All C2f blocks (c2f2/4/6/8) now RTL-clean. **Next: assemble
-the full backbone/neck/head chain** (the per-layer datapaths are proven; remaining work
-is firmware assembly + decode + NMS, validated at detection level vs the C oracle).
+**3x3 large-IC also SOLVED** (CPU INT32-psum accumulate). **FULL CSPDarknet backbone
+(model.0..8) now runs end-to-end on RTL** in `yolo_full_stem.c`: conv0->conv1->c2f2->
+conv6->c2f4->conv13->c2f6->conv20->c2f8, DDR-preloaded image + blob weights + exact-SiLU,
+maxdiff=96 vs c2f8 golden. conv20 (large-IC stride2 3x3) was the last unproven datapath
+-> now validated in-chain. **Next: SPPF (model.9) -> neck -> heads -> CPU decode + NMS.**
 
 ## c2f_4 RESOLUTION (done — for history)
 stage-checksum (generator bakes per-stage golden; smoke compares each DDR buffer)
@@ -61,18 +62,22 @@ separate capacity limit (after wgt_buf ICG_BUF, fixed for PW). c2f_8 bottleneck 
 FIRST ever icg>4 3x3 conv (MNIST/conv0-1/c2f2-6 bottlenecks all icg<=4). NOT a
 regression. Firmware IC-tiling can't fix 3x3 (int32_out is FC-single-position only).
 
-### NEXT ACTION (resume here) — assemble the full network
-All per-layer/per-block datapaths are now RTL-clean (conv0/1, c2f2/4/6/8, large-IC PW
-and 3x3). Remaining to run a full image:
-1. Backbone conv0..SPPF chain (extend yolo_full_stem.c). SPPF needs conv25/26 exact +
-   maxpools. Downsample conv13/conv20 are large-IC 3x3 (icg8/16) -> use
-   yolo_run_conv2d_ic_stream (provide a psum_ddr scratch, avoid the DDR image/weight
-   regions). 2. Neck (upsample2x HW + concat + P3/P4/P5). 3. Heads (conv exact + 1x1
-   output convs + DFL conv63). 4. CPU decode (DFL/sigmoid HW exist) + NMS. Validate
-   FINAL boxes vs the C oracle (4 persons), NOT per-layer (LUT SiLU over-constrains).
-Reusable helpers: yolo_run_conv2d_tiled (small-IC + large-IC 1x1 PW streaming),
-yolo_run_conv2d_ic_stream (large-IC 3x3), the c2f runner (yolo_c2f.c), DFL/sigmoid.
-A large-IC 3x3 conv needs a psum_ddr scratch = (out_c/16)*out_w*out_h*4*2 128-bit words.
+### NEXT ACTION (resume here) — SPPF, then neck/heads/decode
+Full backbone (conv0..c2f8) is DONE in yolo_full_stem.c. Remaining for a full image:
+1. **SPPF (model.9)**: conv25 (1x1, 256->128) -> 3x serial 5x5 maxpool (stride1, pad2,
+   each fed by the previous) -> concat(x, p1, p2, p3 = 512ch) -> conv26 (1x1, 512->256).
+   The NPU has 2x2 pool only; 5x5 maxpool needs either a maxpool helper or CPU. Check
+   yolo_sppf_smoke.c / gen_yolo_sppf_smoke.py (assets exist: yolo_sppf_data.h). conv25/26
+   are 1x1 (cv2 ic=512 -> icg32 PW stream, already supported). Append as stage 9, chain
+   from C2F8_OUT.
+2. Neck: upsample2x (HW yolo_run_upsample2x exists) + concat + 3 more C2f (P3/P4/P5).
+3. Heads: per-scale conv (3x3 exact) + 1x1 cls/reg output convs + DFL conv63.
+4. CPU decode (DFL + sigmoid HW exist) + NMS. Validate FINAL boxes vs C oracle (4 persons),
+   NOT per-layer (LUT SiLU over-constrains).
+Reusable: yolo_run_conv2d_tiled (small-IC + large-IC 1x1 PW stream), yolo_run_conv2d_ic_stream
+(large-IC 3x3, any stride), yolo_run_c2f_block, yolo_run_upsample2x, DFL/sigmoid. Large-IC
+3x3 needs a psum_ddr scratch = (out_c/16)*out_w*out_h*4*2 128-bit words; pick DDR clear of
+the image (0x40400000..0x405A0000) and blob (0x40800000..0x40B01000).
 
 ## HOW TO BUILD / RUN (Git Bash from repo root)
 - MNIST regression (must stay 10/10): `bash run_all.sh sim`
