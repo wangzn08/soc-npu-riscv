@@ -94,7 +94,34 @@ conv35/46 are PAN downsamples (icg4/icg8 3x3 s2 -> conv2d_tiled resident / ic_st
 Head 1x1 out convs (41/42/52/53/61/62/63) are LINEAR (no activation) -> use a linear/INT32
 or no-SiLU requant path. cls/bbox stems (36-40,47-50,57-60) are 3x3 SiLU (some large-IC).
 
-### NEXT ACTION (resume here) — neck (FPN/PAN), then heads/decode
+### STATUS 2026-06-22: model.0-21 (backbone+SPPF+NECK) ALL on RTL
+`yolo_full_stem.c` chains conv0..pan_p3/p4/p5 (the 3 head input features) end-to-end:
+ck SPPF=73, pan_p3=117, pan_p4=63, pan_p5=48 (all <120), 533M cyc, MNIST OK. Neck =
+CPU upsample2/concat2_rq + NECK_C2F macro (c2f_12/15/18/21 shortcut=0) + conv35 (icg4
+s2) + conv46 (icg8 s2 ic_stream). gen_yolo_neck.py emits qparams+goldens. ONLY the
+HEAD (model.22) + decode + NMS remain.
+
+### HEAD recipe + the LINEAR-OUT trick (resume here)
+Head conv dims (ic,oc), all reading pan_p3[40x40x64]/pan_p4[20x20x128]/pan_p5[10x10x256]:
+  bbox stem 36(64,64)/47(128,64)/57(256,64) 3x3; mid 38/49/59(64,64) 3x3; out 41/52/61(64,64) 1x1 LIN
+  cls  stem 37(64,80)/48(128,80)/58(256,80) 3x3; mid 39/50/60(80,80) 3x3; out 42/53/62(80,80) 1x1 LIN
+  DFL conv63(16,1) 1x1.
+Large-IC 3x3 (ic_stream): stems 47/48 (icg8), 57/58 (icg16); cls mids 39/50/60 (icg5).
+Small 3x3 (conv2d_tiled resident): stems 36/37 (icg4), bbox mids 38/49/59 (icg4).
+**LINEAR out convs (41/42/52/53/61/62)**: reuse the EXACT conv path but with STANDARD
+requant qparams (mul=round(in_scale*wscale/out_scale*2^20), bias=round(b/(in_scale*
+wscale))-in_zp*wsum) AND a LINEAR LUT lut[k]=clamp_s8(s8(k)+out_zp). Output int8 then
+dequants in decode as (int8-out_zp)*out_scale. (No int32 path needed.)
+DECODE (CPU): assemble bbox[64,8400]/cls[80,8400] (dequant per scale, anchors P3 6400+
+P4 1600+P5 400 @320 -> /4 = 1600+400+100=2100 anchors); DFL conv63 softmax-expectation
+(4 coords x16 bins, weighted by dequant conv63 w, bias-free, no in_zp); cls sigmoid;
+box decode (anchor center (ax+.5,ay+.5), x1=ax-lt,y1=ay-lt,x2=ax+rb,y2=ay+rb, *stride
+{8,16,32}); NMS conf0.25/nms0.45. Validate FINAL 4 person boxes vs golden
+(preact-scale SoC: (111.1,186.7)(56.1,192.8)(297.1,188.2)(15.3,201.8)). HW dfl_unit+
+sigmoid LUT exist but CPU is simplest. Generator pattern: gen_yolo_neck.py (qparams via
+qp/build_lut; add a qp_std for linear + emit conv63 wscale + strides).
+
+### (older) NEXT ACTION — neck (FPN/PAN), then heads/decode
 Full feature extractor (conv0..SPPF, model.0..9) is DONE in yolo_full_stem.c (stages 0-9).
 SPPF output = SPPF_OUT (0x40780000, 10x10x256). Remaining for a full image:
 1. **Neck (model.10..21, FPN/PAN top-down + bottom-up)**: upsample2x (HW yolo_run_upsample2x
