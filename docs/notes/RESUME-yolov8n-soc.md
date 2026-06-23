@@ -63,6 +63,37 @@ separate capacity limit (after wgt_buf ICG_BUF, fixed for PW). c2f_8 bottleneck 
 FIRST ever icg>4 3x3 conv (MNIST/conv0-1/c2f2-6 bottlenecks all icg<=4). NOT a
 regression. Firmware IC-tiling can't fix 3x3 (int32_out is FC-single-position only).
 
+### FULL NETWORK RECIPE (from C oracle yolov8n_infer.c:585-760 — authoritative)
+Conv indices (blob WGT_OF(ci)); qparams (bias/mul/shift/LUT) generate from meta+weights
+via gen_yolo_c2f_exact.qp()+build_lut() (NO dump needed for qparams; dumps only for a
+per-stage golden). SoC dims @320 = half the oracle's 640 comments (P3=40x40, P4=20x20,
+P5=10x10). Neck C2f use cfg.shortcut=0. Neck concats are NOT scale-preserving -> requant
+each part to the target conv's in_scale (concat2_to_conv): mul_part=(part_out_scale/
+target_in_scale)*2^shift, like the C2f cat. Backbone taps to SAVE before overwrite:
+P4tap=c2f6 out (conv19, =C2F6_OUT 0x40F90000), P3tap=c2f4 out (conv12, =C2F4_OUT
+0x40E80000), P5tap=c2f8 out (conv24, =C2F8_OUT 0x406C0000).
+```
+FPN:  up1=upsample2x(SPPF_OUT 10x10x256); cat1=concat2_rq(up1, P4tap[c2f6], ->conv27.in)
+      c2f_12 {cv1=27, m={28}, m2={29}, cv2=30, n=1, sc=0} -> fpn_mid 20x20x128
+      up2=upsample2x(fpn_mid); cat2=concat2_rq(up2, P3tap[c2f4], ->conv31.in)
+      c2f_15 {cv1=31, m={32}, m2={33}, cv2=34, n=1, sc=0} -> pan_p3 40x40x64  [HEAD P3]
+PAN:  conv35(pan_p3, 3x3 s2)->20x20x64; cat3=concat2_rq(conv35, fpn_mid, ->conv40.in)
+      c2f_18 {cv1=40, m={43}, m2={44}, cv2=45, n=1, sc=0} -> pan_p4 20x20x128 [HEAD P4]
+      conv46(pan_p4, 3x3 s2)->10x10x128; cat4=concat2_rq(conv46, P5tap[c2f8], ->conv51.in)
+      c2f_21 {cv1=51, m={54}, m2={55}, cv2=56, n=1, sc=0} -> pan_p5 10x10x256 [HEAD P5]
+HEAD (model.22), per scale bbox(64ch)+cls(80ch), each = 3x3 stem -> 3x3 mid -> 1x1 out(linear):
+      P3(pan_p3): bbox=36->38->41, cls=37->39->42
+      P4(pan_p4): bbox=47->49->52, cls=48->50->53
+      P5(pan_p5): bbox=57->59->61, cls=58->60->62   (1x1 out convs are LINEAR: no SiLU)
+DECODE: concat 3 scales -> bbox[64,8400]/cls[80,8400]; DFL conv63 (16->1, bias-free,
+      softmax-expectation over 16 bins, weighted by dequant conv63 w) -> [4,8400];
+      cls sigmoid; box decode (anchor center +-dist, grid units * stride); NMS conf0.25/nms0.45.
+      HW dfl_unit + sigmoid LUT exist; or CPU. Validate FINAL 4 person boxes vs C oracle.
+```
+conv35/46 are PAN downsamples (icg4/icg8 3x3 s2 -> conv2d_tiled resident / ic_stream).
+Head 1x1 out convs (41/42/52/53/61/62/63) are LINEAR (no activation) -> use a linear/INT32
+or no-SiLU requant path. cls/bbox stems (36-40,47-50,57-60) are 3x3 SiLU (some large-IC).
+
 ### NEXT ACTION (resume here) — neck (FPN/PAN), then heads/decode
 Full feature extractor (conv0..SPPF, model.0..9) is DONE in yolo_full_stem.c (stages 0-9).
 SPPF output = SPPF_OUT (0x40780000, 10x10x256). Remaining for a full image:
