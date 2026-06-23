@@ -4,6 +4,19 @@ Branch: `codex/yolov8n-rtl-m0`. Last commit before this doc: `08b78fd`.
 Read also: `CLAUDE.md`, `docs/notes/yolov8n-320-golden.md` (full detail/history),
 memory `soc-silu-lut-range-gap.md`.
 
+## DONE (2026-06-23): FULL YOLOv8n on-SoC -> 4 boxes match C oracle
+`yolo_full_stem.c` runs the WHOLE net (conv0..head, model.0-22 + DFL/sigmoid/decode/
+NMS on CPU) end-to-end on RTL with the DDR-preloaded bus320 image: `head dets=32,
+golden-matched=4/4`, `YOLO FULL NET PASS`, 680M cyc (~3.4ms/img @200MHz, unoptimized).
+KEY final fix: integer requant FLOOR bias accumulated over the deep chain and
+collapsed detection confidence (P4 person 0.116). Folding rounding into the bias
+(+round(2^(Q-1)/mul) in every exact generator) + concat/ratio requant +half restored
+it (0.794 ~= oracle 0.755). RTL is UNCHANGED (still floors); only generated qparams +
+CPU concat round. Soft-float decode links via `-lgcc` (run_all.sh). All datapaths
+proven: large-IC PW (icg<=32) + 3x3 ic_stream (any stride) + neck FPN/PAN + head +
+linear-out (exact path + linear LUT). MNIST baseline 10/10 / 941,155 cyc preserved.
+Remaining = performance (on-chip residency, HW concat/upsample, fewer MMIO) + report.
+
 ## ONE-LINE STATUS
 Core accuracy bottleneck SOLVED (preact-scale SiLU -> 4 boxes, C oracle). **c2f_4
 SOLVED (2026-06-22): root cause was PW 1x1 weight-buffer overflow, NOT the doc's old
