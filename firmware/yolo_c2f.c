@@ -133,7 +133,7 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
             if (bn_stream) {
                 if (!yolo_run_conv2d_ic_stream(prev_ddr, wd, WGT_BASE, cfg->bn_out_ddr,
                                        cfg->psum_ddr, cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
-                                       cfg->full_c/2u, cfg->full_c/2u, 3u, 3u, 1u,
+                                       cfg->full_c/2u, cfg->full_c/2u, 3u, 3u, 1u, 1u,
                                        cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
                                        cfg->mcv1_silu_lut[i], cfg->mcv1_pad_value[i]))
                     return 0;
@@ -158,7 +158,7 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
             if (bn_stream) {
                 if (!yolo_run_conv2d_ic_stream(cfg->bn_out_ddr, wd, WGT_BASE, cfg->mcv2_ddr,
                                        cfg->psum_ddr, cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
-                                       cfg->full_c/2u, cfg->full_c/2u, 3u, 3u, 1u,
+                                       cfg->full_c/2u, cfg->full_c/2u, 3u, 3u, 1u, 1u,
                                        cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
                                        cfg->mcv2_silu_lut[i], cfg->mcv2_pad_value[i]))
                     return 0;

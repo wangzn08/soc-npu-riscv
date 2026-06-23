@@ -92,7 +92,7 @@ int yolo_run_conv2d_tiled(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_ba
 int yolo_run_conv2d_ic_stream(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_base,
                               uint32_t out_ddr, uint32_t psum_ddr, uint32_t pad_row_ddr,
                               uint32_t in_w, uint32_t in_h, uint32_t in_c, uint32_t out_c,
-                              uint32_t kernel_h, uint32_t kernel_w, uint32_t pad,
+                              uint32_t kernel_h, uint32_t kernel_w, uint32_t stride, uint32_t pad,
                               const int32_t *bias, const uint32_t *scale_mul,
                               const uint32_t *scale_shift, const uint8_t *silu_lut,
                               int32_t pad_value);

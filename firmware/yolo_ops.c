@@ -553,7 +553,7 @@ static const uint32_t YOLO_ZERO_SHIFT[16] = {0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u
 int yolo_run_conv2d_ic_stream(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wgt_base,
                               uint32_t out_ddr, uint32_t psum_ddr, uint32_t pad_row_ddr,
                               uint32_t in_w, uint32_t in_h, uint32_t in_c, uint32_t out_c,
-                              uint32_t kernel_h, uint32_t kernel_w, uint32_t pad,
+                              uint32_t kernel_h, uint32_t kernel_w, uint32_t stride, uint32_t pad,
                               const int32_t *bias, const uint32_t *scale_mul,
                               const uint32_t *scale_shift, const uint8_t *silu_lut,
                               int32_t pad_value)
@@ -566,11 +566,11 @@ int yolo_run_conv2d_ic_stream(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wg
     uint32_t acc_words, acc_i32, temp_ddr;
 
     if (icg == 0u || in_w == 0u || in_h == 0u || out_c == 0u || (out_c & 15u) != 0u ||
-        kernel_h == 0u || kernel_w == 0u)
+        kernel_h == 0u || kernel_w == 0u || stride == 0u)
         return 0;
 
-    out_w = in_w + 2u * pad - kernel_w + 1u;
-    out_h = in_h + 2u * pad - kernel_h + 1u;
+    out_w = (in_w + 2u * pad - kernel_w) / stride + 1u;
+    out_h = (in_h + 2u * pad - kernel_h) / stride + 1u;
     out_sp = out_w * out_h;
     ocg_total = out_c / 16u;
     nchunks = (icg + YOLO_ICG_BUF - 1u) / YOLO_ICG_BUF;
@@ -593,7 +593,7 @@ int yolo_run_conv2d_ic_stream(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wg
         uint32_t cic  = cicg * 16u;
         uint32_t wpoc_chunk = cicg * ko;
         uint32_t dst_psum = (c == 0u) ? psum_ddr : temp_ddr;
-        uint32_t strip_in_h = (out_h - 1u) + kernel_h;   /* stride 1 */
+        uint32_t strip_in_h = (out_h - 1u) * stride + kernel_h;
         int32_t  ir0 = -(int32_t)pad;
 
         /* Stage this chunk's IC groups (tile-major) into Act SRAM with vertical pad. */
@@ -618,7 +618,7 @@ int yolo_run_conv2d_ic_stream(uint32_t in_ddr, uint32_t wgt_all_ddr, uint32_t wg
                     return 0;
             }
             if (!yolo_run_conv2d_qparams_pads(0u, wgt_base, 0u, in_w, strip_in_h, cic, 16u,
-                                              kernel_h, kernel_w, 1u, 0u, pad,
+                                              kernel_h, kernel_w, stride, 0u, pad,
                                               YOLO_ZERO_BIAS, YOLO_UNIT_MUL, YOLO_ZERO_SHIFT,
                                               NPU_CTRL_INT32_OUT | NPU_CTRL_IC_STREAM))
                 return 0;
