@@ -596,7 +596,7 @@ module npu_top #(
     wire [ACT_DATA_W-1:0]       fsm_im2col_pixel_data;
     wire                        fsm_im2col_pixel_vld;
     wire                        fsm_border;
-    wire [3:0]                  fsm_im2col_load_tile;
+    wire [4:0]                  fsm_im2col_load_tile;
     wire [15:0]                 fsm_im2col_group_base;
     wire                        fsm_im2col_sweep_advance;
     wire                        fsm_im2col_win_vld;
@@ -814,20 +814,20 @@ module npu_top #(
     // During CALC the systolic reads the window for the current IC tile.
     // ic_groups==1 → identical to the original single-tile design.
     // -----------------------------------------------------------------
-    localparam ICG_MAX = 8;  // im2col window holds 8 IC tiles (128 ch): lets icg<=8 3x3
+    localparam ICG_MAX = 16; // im2col window holds 16 IC tiles (256 ch): lets icg<=16 3x3
                              // convs run the resident path instead of CPU ic_stream psum.
-    wire [3:0] cfg_ic_groups = (cfg_dim_in_c + 16'd15) >> 4;  // 1..ICG_MAX
+    wire [4:0] cfg_ic_groups = (cfg_dim_in_c + 16'd15) >> 4;  // 1..ICG_MAX
 
     // SRAM Read Latency Compensation
     reg fsm_im2col_pixel_vld_d;
     reg fsm_im2col_win_advance_d;
-    reg [3:0] fsm_im2col_load_tile_d;
+    reg [4:0] fsm_im2col_load_tile_d;
     reg fsm_border_d;   // hw-pad border flag, delayed to match the 1-cycle SRAM read
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             fsm_im2col_pixel_vld_d   <= 1'b0;
             fsm_im2col_win_advance_d <= 1'b0;
-            fsm_im2col_load_tile_d   <= 4'd0;
+            fsm_im2col_load_tile_d   <= 5'd0;
             fsm_border_d             <= 1'b0;
         end else begin
             fsm_im2col_pixel_vld_d   <= fsm_im2col_pixel_vld;
@@ -852,7 +852,7 @@ module npu_top #(
         .i_pixel_vld     (fsm_im2col_pixel_vld_d),
         .i_pixel_tile    (fsm_im2col_load_tile_d),
         .i_ic_groups     (cfg_ic_groups),
-        .i_win_tile      (fsm_cur_ic_tile[7:4]),
+        .i_win_tile      ({1'b0, fsm_cur_ic_tile[7:4]}),
         .i_width         (cfg_dim_in_w),
         .i_height        (cfg_dim_in_h),
         .i_row_start     (fsm_im2col_row_start),

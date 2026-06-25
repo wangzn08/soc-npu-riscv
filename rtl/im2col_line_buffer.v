@@ -34,9 +34,9 @@ module im2col_line_buffer #(
     // Pixel input stream (from Act SRAM)
     input  wire [ACT_GROUP_W-1:0]       i_pixel_data,
     input  wire                         i_pixel_vld,
-    input  wire [3:0]                   i_pixel_tile,   // IC tile of this pixel
-    input  wire [3:0]                   i_ic_groups,    // number of IC tiles (1..ICG_MAX)
-    input  wire [3:0]                   i_win_tile,     // IC tile whose window to output
+    input  wire [4:0]                   i_pixel_tile,   // IC tile of this pixel
+    input  wire [4:0]                   i_ic_groups,    // number of IC tiles (1..ICG_MAX)
+    input  wire [4:0]                   i_win_tile,     // IC tile whose window to output
 
     // Feature map geometry
     input  wire [15:0]                  i_width,
@@ -92,7 +92,7 @@ module im2col_line_buffer #(
     reg win_valid;
 
     // Column complete = last IC tile of the column being streamed
-    wire col_complete = i_pixel_vld && (i_pixel_tile == (i_ic_groups - 4'd1));
+    wire col_complete = i_pixel_vld && (i_pixel_tile == (i_ic_groups - 5'd1));
 
     integer init_i, init_g, gg, wr, wc;
 

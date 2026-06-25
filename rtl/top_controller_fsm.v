@@ -75,7 +75,7 @@ module top_controller_fsm #(
     output wire [DATA_W-1:0]        o_im2col_pixel_data,
     output wire                     o_im2col_pixel_vld,
     output wire                     o_border,             // hw-pad: current pixel is a border zero
-    output wire [3:0]               o_im2col_load_tile,   // IC tile being streamed during LOAD_ROW
+    output wire [4:0]               o_im2col_load_tile,   // IC tile being streamed during LOAD_ROW
     output wire [15:0]              o_im2col_group_base,  // first output column of the current 16-wide group
     output wire [15:0]              o_group_size,
     output wire [3:0]               o_rows_per_grp,   // #4: R output rows packed (1 = byte-identical)
@@ -171,7 +171,7 @@ module top_controller_fsm #(
     reg [15:0] load_col_cnt;  // Column load counter
     reg [15:0] pf_wait_cnt;   // Pre-fetch wait counter
     reg [15:0] row_base_in_row; // Starting cur_in_row for current output row
-    reg [3:0]  load_tile;     // Current IC tile being streamed within a column (0..ic_groups-1)
+    reg [4:0]  load_tile;     // Current IC tile being streamed within a column (0..ic_groups-1)
     reg        wgt_loaded;    // 1 = this OC tile's weights are resident in wgt_buf (reuse mode)
     reg [2:0]  oc_t;          // decision O: active OC-tile in the oc_single OC-inner loop
 
@@ -195,7 +195,7 @@ module top_controller_fsm #(
     // Weight-prefetch reuse: when a whole OC tile's weights fit the on-chip
     // buffer (ic_groups <= ICG_BUF), prefetch once per OC tile and reuse across
     // the spatial sweep. General over any model; GEMM excluded (handled separately).
-    localparam ICG_BUF          = 4;
+    localparam ICG_BUF          = 16; // 8->16: lets 256-channel 3x3 layers use resident reuse mode
     localparam WGT_REUSE_SETTLE = 16'd2;  // im2col window settle when skipping prefetch
     // pointwise reuses weights across the spatial sweep (1x1 weights are position
     // independent), so it joins the per-OC-tile reuse path like conv ic_groups<=4.
@@ -246,7 +246,7 @@ module top_controller_fsm #(
     assign act_rd_addr = act_base_addr
                        + cur_in_row * act_row_stride
                        + cur_in_col * ic_groups
-                       + load_tile;   // stream each IC tile of the column
+                       + load_tile[3:0];   // stream each IC tile of the column
 
     // GEMM: input vector word index = ic_tile/16 (ceil(IC/16) words at act_base)
     wire [SRAM_ADDR_W-1:0] gemm_act_addr;
@@ -406,7 +406,7 @@ module top_controller_fsm #(
             load_col_cnt <= 16'd0;
             pf_wait_cnt  <= 16'd0;
             row_base_in_row <= 16'd0;
-            load_tile    <= 4'd0;
+            load_tile    <= 5'd0;
             win_step_cnt <= 8'd0;
             wgt_loaded   <= 1'b0;
             oc_t         <= 3'd0;
@@ -444,7 +444,7 @@ module top_controller_fsm #(
                         drain_cnt  <= 5'd0;
                         pf_wait_cnt<= 16'd0;
                         row_base_in_row <= 16'd0;
-                        load_tile  <= 4'd0;
+                        load_tile  <= 5'd0;
                         wgt_loaded <= 1'b0;   // force first prefetch of this layer
                         oc_t       <= 3'd0;   // decision O: start OC-inner loop at tile 0
                         super_step <= 4'd0;
@@ -473,16 +473,16 @@ module top_controller_fsm #(
                         if (load_col_cnt == 16'd0) begin
                             load_col_cnt <= 16'd1;
                         end else if ({12'd0, load_tile} >= ic_groups - 16'd1) begin
-                            load_tile  <= 4'd0;
+                            load_tile  <= 5'd0;
                             cur_in_col <= cur_in_col + 16'd1;
                         end else begin
-                            load_tile  <= load_tile + 4'd1;
+                            load_tile  <= load_tile + 5'd1;
                         end
                     end else begin
                         // Row complete
                         cur_in_col   <= 16'd0;
                         load_col_cnt <= 16'd0;
-                        load_tile    <= 4'd0;
+                        load_tile    <= 5'd0;
                         // After loading enough rows (≥ kernel height),
                         // transition to window processing.
                         // IMPORTANT: do NOT increment cur_in_row here —

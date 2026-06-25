@@ -9,7 +9,7 @@
  * (yolo_run_conv2d_tiled), 3x3 streams via INT32 psum accumulate
  * (yolo_run_conv2d_ic_stream). Keep in sync with rtl/wgt_reader.v ICG_BUF and
  * rtl/im2col_line_buffer.v ICG_MAX. */
-#define YOLO_ICG_BUF 8u
+#define YOLO_ICG_BUF 16u
 
 int yolo_dma_ddr_to_act(uint32_t ddr_addr, uint32_t act_base, uint32_t words);
 int yolo_dma_ddr_to_wgt(uint32_t ddr_addr, uint32_t wgt_base, uint32_t words);

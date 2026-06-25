@@ -30,7 +30,8 @@ module wgt_reader #(
     parameter WGT_BUS_W      = NUM_OC * WGT_GROUP_W,      // 2048
     parameter SRAM_ADDR_W    = 14,
     parameter IC_GROUPS_MAX  = 64,   // max IC groups (1024 ch / 16)
-    parameter ICG_BUF        = 4,    // IC-tiles held on-chip for per-OC-tile reuse
+    parameter ICG_BUF        = 16,   // IC-tiles held on-chip for per-OC-tile reuse
+                                     // (8->16: matches im2col ICG_MAX so icg<=16 3x3 is resident)
     parameter MAX_OC_RESIDENT = 64,  // decision O: all-OC-tiles held on-chip (OC tiles × 16)
     parameter OC_TILES_W     = 3     // width of OC-tile counter (1..MAX_OC_RESIDENT/16)
 ) (
