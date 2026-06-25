@@ -94,10 +94,17 @@ void usercode7(void);
 #define NPU_DMA_EXPAND_TRIG  (NPU_BASE + 0x158)  // write any value: trigger img_expand
 #define NPU_UPSAMPLE_CFG0    (NPU_BASE + 0x3C0)  // [31:16]in_h [15:0]in_w for shared Act-SRAM 2x upsample
 #define NPU_UPSAMPLE_CFG1    (NPU_BASE + 0x3C4)  // [15:0]ic_groups for shared Act-SRAM 2x upsample
-#define NPU_DMA_UPSAMPLE_TRIG (NPU_BASE + 0x3C8) // write any value: trigger upsample2x
+#define NPU_DMA_UPSAMPLE_TRIG (NPU_BASE + 0x3C8) // write bit0: upsample2x, bit1: maxpool5x5, bit2: eltwise_add
 #define NPU_SILU_REQUANT_CFG (NPU_BASE + 0x3CC)  // [31:24]zp [21:16]shift [15:0]mul; optional SiLU output requant
 #define NPU_PAD_VALUE         (NPU_BASE + 0x3D0)  // [7:0] hardware padding fill byte, default 0
-#define NPU_ELTWISE_ZP        (NPU_BASE + 0x3D4)  // [7:0] glue zero-point for signed eltwise add (CTRL[20])
+#define NPU_ELTWISE_ZP        (NPU_BASE + 0x3D4)  // packed signed-eltwise residual cfg (CTRL[20]):
+                                                  //  [7:0]=glue zp, [13:8]=ratio_shift,
+                                                  //  [14]=ratio_en, [31:15]=ratio_mul (17b)
+// Build the packed NPU_ELTWISE_ZP value. ratio_en=0 -> legacy signed (skip - zp).
+// ratio_en=1 -> skip rescaled: ((skip-zp)*mul + round)>>sh  (YOLO C2f true residual).
+#define NPU_ELT_PACK(zp, ratio_en, ratio_sh, ratio_mul) \
+    ( ((uint32_t)(zp) & 0xFFu) | (((uint32_t)(ratio_sh) & 0x3Fu) << 8) | \
+      (((uint32_t)(ratio_en) & 0x1u) << 14) | (((uint32_t)(ratio_mul) & 0x1FFFFu) << 15) )
 #define NPU_DFL_SRC           (NPU_BASE + 0x3D8)  // DFL src Act-SRAM word base
 #define NPU_DFL_DST           (NPU_BASE + 0x3DC)  // DFL dst Act-SRAM word base
 #define NPU_DFL_CNT           (NPU_BASE + 0x3E0)  // DFL input word count (anchors*4)
@@ -114,6 +121,8 @@ void usercode7(void);
 #define NPU_DMA_STATUS_EXPAND_DONE (1 << 3)
 #define NPU_DMA_STATUS_UPSAMPLE_DONE (1 << 4)
 #define NPU_DMA_STATUS_DFL_DONE    (1 << 5)
+#define NPU_DMA_STATUS_MAXPOOL5_DONE (1 << 6)
+#define NPU_DMA_STATUS_ELTWISE_DONE (1 << 7)
 
 // CTRL bits
 #define NPU_CTRL_START      (1 << 0)

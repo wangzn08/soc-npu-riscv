@@ -12,6 +12,7 @@
 #define YOLO_DMA_TIMEOUT 4000000u
 #define YOLO_NPU_TIMEOUT 60000000u   /* big 320 layers (ic128/oc256, no row_par) run many M cycles */
 #define YOLO_DMA_MAX_BEATS 256u
+#define YOLO_ACT_SRAM_WORDS 16384u
 
 static inline void npu_wr(uint32_t addr, uint32_t data)
 {
@@ -202,6 +203,91 @@ int yolo_run_upsample2x(uint32_t src_act_base,
     return wait_dma_status(NPU_DMA_STATUS_UPSAMPLE_DONE);
 }
 
+int yolo_run_upsample2x_ddr(uint32_t src_ddr,
+                            uint32_t dst_ddr,
+                            uint32_t scratch_act_base,
+                            uint32_t in_w,
+                            uint32_t in_h,
+                            uint32_t ic_groups)
+{
+    uint32_t in_words = in_w * in_h * ic_groups;
+    uint32_t out_words = in_words * 4u;
+    uint32_t src_act_base = scratch_act_base + out_words;
+
+    if (in_w == 0u || in_h == 0u || ic_groups == 0u)
+        return 0;
+    if (src_act_base + in_words > YOLO_ACT_SRAM_WORDS)
+        return 0;
+
+    if (!yolo_dma_ddr_to_act(src_ddr, src_act_base, in_words))
+        return 0;
+    if (!yolo_run_upsample2x(src_act_base, scratch_act_base, in_w, in_h, ic_groups))
+        return 0;
+
+    return yolo_dma_act_to_ddr(dst_ddr, scratch_act_base, out_words);
+}
+
+int yolo_copy_ddr_to_ddr_via_act(uint32_t src_ddr,
+                                 uint32_t dst_ddr,
+                                 uint32_t scratch_act_base,
+                                 uint32_t words)
+{
+    uint32_t done = 0u;
+
+    if (words == 0u)
+        return 1;
+    if (scratch_act_base >= YOLO_ACT_SRAM_WORDS)
+        return 0;
+
+    while (done < words) {
+        uint32_t cap = YOLO_ACT_SRAM_WORDS - scratch_act_base;
+        uint32_t chunk = words - done;
+        if (chunk > YOLO_DMA_MAX_BEATS)
+            chunk = YOLO_DMA_MAX_BEATS;
+        if (chunk > cap)
+            chunk = cap;
+        if (chunk == 0u)
+            return 0;
+
+        if (!yolo_dma_ddr_to_act(src_ddr + done * 16u, scratch_act_base, chunk))
+            return 0;
+        if (!yolo_dma_act_to_ddr(dst_ddr + done * 16u, scratch_act_base, chunk))
+            return 0;
+
+        done += chunk;
+    }
+
+    return 1;
+}
+
+int yolo_run_maxpool5x5(uint32_t src_ddr,
+                        uint32_t dst_ddr,
+                        uint32_t scratch_act_base,
+                        uint32_t in_w,
+                        uint32_t in_h,
+                        uint32_t ic_groups)
+{
+    uint32_t words = in_w * in_h * ic_groups;
+    uint32_t dst_act_base = scratch_act_base + words;
+
+    if (in_w == 0u || in_h == 0u || ic_groups == 0u)
+        return 1;
+
+    if (!yolo_dma_ddr_to_act(src_ddr, scratch_act_base, words))
+        return 0;
+
+    npu_wr(NPU_DMA_RD_SRAM_BASE, scratch_act_base);
+    npu_wr(NPU_DMA_WR_SRAM_BASE, dst_act_base);
+    npu_wr(NPU_UPSAMPLE_CFG0, (in_h << 16) | in_w);
+    npu_wr(NPU_UPSAMPLE_CFG1, ic_groups);
+    npu_wr(NPU_DMA_UPSAMPLE_TRIG, 2u);
+
+    if (!wait_dma_status(NPU_DMA_STATUS_MAXPOOL5_DONE))
+        return 0;
+
+    return yolo_dma_act_to_ddr(dst_ddr, dst_act_base, words);
+}
+
 void yolo_set_silu_requant(uint32_t mul, uint32_t shift, int32_t zp)
 {
     npu_wr(NPU_SILU_REQUANT_CFG,
@@ -236,6 +322,75 @@ int yolo_run_dfl(uint32_t src, uint32_t dst, uint32_t n)
     npu_wr(NPU_DFL_CNT, n);
     npu_wr(NPU_DFL_TRIG, 1u);
     return wait_dma_status(NPU_DMA_STATUS_DFL_DONE);
+}
+
+int yolo_run_dfl_ddr(uint32_t src_ddr,
+                     uint32_t dst_ddr,
+                     uint32_t scratch_act_base,
+                     uint32_t in_words)
+{
+    uint32_t out_words = in_words >> 2;
+    uint32_t dst_act_base = scratch_act_base + in_words;
+
+    if (in_words == 0u)
+        return 1;
+    if ((in_words & 3u) != 0u)
+        return 0;
+
+    if (!yolo_dma_ddr_to_act(src_ddr, scratch_act_base, in_words))
+        return 0;
+    if (!yolo_run_dfl(scratch_act_base, dst_act_base, in_words))
+        return 0;
+    return yolo_dma_act_to_ddr(dst_ddr, dst_act_base, out_words);
+}
+
+int yolo_run_eltwise_add_ddr(uint32_t src0_ddr,
+                             uint32_t src1_ddr,
+                             uint32_t dst_ddr,
+                             uint32_t scratch_act_base,
+                             uint32_t words,
+                             int32_t zp,
+                             uint32_t ratio_en,
+                             uint32_t ratio_mul,
+                             uint32_t ratio_shift)
+{
+    uint32_t done = 0u;
+    const uint32_t max_chunk = 4096u;
+
+    if (words == 0u)
+        return 1;
+
+    while (done < words) {
+        uint32_t chunk = words - done;
+        uint32_t src1_act;
+        uint32_t dst_act;
+
+        if (chunk > max_chunk)
+            chunk = max_chunk;
+        src1_act = scratch_act_base + chunk;
+        dst_act = src1_act + chunk;
+
+        if (!yolo_dma_ddr_to_act(src0_ddr + done * 16u, scratch_act_base, chunk))
+            return 0;
+        if (!yolo_dma_ddr_to_act(src1_ddr + done * 16u, src1_act, chunk))
+            return 0;
+
+        npu_wr(NPU_DMA_RD_SRAM_BASE, scratch_act_base);
+        npu_wr(NPU_SKIP_BASE, src1_act);
+        npu_wr(NPU_DMA_WR_SRAM_BASE, dst_act);
+        npu_wr(NPU_DMA_RD_LEN, chunk);
+        npu_wr(NPU_ELTWISE_ZP, NPU_ELT_PACK((uint32_t)zp, ratio_en, ratio_shift, ratio_mul));
+        npu_wr(NPU_DMA_UPSAMPLE_TRIG, 4u);
+
+        if (!wait_dma_status(NPU_DMA_STATUS_ELTWISE_DONE))
+            return 0;
+        if (!yolo_dma_act_to_ddr(dst_ddr + done * 16u, dst_act, chunk))
+            return 0;
+
+        done += chunk;
+    }
+
+    return 1;
 }
 
 void yolo_load_sigmoid_lut(const uint8_t p[256])

@@ -9,7 +9,7 @@
  * (yolo_run_conv2d_tiled), 3x3 streams via INT32 psum accumulate
  * (yolo_run_conv2d_ic_stream). Keep in sync with rtl/wgt_reader.v ICG_BUF and
  * rtl/im2col_line_buffer.v ICG_MAX. */
-#define YOLO_ICG_BUF 4u
+#define YOLO_ICG_BUF 8u
 
 int yolo_dma_ddr_to_act(uint32_t ddr_addr, uint32_t act_base, uint32_t words);
 int yolo_dma_ddr_to_wgt(uint32_t ddr_addr, uint32_t wgt_base, uint32_t words);
@@ -34,12 +34,41 @@ int yolo_run_upsample2x(uint32_t src_act_base,
                         uint32_t in_w,
                         uint32_t in_h,
                         uint32_t ic_groups);
+int yolo_run_upsample2x_ddr(uint32_t src_ddr,
+                            uint32_t dst_ddr,
+                            uint32_t scratch_act_base,
+                            uint32_t in_w,
+                            uint32_t in_h,
+                            uint32_t ic_groups);
+int yolo_copy_ddr_to_ddr_via_act(uint32_t src_ddr,
+                                 uint32_t dst_ddr,
+                                 uint32_t scratch_act_base,
+                                 uint32_t words);
+int yolo_run_maxpool5x5(uint32_t src_ddr,
+                        uint32_t dst_ddr,
+                        uint32_t scratch_act_base,
+                        uint32_t in_w,
+                        uint32_t in_h,
+                        uint32_t ic_groups);
 void yolo_set_silu_requant(uint32_t mul, uint32_t shift, int32_t zp);
 
 // Detect-head decode helpers (DFL expectation engine + sigmoid LUT).
 void yolo_dfl_load_weights(const int16_t wk_q8_8[16]);    // conv63 W_k = wscale*w[k]
 void yolo_dfl_load_exp_lut(const uint16_t exp_q1_15[256]); // per-scale exp table
 int  yolo_run_dfl(uint32_t src_act_base, uint32_t dst_act_base, uint32_t in_words);
+int  yolo_run_dfl_ddr(uint32_t src_ddr,
+                      uint32_t dst_ddr,
+                      uint32_t scratch_act_base,
+                      uint32_t in_words);
+int  yolo_run_eltwise_add_ddr(uint32_t src0_ddr,
+                              uint32_t src1_ddr,
+                              uint32_t dst_ddr,
+                              uint32_t scratch_act_base,
+                              uint32_t words,
+                              int32_t zp,
+                              uint32_t ratio_en,
+                              uint32_t ratio_mul,
+                              uint32_t ratio_shift);
 void yolo_load_sigmoid_lut(const uint8_t prob_q0_8[256]);  // per-scale cls sigmoid
 void yolo_load_silu_lut(const uint8_t silu_q8[256]);       // per-layer exact SiLU (out-grid)
 void yolo_set_pad_value(int32_t pad_value);

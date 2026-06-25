@@ -108,7 +108,10 @@ module param_regfile #(
     output wire [1:0]                   o_acc_mode,      // NPU_ACC_MODE (0x3F8): INT32 psum accumulate (0=NONE,1=FIRST,2=ADD,3=FINAL)
     output wire [SRAM_ADDR_W-1:0]       o_psum_rd_base,  // NPU_PSUM_RD_BASE (0x3FC): Out-SRAM INT32 psum readback base (ADD/FINAL)
     output wire                         o_elt_signed,    // CTRL[20]: signed INT8 + zero-point eltwise add (YOLO C2f residual)
-    output wire [7:0]                   o_elt_zp,        // NPU_ELTWISE_ZP (0x3D4): glue zero-point for signed eltwise add
+    output wire [7:0]                   o_elt_zp,        // NPU_ELTWISE_ZP (0x3D4)[7:0]: glue zero-point for signed eltwise add
+    output wire                         o_elt_ratio_en,  // 0x3D4[14]: apply ratio rescale to skip (YOLO C2f true residual)
+    output wire [16:0]                  o_elt_ratio_mul, // 0x3D4[31:15]: skip rescale multiplier
+    output wire [5:0]                   o_elt_ratio_shift,// 0x3D4[13:8]: skip rescale right-shift (round-half)
 
     // YOLO detect-head decode: DFL expectation engine + sigmoid LUT
     output wire [SRAM_ADDR_W-1:0]       o_dfl_src,       // 0x3D8: DFL src Act-SRAM word base
@@ -211,6 +214,10 @@ module param_regfile #(
     output wire                         o_upsample_trig,    // 0x3C8 write: pulse to start Act-SRAM 2x upsample
     input  wire                         i_upsample_done,    // upsample2x: completion (level), exposed in STATUS[4]
     input  wire                         i_dfl_done,         // dfl_unit: completion (level), exposed in STATUS[5]
+    output wire                         o_maxpool5_trig,    // 0x3C8[1] write: pulse to start Act-SRAM 5x5 maxpool
+    input  wire                         i_maxpool5_done,    // maxpool5x5: completion (level), exposed in STATUS[6]
+    output wire                         o_eltwise_trig,     // 0x3C8[2] write: pulse to start standalone signed eltwise add
+    input  wire                         i_eltwise_done,     // eltwise_add_engine: completion (level), exposed in STATUS[7]
     output wire [15:0]                  o_upsample_in_w,    // 0x3C0[15:0]
     output wire [15:0]                  o_upsample_in_h,    // 0x3C0[31:16]
     output wire [15:0]                  o_upsample_ic_groups, // 0x3C4[15:0]
@@ -260,7 +267,10 @@ module param_regfile #(
     reg [1:0]  acc_mode;       // NPU_ACC_MODE: INT32 psum accumulate mode (0=NONE)
     reg [SRAM_ADDR_W-1:0] psum_rd_base; // NPU_PSUM_RD_BASE: INT32 psum readback base
     reg        ctrl_elt_signed;       // CTRL[20]: signed INT8 + zero-point eltwise add
-    reg [7:0]  elt_zp;                // NPU_ELTWISE_ZP: glue zero-point for signed eltwise
+    reg [7:0]  elt_zp;                // NPU_ELTWISE_ZP[7:0]: glue zero-point for signed eltwise
+    reg        elt_ratio_en;          // NPU_ELTWISE_ZP[14]: ratio rescale enable (C2f residual)
+    reg [16:0] elt_ratio_mul;         // NPU_ELTWISE_ZP[31:15]: skip rescale multiplier
+    reg [5:0]  elt_ratio_shift;       // NPU_ELTWISE_ZP[13:8]: skip rescale shift
 
     // Status
     wire       status_done;
@@ -318,6 +328,8 @@ module param_regfile #(
     reg        copy_trig_d;    // 1-cycle delayed pulse for on-chip Out->Act copy trigger
     reg        expand_trig_d;  // 1-cycle delayed pulse for img_expand trigger
     reg        upsample_trig_d; // 1-cycle delayed pulse for upsample2x trigger
+    reg        maxpool5_trig_d; // 1-cycle delayed pulse for maxpool5x5 trigger
+    reg        eltwise_trig_d;  // 1-cycle delayed pulse for standalone eltwise add trigger
     reg [15:0] upsample_in_w;
     reg [15:0] upsample_in_h;
     reg [15:0] upsample_ic_groups;
@@ -413,6 +425,9 @@ module param_regfile #(
             psum_rd_base    <= {SRAM_ADDR_W{1'b0}};
             ctrl_elt_signed <= 1'b0;   // default 0 = legacy unsigned eltwise (MNIST byte-identical)
             elt_zp          <= 8'd0;
+            elt_ratio_en    <= 1'b0;   // default 0 = legacy signed eltwise (skip - zp, no ratio)
+            elt_ratio_mul   <= 17'd0;
+            elt_ratio_shift <= 6'd0;
             act_addr_ping   <= {SRAM_ADDR_W{1'b0}};
             act_addr_pong   <= {SRAM_ADDR_W{1'b0}};
             wgt_addr_ping   <= {SRAM_ADDR_W{1'b0}};
@@ -446,6 +461,8 @@ module param_regfile #(
             copy_trig_d      <= 1'b0;
             expand_trig_d    <= 1'b0;
             upsample_trig_d  <= 1'b0;
+            maxpool5_trig_d  <= 1'b0;
+            eltwise_trig_d   <= 1'b0;
             upsample_in_w    <= 16'd0;
             upsample_in_h    <= 16'd0;
             upsample_ic_groups <= 16'd0;
@@ -480,6 +497,8 @@ module param_regfile #(
             copy_trig_d  <= 1'b0;
             expand_trig_d <= 1'b0;
             upsample_trig_d <= 1'b0;
+            maxpool5_trig_d <= 1'b0;
+            eltwise_trig_d <= 1'b0;
             dfl_trig_d <= 1'b0;
             dfl_wload_en_d <= 1'b0;
             dfl_eload_en_d <= 1'b0;
@@ -615,14 +634,23 @@ module param_regfile #(
                         upsample_in_h <= s_axi_wdata[31:16];
                     end
                     10'h3C4: upsample_ic_groups <= s_axi_wdata[15:0]; // NPU_UPSAMPLE_CFG1
-                    10'h3C8: upsample_trig_d <= 1'b1;        // trigger upsample2x
+                    10'h3C8: begin                            // trigger spatial engines
+                        upsample_trig_d <= s_axi_wdata[0];    // bit0: upsample2x
+                        maxpool5_trig_d <= s_axi_wdata[1];    // bit1: maxpool5x5
+                        eltwise_trig_d  <= s_axi_wdata[2];    // bit2: standalone eltwise add
+                    end
                     10'h3CC: begin                            // NPU_SILU_REQUANT_CFG
                         silu_requant_mul   <= s_axi_wdata[15:0];
                         silu_requant_shift <= s_axi_wdata[21:16];
                         silu_requant_zp    <= s_axi_wdata[31:24];
                     end
                     10'h3D0: pad_value <= s_axi_wdata[7:0];   // NPU_PAD_VALUE
-                    10'h3D4: elt_zp    <= s_axi_wdata[7:0];   // NPU_ELTWISE_ZP
+                    10'h3D4: begin                            // NPU_ELTWISE_ZP (packed residual cfg)
+                        elt_zp          <= s_axi_wdata[7:0];
+                        elt_ratio_shift <= s_axi_wdata[13:8];
+                        elt_ratio_en    <= s_axi_wdata[14];
+                        elt_ratio_mul   <= s_axi_wdata[31:15];
+                    end
                     10'h3D8: dfl_src   <= s_axi_wdata[SRAM_ADDR_W-1:0]; // NPU_DFL_SRC
                     10'h3DC: dfl_dst   <= s_axi_wdata[SRAM_ADDR_W-1:0]; // NPU_DFL_DST
                     10'h3E0: dfl_cnt   <= s_axi_wdata[15:0];   // NPU_DFL_CNT
@@ -762,7 +790,7 @@ module param_regfile #(
                     10'h15C: rdata <= {gavg_shift, gavg_mul};
 
                     // DMA status (0x140, read-only)
-                    10'h140: rdata <= {26'd0, i_dfl_done, i_upsample_done, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
+                    10'h140: rdata <= {24'd0, i_eltwise_done, i_maxpool5_done, i_dfl_done, i_upsample_done, i_expand_done, i_copy_done, i_dma_wr_done, i_dma_rd_done};
 
                     // DMA register readback (0x124-0x13C)
                     10'h124: rdata <= dma_rd_ddr_addr;
@@ -778,7 +806,7 @@ module param_regfile #(
                     10'h3C4: rdata <= {16'd0, upsample_ic_groups};
                     10'h3CC: rdata <= {silu_requant_zp, 2'd0, silu_requant_shift, silu_requant_mul};
                     10'h3D0: rdata <= {24'd0, pad_value};
-                    10'h3D4: rdata <= {24'd0, elt_zp};
+                    10'h3D4: rdata <= {elt_ratio_mul, elt_ratio_en, elt_ratio_shift, elt_zp};
 
                     default: rdata <= 32'd0;
                 endcase
@@ -842,6 +870,9 @@ module param_regfile #(
     assign o_skip_base    = skip_base;
     assign o_elt_signed   = ctrl_elt_signed;
     assign o_elt_zp       = elt_zp;
+    assign o_elt_ratio_en = elt_ratio_en;
+    assign o_elt_ratio_mul = elt_ratio_mul;
+    assign o_elt_ratio_shift = elt_ratio_shift;
     assign o_clear_done   = ctrl_clear_done;
 
     assign o_act_addr_ping = act_addr_ping;
@@ -896,6 +927,8 @@ module param_regfile #(
     assign o_copy_trig        = copy_trig_d;
     assign o_expand_trig      = expand_trig_d;
     assign o_upsample_trig    = upsample_trig_d;
+    assign o_maxpool5_trig    = maxpool5_trig_d;
+    assign o_eltwise_trig     = eltwise_trig_d;
     assign o_dfl_src          = dfl_src;
     assign o_dfl_dst          = dfl_dst;
     assign o_dfl_cnt          = dfl_cnt;

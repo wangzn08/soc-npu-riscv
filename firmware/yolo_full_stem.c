@@ -80,6 +80,7 @@
 #define S_M2      0x40750000u
 #define S_CAT     0x40760000u   // concat 512ch
 #define SPPF_OUT  0x40780000u   // conv26 out 256ch (P5)
+#define S_POOL_ACT 2048u        // Act-SRAM scratch for generic 5x5 maxpool engine
 // ---- NECK (FPN/PAN) buffers. backbone taps stay alive: P5tap=C2F8_OUT,
 //      cat1-tap=C2F6_OUT (c2f6 out), cat2-tap=C2F4_OUT (c2f4 out). ----
 #define NK_UP1    0x40790000u   // upsample(SPPF) 20x20x256
@@ -111,33 +112,94 @@
 #define HD_BB_P5  0x40DF0000u
 #define HD_CL_P5  0x40E00000u
 #define HD_PSUM   0x40E20000u   // ic_stream psum for head large-IC convs
+#define HD_DFL_IN  0x40E60000u  // reordered [anchor][coord] DFL input scratch
+#define HD_DFL_OUT 0x40E64000u  // packed Q8.8 DFL output scratch
+#define HD_DFL_ACT 4096u        // Act-SRAM scratch for generic DFL engine
 #define WGT_BASE  0u
 
 static int32_t rs8(uint32_t a, uint32_t w, uint32_t b)
 { volatile uint32_t *p=(volatile uint32_t*)(a+w*16u); uint32_t v=p[b>>2]>>((b&3u)*8u)&0xFFu; return (v&0x80u)?((int32_t)v-256):(int32_t)v; }
 static int32_t s8(uint32_t b){ b&=0xFFu; return (b&0x80u)?((int32_t)b-256):(int32_t)b; }
+static uint32_t ad(int32_t a,int32_t b) __attribute__((unused));
 static uint32_t ad(int32_t a,int32_t b){ int32_t d=a-b; return (uint32_t)(d<0?-d:d); }
 
+// ---- Phase-0 per-stage profiler (reads free-running RTL perf counters) ----
+// dcyc = wall cycles for the stage; dnpu = NPU-FSM-busy cycles in the stage;
+// (dcyc - dnpu) ~= CPU/DMA software-glue cost. drd/dwr = AXI DDR beats.
+// YOLO-only file (not compiled for MNIST), so this never perturbs the baseline.
+static uint32_t pf_tot, pf_busy, pf_rd, pf_wr;
+static void prof_reset(void)
+{
+    pf_tot  = *(volatile uint32_t*)NPU_PERF_CYC_TOTAL;
+    pf_busy = *(volatile uint32_t*)NPU_PERF_CYC_BUSY;
+    pf_rd   = *(volatile uint32_t*)NPU_PERF_RD_BEATS;
+    pf_wr   = *(volatile uint32_t*)NPU_PERF_WR_BEATS;
+}
+static void prof_mark(const char *tag)
+{
+    uint32_t t = *(volatile uint32_t*)NPU_PERF_CYC_TOTAL;
+    uint32_t b = *(volatile uint32_t*)NPU_PERF_CYC_BUSY;
+    uint32_t r = *(volatile uint32_t*)NPU_PERF_RD_BEATS;
+    uint32_t w = *(volatile uint32_t*)NPU_PERF_WR_BEATS;
+    print_str("[PROF] "); print_str(tag);
+    print_str(" dcyc="); print_dec(t - pf_tot);
+    print_str(" dnpu="); print_dec(b - pf_busy);
+    print_str(" drd=");  print_dec(r - pf_rd);
+    print_str(" dwr=");  print_dec(w - pf_wr);
+    print_str("\n");
+    pf_tot = t; pf_busy = b; pf_rd = r; pf_wr = w;
+}
+
 // SPPF 5x5 stride-1 pad-2 int8 max-pool, tile-major DDR (groups of 16 channels).
+// 5x5 stride-1 pad-2 int8 maxpool, SEPARABLE: a 1x5 horizontal max into a local
+// buffer, then a 5x1 vertical max -> 10 taps/pixel instead of 25 (~2.5x fewer
+// scalar max ops; the stage is CPU-arithmetic-bound, not memory-bound). The src
+// plane is staged into fast local RAM once per group. Output bit-identical.
+static void maxpool5(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, uint32_t W) __attribute__((unused));
 static void maxpool5(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, uint32_t W)
 {
-    uint32_t SP = H*W, g, oh, ow, kh, kw, k;
-    for (g = 0u; g < groups; g++)
+    static int8_t plane[256*16];   // src group plane (SP<=256, 16 lanes), signed
+    static int8_t hmax[256*16];    // horizontal 1x5 max
+    uint32_t SP = H*W, g, oh, ow, kk, k, p;
+    for (g = 0u; g < groups; g++) {
+        volatile uint32_t *sp = (volatile uint32_t*)(src + g*SP*16u);
+        for (p = 0u; p < SP; p++) {                       // DDR -> local int8 (once)
+            uint32_t w0=sp[p*4u],w1=sp[p*4u+1u],w2=sp[p*4u+2u],w3=sp[p*4u+3u];
+            int8_t *pl=&plane[p*16u];
+            for (k=0u;k<4u;k++) pl[k]   =(int8_t)(w0>>(k*8u));
+            for (k=0u;k<4u;k++) pl[4u+k]=(int8_t)(w1>>(k*8u));
+            for (k=0u;k<4u;k++) pl[8u+k]=(int8_t)(w2>>(k*8u));
+            for (k=0u;k<4u;k++) pl[12u+k]=(int8_t)(w3>>(k*8u));
+        }
+        // horizontal 1x5 max -> hmax
         for (oh = 0u; oh < H; oh++)
             for (ow = 0u; ow < W; ow++) {
-                int32_t mx[16]; uint32_t o[4] = {0u,0u,0u,0u};
-                for (k = 0u; k < 16u; k++) mx[k] = -128;
-                for (kh = 0u; kh < 5u; kh++)
-                    for (kw = 0u; kw < 5u; kw++) {
-                        int32_t ih = (int32_t)oh-2+(int32_t)kh, iw = (int32_t)ow-2+(int32_t)kw;
-                        if (ih>=0 && ih<(int32_t)H && iw>=0 && iw<(int32_t)W) {
-                            volatile uint32_t *p=(volatile uint32_t*)(src+(g*SP+(uint32_t)ih*W+(uint32_t)iw)*16u);
-                            for (k = 0u; k < 16u; k++) { int32_t v=s8(p[k>>2]>>((k&3u)*8u)); if (v>mx[k]) mx[k]=v; }
-                        }
+                int8_t *o = &hmax[(oh*W+ow)*16u];
+                for (k=0u;k<16u;k++) o[k] = -128;
+                for (kk = 0u; kk < 5u; kk++) {
+                    int32_t iw = (int32_t)ow-2+(int32_t)kk;
+                    if (iw>=0 && iw<(int32_t)W) {
+                        int8_t *q=&plane[(oh*W+(uint32_t)iw)*16u];
+                        for (k=0u;k<16u;k++) if (q[k]>o[k]) o[k]=q[k];
                     }
-                for (k = 0u; k < 16u; k++) o[k>>2] |= ((uint32_t)(mx[k]&0xFF))<<((k&3u)*8u);
-                { volatile uint32_t *q=(volatile uint32_t*)(dst+(g*SP+oh*W+ow)*16u); q[0]=o[0];q[1]=o[1];q[2]=o[2];q[3]=o[3]; }
+                }
             }
+        // vertical 5x1 max -> dst
+        for (oh = 0u; oh < H; oh++)
+            for (ow = 0u; ow < W; ow++) {
+                int32_t mx[16]; uint32_t out[4]={0u,0u,0u,0u};
+                for (k=0u;k<16u;k++) mx[k]=-128;
+                for (kk = 0u; kk < 5u; kk++) {
+                    int32_t ih = (int32_t)oh-2+(int32_t)kk;
+                    if (ih>=0 && ih<(int32_t)H) {
+                        int8_t *q=&hmax[((uint32_t)ih*W+ow)*16u];
+                        for (k=0u;k<16u;k++) if (q[k]>mx[k]) mx[k]=q[k];
+                    }
+                }
+                for (k=0u;k<16u;k++) out[k>>2] |= ((uint32_t)((uint8_t)mx[k]))<<((k&3u)*8u);
+                { volatile uint32_t *t=(volatile uint32_t*)(dst+(g*SP+oh*W+ow)*16u); t[0]=out[0];t[1]=out[1];t[2]=out[2];t[3]=out[3]; }
+            }
+    }
 }
 // concat 4 same-scale tile-major parts -> [4*groups] tensor.
 static void concat4(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t dst,
@@ -152,6 +214,7 @@ static void concat4(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t dst
         }
 }
 // nearest-neighbor 2x upsample (tile-major DDR, scale/zp unchanged): HxW -> 2Hx2W.
+static void upsample2(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, uint32_t W) __attribute__((unused));
 static void upsample2(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, uint32_t W)
 {
     uint32_t g, y, x; uint32_t OW = W*2u;
@@ -166,10 +229,28 @@ static void upsample2(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, u
                 for (k=0u;k<4u;k++){ volatile uint32_t *t=(volatile uint32_t*)(dst+dd[k]*16u); t[0]=v0;t[1]=v1;t[2]=v2;t[3]=v3; }
             }
 }
+// plain tile-major tensor copy (groups*SP 128-bit words), no requant. Used to lay
+// the backbone tap next to the upsampled feature in the FPN/PAN cat buffer; the cat
+// requant is folded into the neck c2f cv1 weights, so no per-lane math here.
+static void copy_groups(uint32_t src, uint32_t dst, uint32_t groups, uint32_t SP) __attribute__((unused));
+static void copy_groups(uint32_t src, uint32_t dst, uint32_t groups, uint32_t SP)
+{
+    uint32_t n, words = groups*SP;
+    for (n = 0u; n < words; n++) {
+        volatile uint32_t *s=(volatile uint32_t*)(src+n*16u);
+        volatile uint32_t *t=(volatile uint32_t*)(dst+n*16u);
+        t[0]=s[0];t[1]=s[1];t[2]=s[2];t[3]=s[3];
+    }
+}
 // signed-int8 requant one lane: clamp((q-inzp)*mul>>sh + catzp)
+static int32_t rq_lane(int32_t q, int32_t inzp, uint32_t mul, uint32_t sh, int32_t catzp) __attribute__((unused));
 static int32_t rq_lane(int32_t q, int32_t inzp, uint32_t mul, uint32_t sh, int32_t catzp)
 { int32_t v=(((q-inzp)*(int32_t)mul + (1<<(sh-1u)))>>sh)+catzp; return v>127?127:(v<-128?-128:v); }
 // concat2 with per-part requant to a common (cat) scale -> [up_g+tap_g] tile-major.
+// Superseded by the cv1 cat-fold (copy_groups + folded weights); kept for reference.
+static void concat2_rq(uint32_t up, uint32_t up_g, uint32_t up_mul, int32_t up_iz,
+                       uint32_t tap, uint32_t tap_g, uint32_t tap_mul, int32_t tap_iz,
+                       int32_t catzp, uint32_t sh, uint32_t dst, uint32_t SP) __attribute__((unused));
 static void concat2_rq(uint32_t up, uint32_t up_g, uint32_t up_mul, int32_t up_iz,
                        uint32_t tap, uint32_t tap_g, uint32_t tap_mul, int32_t tap_iz,
                        int32_t catzp, uint32_t sh, uint32_t dst, uint32_t SP)
@@ -189,6 +270,9 @@ static void concat2_rq(uint32_t up, uint32_t up_g, uint32_t up_mul, int32_t up_i
     }
 }
 // stage checksum vs golden (sum + position/channel hash), prints OK/MISMATCH.
+// Validation-only (gated by YOLO_DEBUG_CK at the call sites); may be unused.
+static void ck_stage(const char *nm, uint32_t base, uint32_t SP, uint32_t OC,
+                     const uint8_t *golden, uint32_t gOC, uint32_t tol) __attribute__((unused));
 static void ck_stage(const char *nm, uint32_t base, uint32_t SP, uint32_t OC,
                      const uint8_t *golden, uint32_t gOC, uint32_t tol)
 {
@@ -227,7 +311,7 @@ static void ck_stage(const char *nm, uint32_t base, uint32_t SP, uint32_t OC,
     cfg.cat_mul_add[0]=P##_CAT_MUL_ADD0; cfg.cat_inzp_add[0]=P##_CAT_INZP_ADD0; \
     cfg.cv2_ic=P##_CV2_IC; cfg.cv2_oc=P##_CV2_OC; cfg.cv2_wgt_words=P##_CV2_OC*(P##_CV2_IC/16u); \
     cfg.cv2_bias=p##_cv2_bias; cfg.cv2_mul=p##_cv2_mul; cfg.cv2_shift=p##_cv2_shift; \
-    cfg.cv2_silu_lut=p##_cv2_lut; cfg.cv2_rq_zp=P##_CV2_ZP; \
+    cfg.cv2_silu_lut=p##_cv2_lut; cfg.cv2_rq_zp=P##_CV2_ZP; cfg.cv2_folded=P##_CV2_FOLDED; \
     if (errors==0u && !yolo_run_c2f_block(&cfg)) { print_str("  neck c2f fail\n"); errors++; } \
 } while(0)
 
@@ -258,6 +342,24 @@ static float my_exp(float x)
     if (e > 254) e = 254;
     v.u = ((uint32_t)e) << 23; return p * v.fl;
 }
+static void dfl_prepare_tables(float scale, int16_t wk[16], uint16_t elut[256])
+{
+    uint32_t i;
+    float e = 1.0f;
+    float step = my_exp(-scale);
+    for (i = 0u; i < 16u; i++)
+        wk[i] = (int16_t)(yolo_hd_dfl_w[i] * 256.0f + 0.5f);
+    for (i = 0u; i < 256u; i++) {
+        uint32_t q = (uint32_t)(e * 32768.0f + 0.5f);
+        if (q > 65535u) q = 65535u;
+        elut[i] = (uint16_t)q;
+        e *= step;
+    }
+}
+static float q8_8_to_float(uint16_t q)
+{
+    return ((float)((int16_t)q)) * (1.0f / 256.0f);
+}
 static float dq(uint32_t base, uint32_t sp, uint32_t ch, uint32_t pos, int32_t zp, float sc)
 { return (float)(rs8(base, (ch>>4)*sp + pos, ch&15u) - zp) * sc; }
 
@@ -269,6 +371,12 @@ void usercode7(void)
     print_str("YOLO FULL STEM: conv0 -> ... -> SPPF (on-SoC, DDR, preloaded img)\n");
     /* intermediate goldens are checkpoints; only the final (SPPF) one is validated */
     (void)yolo_c2f4_golden; (void)yolo_c2f6_golden; (void)yolo_c2f8_golden;
+    /* Stage checksums (ck_stage) are validation-only; gate them out of the deploy
+     * path (define YOLO_DEBUG_CK to re-enable). The final 4-box check is the real
+     * functional gate. These (void) casts keep -Werror happy when ck is gated. */
+    (void)yolo_sppf_e_golden; (void)yolo_nk_pan_p3_golden;
+    (void)yolo_nk_pan_p4_golden; (void)yolo_nk_pan_p5_golden;
+    prof_reset();
 
     // ---------- Stage 0: conv0 (preloaded image, weights from DDR blob) -> C0_OUT ----------
     yolo_set_pad_value(C0E_PAD_VALUE);
@@ -282,6 +390,7 @@ void usercode7(void)
                                NPU_CTRL_SILU_EXACT_EN, C0E_WGT_PER_OC, 16u, C0E_PAD_VALUE)) {
         print_str("  conv0 fail\n"); errors++;
     }
+    prof_mark("s0_conv0");
 
     // ---------- Stage 1: conv1 reads C0_OUT, weights from DDR blob -> C1_OUT ----------
     yolo_set_pad_value(C1E_PAD_VALUE);
@@ -295,6 +404,7 @@ void usercode7(void)
                                NPU_CTRL_SILU_EXACT_EN, C1E_WGT_PER_OC, 16u, C1E_PAD_VALUE)) {
         print_str("  conv1 fail\n"); errors++;
     }
+    prof_mark("s1_conv1");
 
     // ---------- Stage 2: c2f_2 reads C1_OUT ----------
     cfg.in_w=YOLO_C2F2_IN_W; cfg.in_h=YOLO_C2F2_IN_H; cfg.spatial=YOLO_C2F2_SPATIAL;
@@ -331,9 +441,11 @@ void usercode7(void)
     cfg.cv2_wgt=yolo_c2f2_cv2_wgt; cfg.cv2_wgt_words=YOLO_C2F2_CV2_WGT_WORDS;
     cfg.cv2_bias=yolo_c2f2_cv2_bias; cfg.cv2_mul=yolo_c2f2_cv2_mul; cfg.cv2_shift=yolo_c2f2_cv2_shift;
     cfg.cv2_rq_mul=YOLO_C2F2_CV2_RQ_MUL; cfg.cv2_rq_shift=YOLO_C2F2_CV2_RQ_SHIFT; cfg.cv2_rq_zp=YOLO_C2F2_CV2_RQ_ZP;
+    cfg.cv2_folded=YOLO_C2F2_CV2_FOLDED;   // concat folded into cv2 weights (blob has folded conv5)
     cfg.cv2_silu_lut=yolo_c2f2_cv2_silu_lut;
     if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f2 fail\n"); errors++; }
     print_str("  [stage2 c2f_2 done]\n");
+    prof_mark("s2_c2f2");
 
     // ---------- Stage 3: conv6 (downsample 80x80x32 -> 40x40x64) reads C2F_OUT ----------
     yolo_set_pad_value(C6E_PAD_VALUE);
@@ -346,6 +458,7 @@ void usercode7(void)
         print_str("  conv6 fail\n"); errors++;
     }
     print_str("  [stage3 conv6 done]\n");
+    prof_mark("s3_conv6");
 
     // ---------- Stage 4: c2f_4 (model.4, n=2) reads C6_OUT, blob weights ----------
     cfg.in_w=YOLO_C2F4_IN_W; cfg.in_h=YOLO_C2F4_IN_H; cfg.spatial=YOLO_C2F4_SPATIAL;
@@ -383,8 +496,10 @@ void usercode7(void)
     cfg.cv2_wgt_words=YOLO_C2F4_CV2_WGT_WORDS;
     cfg.cv2_bias=yolo_c2f4_cv2_bias; cfg.cv2_mul=yolo_c2f4_cv2_mul; cfg.cv2_shift=yolo_c2f4_cv2_shift;
     cfg.cv2_silu_lut=yolo_c2f4_cv2_lut; cfg.cv2_rq_zp=YOLO_C2F4_CV2_RQ_ZP;
+    cfg.cv2_folded=YOLO_C2F4_CV2_FOLDED;   // concat requant folded into cv2 weights (blob has w2f)
     if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f4 fail\n"); errors++; }
     print_str("  [stage4 c2f_4 done]\n");
+    prof_mark("s4_c2f4");
 
     // ---------- Stage 5: conv13 (downsample 40x40x64 -> 20x20x128) reads C2F4_OUT ----------
     yolo_set_pad_value(C13E_PAD_VALUE);
@@ -397,6 +512,7 @@ void usercode7(void)
         print_str("  conv13 fail\n"); errors++;
     }
     print_str("  [stage5 conv13 done]\n");
+    prof_mark("s5_conv13");
 
     // ---------- Stage 6: c2f_6 (model.6, n=2, 128ch) reads C13_OUT, blob weights ----------
     cfg.in_w=YOLO_C2F6_IN_W; cfg.in_h=YOLO_C2F6_IN_H; cfg.spatial=YOLO_C2F6_SPATIAL;
@@ -435,19 +551,25 @@ void usercode7(void)
     cfg.cv2_wgt_words=YOLO_C2F6_CV2_WGT_WORDS;
     cfg.cv2_bias=yolo_c2f6_cv2_bias; cfg.cv2_mul=yolo_c2f6_cv2_mul; cfg.cv2_shift=yolo_c2f6_cv2_shift;
     cfg.cv2_silu_lut=yolo_c2f6_cv2_lut; cfg.cv2_rq_zp=YOLO_C2F6_CV2_RQ_ZP;
+    cfg.cv2_folded=YOLO_C2F6_CV2_FOLDED;
     if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f6 fail\n"); errors++; }
     print_str("  [stage6 c2f_6 done]\n");
+    prof_mark("s6_c2f6");
 
     // ---------- Stage 7: conv20 (downsample 20x20x128 -> 10x10x256, large-IC s2) ----------
-    // icg=8 (>ICG_BUF) + stride2 3x3 -> IC-chunk streaming + CPU INT32 psum accumulate.
-    if (errors == 0u && !yolo_run_conv2d_ic_stream(C2F6_OUT, WGT_OF(20), WGT_BASE, C20_OUT,
-                               C20_PSUM, PAD_ROW, C20E_IN_W, C20E_IN_H, C20E_IC, C20E_OC,
-                               3u, 3u, C20E_STRIDE, 1u,
+    // icg=8 now fits the resident path (ICG_MAX/ICG_BUF=8): tiled conv (stride2 serial),
+    // no CPU INT32 psum. (void)C20_PSUM.
+    (void)C20_PSUM;
+    yolo_set_pad_value(C20E_PAD_VALUE);
+    yolo_load_silu_lut(yolo_conv20e_silu_lut); yolo_set_silu_requant(0u, 0u, 0);
+    if (errors == 0u && !yolo_run_conv2d_tiled(C2F6_OUT, WGT_OF(20), WGT_BASE, C20_OUT, PAD_ROW,
+                               C20E_IN_W, C20E_IN_H, C20E_IC, C20E_OC, 3u, 3u, C20E_STRIDE, 1u,
                                yolo_conv20e_bias_q, yolo_conv20e_scale_mul, yolo_conv20e_scale_shift,
-                               yolo_conv20e_silu_lut, C20E_PAD_VALUE)) {
+                               NPU_CTRL_SILU_EXACT_EN, (C20E_IC/16u)*9u, 16u, C20E_PAD_VALUE)) {
         print_str("  conv20 fail\n"); errors++;
     }
     print_str("  [stage7 conv20 done]\n");
+    prof_mark("s7_conv20_icstream");
 
     // ---------- Stage 8: c2f_8 (model.8, n=1, 256ch) reads C20_OUT, blob weights ----------
     cfg.in_w=YOLO_C2F8_IN_W; cfg.in_h=YOLO_C2F8_IN_H; cfg.spatial=YOLO_C2F8_SPATIAL;
@@ -478,8 +600,10 @@ void usercode7(void)
     cfg.cv2_wgt_words=YOLO_C2F8_CV2_WGT_WORDS;
     cfg.cv2_bias=yolo_c2f8_cv2_bias; cfg.cv2_mul=yolo_c2f8_cv2_mul; cfg.cv2_shift=yolo_c2f8_cv2_shift;
     cfg.cv2_silu_lut=yolo_c2f8_cv2_lut; cfg.cv2_rq_zp=YOLO_C2F8_CV2_RQ_ZP;
+    cfg.cv2_folded=YOLO_C2F8_CV2_FOLDED;
     if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f8 fail\n"); errors++; }
     print_str("  [stage8 c2f_8 done]\n");
+    prof_mark("s8_c2f8");
 
     // ---------- Stage 9: SPPF (model.9) conv25 -> 3x maxpool5 -> concat -> conv26 ----------
     // conv25 (1x1 256->128, icg16 PW stream, exact); maxpool/concat on CPU (scale-
@@ -492,13 +616,15 @@ void usercode7(void)
                                NPU_CTRL_SILU_EXACT_EN, SPPFE_C25_IC/16u, 16u, 0)) {
         print_str("  conv25 fail\n"); errors++;
     }
+    prof_mark("s9_sppf_conv25");
     if (errors == 0u) {
         uint32_t g25 = SPPFE_C25_OC / 16u;
-        maxpool5(S_CV1, S_M0, g25, SPPFE_IN_H, SPPFE_IN_W);
-        maxpool5(S_M0,  S_M1, g25, SPPFE_IN_H, SPPFE_IN_W);
-        maxpool5(S_M1,  S_M2, g25, SPPFE_IN_H, SPPFE_IN_W);
+        if (!yolo_run_maxpool5x5(S_CV1, S_M0, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool0 fail\n"); errors++; }
+        if (errors == 0u && !yolo_run_maxpool5x5(S_M0, S_M1, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool1 fail\n"); errors++; }
+        if (errors == 0u && !yolo_run_maxpool5x5(S_M1, S_M2, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool2 fail\n"); errors++; }
         concat4(S_CV1, S_M0, S_M1, S_M2, S_CAT, g25, SPPFE_SPATIAL);
     }
+    prof_mark("s9_sppf_maxpool_concat_CPU");
     yolo_load_silu_lut(yolo_sppf_e_c26_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled(S_CAT, WGT_OF(26), WGT_BASE, SPPF_OUT, PAD_ROW,
@@ -507,25 +633,43 @@ void usercode7(void)
                                NPU_CTRL_SILU_EXACT_EN, SPPFE_C26_IC/16u, 16u, 0)) {
         print_str("  conv26 fail\n"); errors++;
     }
+    prof_mark("s9_sppf_conv26");
     print_str("  [stage9 SPPF done]\n");
+#ifdef YOLO_DEBUG_CK
     ck_stage("[ck SPPF]", SPPF_OUT, SPPFE_SPATIAL, SPPFE_C26_OC, &yolo_sppf_e_golden[0][0], SPPFE_C26_OC, 120u);
+    prof_mark("ck_sppf_DEBUG");
+#endif
 
     // ================= NECK (FPN/PAN, model.10-21) =================
     // ---- FPN: P5 up + concat(P4=c2f6) -> c2f_12 -> fpn_mid (20x20x128) ----
-    upsample2(SPPF_OUT, NK_UP1, 256u/16u, 10u, 10u);
-    concat2_rq(NK_UP1, 256u/16u, YOLO_NK_CAT1_MUL_UP, YOLO_NK_CAT1_INZP_UP,
-               C2F6_OUT, 128u/16u, YOLO_NK_CAT1_MUL_TAP, YOLO_NK_CAT1_INZP_TAP,
-               YOLO_NK_CAT1_CAT_ZP, YOLO_NK_CAT1_CAT_SHIFT, NK_CAT1, 20u*20u);
+    // cat folded into c2f_12 cv1 weights: build raw [up|tap] native (no requant).
+    if (errors == 0u && !yolo_run_upsample2x_ddr(SPPF_OUT, NK_CAT1, 0u, 10u, 10u, 256u/16u)) {
+        print_str("  neck up1 fail\n"); errors++;
+    }
+    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(C2F6_OUT, NK_CAT1 + (256u/16u)*(20u*20u)*16u,
+                                                       0u, (128u/16u)*(20u*20u))) {
+        print_str("  neck cat1 tap fail\n"); errors++;
+    }
+    prof_mark("neck_up1_cat1_DMA");
     NECK_C2F(YOLO_NK_C12, yolo_nk_c12, NK_CAT1, NK_FMID, WGT_OF(27),WGT_OF(28),WGT_OF(29),WGT_OF(30));
     print_str("  [neck c2f_12 done]\n");
+    prof_mark("neck_c2f12");
 
     // ---- FPN: fpn_mid up + concat(P3=c2f4) -> c2f_15 -> pan_p3 (40x40x64) ----
-    upsample2(NK_FMID, NK_UP2, 128u/16u, 20u, 20u);
-    concat2_rq(NK_UP2, 128u/16u, YOLO_NK_CAT2_MUL_UP, YOLO_NK_CAT2_INZP_UP,
-               C2F4_OUT, 64u/16u, YOLO_NK_CAT2_MUL_TAP, YOLO_NK_CAT2_INZP_TAP,
-               YOLO_NK_CAT2_CAT_ZP, YOLO_NK_CAT2_CAT_SHIFT, NK_CAT2, 40u*40u);
+    if (errors == 0u && !yolo_run_upsample2x_ddr(NK_FMID, NK_CAT2, 0u, 20u, 20u, 128u/16u)) {
+        print_str("  neck up2 fail\n"); errors++;
+    }
+    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(C2F4_OUT, NK_CAT2 + (128u/16u)*(40u*40u)*16u,
+                                                       0u, (64u/16u)*(40u*40u))) {
+        print_str("  neck cat2 tap fail\n"); errors++;
+    }
+    prof_mark("neck_up2_cat2_DMA");
     NECK_C2F(YOLO_NK_C15, yolo_nk_c15, NK_CAT2, NK_PANP3, WGT_OF(31),WGT_OF(32),WGT_OF(33),WGT_OF(34));
+    prof_mark("neck_c2f15");
+#ifdef YOLO_DEBUG_CK
     ck_stage("[ck pan_p3]", NK_PANP3, YOLO_NK_P3_SP, YOLO_NK_P3_OC, &yolo_nk_pan_p3_golden[0][0], YOLO_NK_P3_OC, 120u);
+    prof_mark("ck_panp3_DEBUG");
+#endif
 
     // ---- PAN: conv35(pan_p3 3x3 s2) + concat(fpn_mid) -> c2f_18 -> pan_p4 (20x20x128) ----
     yolo_set_pad_value(YOLO_NK_C35_PAD);
@@ -534,22 +678,46 @@ void usercode7(void)
                                40u,40u, 64u,64u, 3u,3u, 2u,1u,
                                yolo_nk_c35_bias, yolo_nk_c35_mul, yolo_nk_c35_shift,
                                NPU_CTRL_SILU_EXACT_EN, 4u*9u, 16u, YOLO_NK_C35_PAD)) { print_str("  conv35 fail\n"); errors++; }
-    concat2_rq(NK_C35, 64u/16u, YOLO_NK_CAT3_MUL_UP, YOLO_NK_CAT3_INZP_UP,
-               NK_FMID, 128u/16u, YOLO_NK_CAT3_MUL_TAP, YOLO_NK_CAT3_INZP_TAP,
-               YOLO_NK_CAT3_CAT_ZP, YOLO_NK_CAT3_CAT_SHIFT, NK_CAT3, 20u*20u);
+    prof_mark("neck_conv35_s2");
+    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(NK_C35, NK_CAT3, 0u, (64u/16u)*(20u*20u))) {
+        print_str("  neck cat3 src0 fail\n"); errors++;
+    }
+    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(NK_FMID, NK_CAT3 + (64u/16u)*(20u*20u)*16u,
+                                                       0u, (128u/16u)*(20u*20u))) {
+        print_str("  neck cat3 tap fail\n"); errors++;
+    }
+    prof_mark("neck_cat3_DMA");
     NECK_C2F(YOLO_NK_C18, yolo_nk_c18, NK_CAT3, NK_PANP4, WGT_OF(40),WGT_OF(43),WGT_OF(44),WGT_OF(45));
+    prof_mark("neck_c2f18");
+#ifdef YOLO_DEBUG_CK
     ck_stage("[ck pan_p4]", NK_PANP4, YOLO_NK_P4_SP, YOLO_NK_P4_OC, &yolo_nk_pan_p4_golden[0][0], YOLO_NK_P4_OC, 120u);
+    prof_mark("ck_panp4_DEBUG");
+#endif
 
-    // ---- PAN: conv46(pan_p4 3x3 s2, large-IC) + concat(c2f8) -> c2f_21 -> pan_p5 (10x10x256) ----
-    if (errors==0u && !yolo_run_conv2d_ic_stream(NK_PANP4, WGT_OF(46), WGT_BASE, NK_C46, NK_PSUM, PAD_ROW,
+    // ---- PAN: conv46(pan_p4 3x3 s2, icg8) + concat(c2f8) -> c2f_21 -> pan_p5 (10x10x256) ----
+    // icg8 now resident (ICG_MAX/ICG_BUF=8): tiled conv instead of CPU ic_stream. (void)NK_PSUM.
+    (void)NK_PSUM;
+    yolo_set_pad_value(YOLO_NK_C46_PAD);
+    yolo_load_silu_lut(yolo_nk_c46_lut); yolo_set_silu_requant(0u, 0u, 0);
+    if (errors==0u && !yolo_run_conv2d_tiled(NK_PANP4, WGT_OF(46), WGT_BASE, NK_C46, PAD_ROW,
                                20u,20u, 128u,128u, 3u,3u, 2u,1u,
                                yolo_nk_c46_bias, yolo_nk_c46_mul, yolo_nk_c46_shift,
-                               yolo_nk_c46_lut, YOLO_NK_C46_PAD)) { print_str("  conv46 fail\n"); errors++; }
-    concat2_rq(NK_C46, 128u/16u, YOLO_NK_CAT4_MUL_UP, YOLO_NK_CAT4_INZP_UP,
-               C2F8_OUT, 256u/16u, YOLO_NK_CAT4_MUL_TAP, YOLO_NK_CAT4_INZP_TAP,
-               YOLO_NK_CAT4_CAT_ZP, YOLO_NK_CAT4_CAT_SHIFT, NK_CAT4, 10u*10u);
+                               NPU_CTRL_SILU_EXACT_EN, (128u/16u)*9u, 16u, YOLO_NK_C46_PAD)) { print_str("  conv46 fail\n"); errors++; }
+    prof_mark("neck_conv46_s2_icstream");
+    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(NK_C46, NK_CAT4, 0u, (128u/16u)*(10u*10u))) {
+        print_str("  neck cat4 src0 fail\n"); errors++;
+    }
+    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(C2F8_OUT, NK_CAT4 + (128u/16u)*(10u*10u)*16u,
+                                                       0u, (256u/16u)*(10u*10u))) {
+        print_str("  neck cat4 tap fail\n"); errors++;
+    }
+    prof_mark("neck_cat4_DMA");
     NECK_C2F(YOLO_NK_C21, yolo_nk_c21, NK_CAT4, NK_PANP5, WGT_OF(51),WGT_OF(54),WGT_OF(55),WGT_OF(56));
+    prof_mark("neck_c2f21");
+#ifdef YOLO_DEBUG_CK
     ck_stage("[ck pan_p5]", NK_PANP5, YOLO_NK_P5_SP, YOLO_NK_P5_OC, &yolo_nk_pan_p5_golden[0][0], YOLO_NK_P5_OC, 120u);
+    prof_mark("ck_panp5_DEBUG");
+#endif
 
     print_str("  [neck done]\n");
 
@@ -558,55 +726,102 @@ void usercode7(void)
     #define HBR(IN,INW,INH, P, p, BB_CI,BBM_CI,BBO_CI, CL_CI,CLM_CI,CLO_CI, BBDST,CLDST) do { \
       if(errors==0u && !run_head_conv(IN,WGT_OF(BB_CI),HD_SCR1,INW,INH,YOLO_HD_##P##_STEM_IC,YOLO_HD_##P##_BB_STEM_OC,3u,1u,1u, \
             p##_bb_stem_bias,p##_bb_stem_mul,p##_bb_stem_shift,p##_bb_stem_lut,YOLO_HD_##P##_BB_STEM_PAD)) {print_str(" hbbstem fail\n");errors++;} \
+      prof_mark("h_bbstem3x3"); \
       if(errors==0u && !run_head_conv(HD_SCR1,WGT_OF(BBM_CI),HD_SCR2,INW,INH,YOLO_HD_##P##_BB_STEM_OC,YOLO_HD_##P##_BB_STEM_OC,3u,1u,1u, \
             p##_bb_mid_bias,p##_bb_mid_mul,p##_bb_mid_shift,p##_bb_mid_lut,YOLO_HD_##P##_BB_MID_PAD)) {print_str(" hbbmid fail\n");errors++;} \
+      prof_mark("h_bbmid3x3"); \
       if(errors==0u && !run_head_conv(HD_SCR2,WGT_OF(BBO_CI),BBDST,INW,INH,YOLO_HD_##P##_BB_STEM_OC,64u,1u,1u,0u, \
             p##_bb_out_bias,p##_bb_out_mul,p##_bb_out_shift,p##_bb_out_lut,YOLO_HD_##P##_BB_OUT_PAD)) {print_str(" hbbout fail\n");errors++;} \
+      prof_mark("h_bbout1x1"); \
       if(errors==0u && !run_head_conv(IN,WGT_OF(CL_CI),HD_SCR1,INW,INH,YOLO_HD_##P##_STEM_IC,YOLO_HD_##P##_CL_STEM_OC,3u,1u,1u, \
             p##_cl_stem_bias,p##_cl_stem_mul,p##_cl_stem_shift,p##_cl_stem_lut,YOLO_HD_##P##_CL_STEM_PAD)) {print_str(" hclstem fail\n");errors++;} \
+      prof_mark("h_clstem3x3"); \
       if(errors==0u && !run_head_conv(HD_SCR1,WGT_OF(CLM_CI),HD_SCR2,INW,INH,YOLO_HD_##P##_CL_STEM_OC,YOLO_HD_##P##_CL_STEM_OC,3u,1u,1u, \
             p##_cl_mid_bias,p##_cl_mid_mul,p##_cl_mid_shift,p##_cl_mid_lut,YOLO_HD_##P##_CL_MID_PAD)) {print_str(" hclmid fail\n");errors++;} \
+      prof_mark("h_clmid3x3"); \
       if(errors==0u && !run_head_conv(HD_SCR2,WGT_OF(CLO_CI),CLDST,INW,INH,YOLO_HD_##P##_CL_STEM_OC,80u,1u,1u,0u, \
             p##_cl_out_bias,p##_cl_out_mul,p##_cl_out_shift,p##_cl_out_lut,YOLO_HD_##P##_CL_OUT_PAD)) {print_str(" hclout fail\n");errors++;} \
+      prof_mark("h_clout1x1"); \
     } while(0)
     HBR(NK_PANP3,40u,40u, P3, yolo_hd_p3, 36,38,41, 37,39,42, HD_BB_P3,HD_CL_P3);
+    prof_mark("head_P3_6conv");
     HBR(NK_PANP4,20u,20u, P4, yolo_hd_p4, 47,49,52, 48,50,53, HD_BB_P4,HD_CL_P4);
+    prof_mark("head_P4_6conv");
     HBR(NK_PANP5,10u,10u, P5, yolo_hd_p5, 57,59,61, 58,60,62, HD_BB_P5,HD_CL_P5);
+    prof_mark("head_P5_6conv");
     print_str("  [head convs done]\n");
 
-    // ---- decode (CPU soft-float): DFL + sigmoid + box, per scale; collect dets ----
+    // ---- decode: class0 gate on CPU, DFL expectation on the generic NPU DFL engine ----
     {
         static float dx1[128],dy1[128],dx2[128],dy2[128]; uint32_t nd=0u;
+        static uint16_t dfl_elut[256];
+        static int16_t dfl_wk[16];
+        static uint16_t cand_ax[128], cand_ay[128];
         uint32_t bbB[3]={HD_BB_P3,HD_BB_P4,HD_BB_P5}, clB[3]={HD_CL_P3,HD_CL_P4,HD_CL_P5};
         uint32_t hw[3]={40u,20u,10u}, st[3]={8u,16u,32u};
         float bbs[3]={YOLO_HD_P3_BB_OUTS,YOLO_HD_P4_BB_OUTS,YOLO_HD_P5_BB_OUTS};
-        int32_t bbz[3]={YOLO_HD_P3_BB_OUTZP,YOLO_HD_P4_BB_OUTZP,YOLO_HD_P5_BB_OUTZP};
         float cls[3]={YOLO_HD_P3_CL_OUTS,YOLO_HD_P4_CL_OUTS,YOLO_HD_P5_CL_OUTS};
         int32_t clz[3]={YOLO_HD_P3_CL_OUTZP,YOLO_HD_P4_CL_OUTZP,YOLO_HD_P5_CL_OUTZP};
         uint32_t s2;
         for (s2=0u; s2<3u; s2++) {
-            uint32_t H=hw[s2], Wd=H, SP=H*Wd, pos;
-            for (pos=0u; pos<SP && nd<128u; pos++) {
-                uint32_t ay=pos/Wd, ax=pos%Wd, c, k;
-                /* cheapest first: class-0 (person) score; skip background anchors */
+            uint32_t H=hw[s2], Wd=H, SP=H*Wd, pos, local_n=0u;
+            dfl_prepare_tables(bbs[s2], dfl_wk, dfl_elut);
+            yolo_dfl_load_weights(dfl_wk);
+            yolo_dfl_load_exp_lut(dfl_elut);
+            for (pos=0u; pos<SP && nd + local_n < 128u; pos++) {
+                uint32_t ay=pos/Wd, ax=pos%Wd, c;
+                /* cheapest first: class-0 (person) gate. sigmoid is monotonic, so
+                 * sigmoid(lg0)<0.25 <=> lg0 < ln(1/3); compare the raw logit and skip
+                 * non-candidate anchors entirely. */
                 float lg0=dq(clB[s2],SP,0u,pos,clz[s2],cls[s2]);
-                float p0=1.0f/(1.0f+my_exp(-lg0));
-                if(p0<0.25f) continue;
-                float coord[4];
-                for (c=0u;c<4u;c++){
-                    float d[16], mx=-1e30f, sum=0.0f, val=0.0f;
-                    for(k=0u;k<16u;k++){ d[k]=dq(bbB[s2],SP,c*16u+k,pos,bbz[s2],bbs[s2]); if(d[k]>mx)mx=d[k]; }
-                    for(k=0u;k<16u;k++){ d[k]=my_exp(d[k]-mx); sum+=d[k]; }
-                    for(k=0u;k<16u;k++){ val+=(d[k]/sum)*yolo_hd_dfl_w[k]; }
-                    coord[c]=val;
+                if(lg0 < -1.09861229f) continue;   /* sigmoid(lg0) < 0.25 */
+                cand_ax[local_n] = (uint16_t)ax;
+                cand_ay[local_n] = (uint16_t)ay;
+                for (c=0u; c<4u; c++) {
+                    volatile uint32_t *src = (volatile uint32_t *)(bbB[s2] + (c*SP + pos)*16u);
+                    volatile uint32_t *dst = (volatile uint32_t *)(HD_DFL_IN + (local_n*4u + c)*16u);
+                    dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
                 }
-                float x1=((float)ax+0.5f-coord[0])*(float)st[s2], y1=((float)ay+0.5f-coord[1])*(float)st[s2];
-                float x2=((float)ax+0.5f+coord[2])*(float)st[s2], y2=((float)ay+0.5f+coord[3])*(float)st[s2];
-                dx1[nd]=x1;dy1[nd]=y1;dx2[nd]=x2;dy2[nd]=y2; nd++;
+                local_n++;
+            }
+            if (local_n != 0u) {
+                uint32_t q;
+                if (!yolo_run_dfl_ddr(HD_DFL_IN, HD_DFL_OUT, HD_DFL_ACT, local_n*4u)) {
+                    print_str("  dfl fail\n"); errors++;
+                    break;
+                }
+                for (q=0u; q<local_n; q++) {
+                    volatile uint32_t *op = (volatile uint32_t *)(HD_DFL_OUT + q*16u);
+                    uint32_t lo=op[0], hi=op[1];
+                    float coord0=q8_8_to_float((uint16_t)(lo & 0xFFFFu));
+                    float coord1=q8_8_to_float((uint16_t)(lo >> 16));
+                    float coord2=q8_8_to_float((uint16_t)(hi & 0xFFFFu));
+                    float coord3=q8_8_to_float((uint16_t)(hi >> 16));
+                    float axf=(float)cand_ax[q], ayf=(float)cand_ay[q];
+                    dx1[nd]=(axf+0.5f-coord0)*(float)st[s2];
+                    dy1[nd]=(ayf+0.5f-coord1)*(float)st[s2];
+                    dx2[nd]=(axf+0.5f+coord2)*(float)st[s2];
+                    dy2[nd]=(ayf+0.5f+coord3)*(float)st[s2];
+                    nd++;
+                }
             }
         }
         // greedy NMS (class-agnostic; golden are all one class)
         uint32_t i,j; static uint8_t sup[128];
+        for(i=0u;i<nd;i++) sup[i]=0u;
+        // print NMS-deduped det centers (works for ANY image; 14px greedy dedup)
+        print_str("  boxes(cx,cy):");
+        for(i=0u;i<nd;i++){
+            if(sup[i])continue;
+            float fcx=(dx1[i]+dx2[i])*0.5f, fcy=(dy1[i]+dy2[i])*0.5f;
+            int32_t cx=(int32_t)fcx, cy=(int32_t)fcy; if(cx<0)cx=0; if(cy<0)cy=0;
+            print_str(" ("); print_dec((uint32_t)cx); print_str(","); print_dec((uint32_t)cy); print_str(")");
+            for(j=i+1u;j<nd;j++){ float ex=(dx1[j]+dx2[j])*0.5f-fcx, ey=(dy1[j]+dy2[j])*0.5f-fcy;
+                if(ex<0)ex=-ex;
+                if(ey<0)ey=-ey;
+                if(ex<14.0f&&ey<14.0f) sup[j]=1u; }
+        }
+        print_str("\n");
         for(i=0u;i<nd;i++) sup[i]=0u;
         uint32_t matched=0u;
         // for each golden box, see if a surviving det matches center within 14px
@@ -617,6 +832,7 @@ void usercode7(void)
             if(hit) matched++;
         }
         print_str("  head dets="); print_dec(nd); print_str(" golden-matched="); print_dec(matched); print_str("/4\n");
+        prof_mark("decode_dfl_sigmoid_nms_CPU");
         if (errors==0u && matched>=4u) { print_str("YOLO FULL NET PASS (4 boxes match C oracle)\n"); return; }
         print_str("YOLO FULL NET: only "); print_dec(matched); print_str("/4 boxes matched\n");
     }

@@ -129,6 +129,9 @@ module npu_top #(
     wire [SRAM_ADDR_W-1:0]          cfg_skip_base;
     wire                            cfg_elt_signed;
     wire [7:0]                      cfg_elt_zp;
+    wire                            cfg_elt_ratio_en;
+    wire [16:0]                     cfg_elt_ratio_mul;
+    wire [5:0]                      cfg_elt_ratio_shift;
     wire                            cfg_pw_en;
     wire                            cfg_dw_en;
     wire                            cfg_gpool_en;
@@ -170,6 +173,20 @@ module npu_top #(
     wire                            upsample_en;
     wire                            upsample_we;
     wire [ACT_DATA_W-1:0]           upsample_wdata;
+    wire                            cfg_maxpool5_trig;
+    wire                            maxpool5_done;
+    wire                            maxpool5_busy;
+    wire [SRAM_ADDR_W-1:0]          maxpool5_addr;
+    wire                            maxpool5_en;
+    wire                            maxpool5_we;
+    wire [ACT_DATA_W-1:0]           maxpool5_wdata;
+    wire                            cfg_eltwise_trig;
+    wire                            eltwise_done;
+    wire                            eltwise_busy;
+    wire [SRAM_ADDR_W-1:0]          eltwise_addr;
+    wire                            eltwise_en;
+    wire                            eltwise_we;
+    wire [ACT_DATA_W-1:0]           eltwise_wdata;
     // DFL expectation engine
     wire                            cfg_dfl_trig;
     wire [SRAM_ADDR_W-1:0]          cfg_dfl_src;
@@ -358,6 +375,9 @@ module npu_top #(
         .o_skip_base      (cfg_skip_base),
         .o_elt_signed     (cfg_elt_signed),
         .o_elt_zp         (cfg_elt_zp),
+        .o_elt_ratio_en   (cfg_elt_ratio_en),
+        .o_elt_ratio_mul  (cfg_elt_ratio_mul),
+        .o_elt_ratio_shift(cfg_elt_ratio_shift),
         .i_done_irq       (status_done_irq),
         .i_busy           (status_busy),
         .i_dma_rd_err     (dma_rd_err),
@@ -412,6 +432,10 @@ module npu_top #(
         .i_expand_done     (expand_done),
         .o_upsample_trig   (cfg_upsample_trig),
         .i_upsample_done   (upsample_done),
+        .o_maxpool5_trig   (cfg_maxpool5_trig),
+        .i_maxpool5_done   (maxpool5_done),
+        .o_eltwise_trig    (cfg_eltwise_trig),
+        .i_eltwise_done    (eltwise_done),
         .o_upsample_in_w   (cfg_upsample_in_w),
         .o_upsample_in_h   (cfg_upsample_in_h),
         .o_upsample_ic_groups(cfg_upsample_ic_groups),
@@ -790,7 +814,8 @@ module npu_top #(
     // During CALC the systolic reads the window for the current IC tile.
     // ic_groups==1 → identical to the original single-tile design.
     // -----------------------------------------------------------------
-    localparam ICG_MAX = 4;
+    localparam ICG_MAX = 8;  // im2col window holds 8 IC tiles (128 ch): lets icg<=8 3x3
+                             // convs run the resident path instead of CPU ic_stream psum.
     wire [3:0] cfg_ic_groups = (cfg_dim_in_c + 16'd15) >> 4;  // 1..ICG_MAX
 
     // SRAM Read Latency Compensation
@@ -1075,6 +1100,9 @@ module npu_top #(
         .i_conv_res    (pp_feat),
         .i_skip_res    (out_sram_dob),         // Skip data from Out SRAM Port B
         .i_eltwise_en  (cfg_eltwise_en),
+        .i_elt_ratio_en   (cfg_elt_ratio_en),
+        .i_elt_ratio_mul  (cfg_elt_ratio_mul),
+        .i_elt_ratio_shift(cfg_elt_ratio_shift),
         .i_signed_mode (cfg_elt_signed),
         .i_elt_zp      (cfg_elt_zp),
         .i_vld         (pp_feat_vld),
@@ -1331,22 +1359,30 @@ module npu_top #(
     wire act_dma_wr_active = dma_sram_wr_en & ~cfg_dma_sram_sel;
     wire act_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd1);
 
-    // dfl_unit / img_expand / upsample2x / sram_copy take Act Port B while busy; else DMA muxes.
+    // dfl_unit / maxpool5x5 / eltwise_add / img_expand / upsample2x / sram_copy take Act Port B while busy; else DMA muxes.
     assign act_sram_addrb = dfl_busy ? dfl_addr
+                          : maxpool5_busy ? maxpool5_addr
+                          : eltwise_busy ? eltwise_addr
                           : expand_busy ? expand_addr
                           : upsample_busy ? upsample_addr
                           : copy_busy ? copy_act_wr_addr
                           : act_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
     assign act_sram_enb   = dfl_busy ? dfl_en
+                          : maxpool5_busy ? maxpool5_en
+                          : eltwise_busy ? eltwise_en
                           : expand_busy ? expand_en
                           : upsample_busy ? upsample_en
                           : copy_busy ? copy_act_wr_en
                           : (act_dma_wr_active | act_dma_rd_active);
     assign act_sram_dib   = dfl_busy ? dfl_wdata
+                          : maxpool5_busy ? maxpool5_wdata
+                          : eltwise_busy ? eltwise_wdata
                           : expand_busy ? expand_wdata
                           : upsample_busy ? upsample_wdata
                           : copy_busy ? copy_act_wr_data : dma_sram_wr_data;
     assign act_sram_web   = dfl_busy ? dfl_we
+                          : maxpool5_busy ? maxpool5_we
+                          : eltwise_busy ? eltwise_we
                           : expand_busy ? expand_we
                           : upsample_busy ? upsample_we
                           : copy_busy ? copy_act_wr_en : act_dma_wr_active;
@@ -1472,6 +1508,61 @@ module npu_top #(
         .i_rdata     (act_sram_dob),
         .o_busy      (upsample_busy),
         .o_done      (upsample_done)
+    );
+
+    // ===================================================================
+    // Shared Act-SRAM 5x5 stride-1 signed maxpool engine. Source/destination
+    // bases reuse the DMA SRAM-base registers; dimensions come from the same
+    // generic spatial-engine cfg as upsample2x. Default idle for MNIST.
+    // ===================================================================
+    maxpool5x5 #(
+        .ADDR_W (SRAM_ADDR_W),
+        .DATA_W (ACT_DATA_W)
+    ) u_maxpool5x5 (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .i_trig      (cfg_maxpool5_trig),
+        .i_src_base  (cfg_dma_rd_sram_base),
+        .i_dst_base  (cfg_dma_wr_sram_base),
+        .i_w         (cfg_upsample_in_w),
+        .i_h         (cfg_upsample_in_h),
+        .i_ic_groups (cfg_upsample_ic_groups),
+        .o_addr      (maxpool5_addr),
+        .o_en        (maxpool5_en),
+        .o_we        (maxpool5_we),
+        .o_wdata     (maxpool5_wdata),
+        .i_rdata     (act_sram_dob),
+        .o_busy      (maxpool5_busy),
+        .o_done      (maxpool5_done)
+    );
+
+    // ===================================================================
+    // Shared Act-SRAM signed INT8 eltwise-add engine. Source0 reuses the DMA
+    // read SRAM base, source1 uses NPU_SKIP_BASE, destination reuses DMA write
+    // SRAM base, and length reuses DMA_RD_LEN. Default idle for MNIST.
+    // ===================================================================
+    eltwise_add_engine #(
+        .ADDR_W (SRAM_ADDR_W),
+        .DATA_W (ACT_DATA_W)
+    ) u_eltwise_add_engine (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .i_trig        (cfg_eltwise_trig),
+        .i_src0_base   (cfg_dma_rd_sram_base),
+        .i_src1_base   (cfg_skip_base),
+        .i_dst_base    (cfg_dma_wr_sram_base),
+        .i_len         (cfg_dma_rd_len),
+        .i_zp          (cfg_elt_zp),
+        .i_ratio_en    (cfg_elt_ratio_en),
+        .i_ratio_mul   (cfg_elt_ratio_mul),
+        .i_ratio_shift (cfg_elt_ratio_shift),
+        .o_addr        (eltwise_addr),
+        .o_en          (eltwise_en),
+        .o_we          (eltwise_we),
+        .o_wdata       (eltwise_wdata),
+        .i_rdata       (act_sram_dob),
+        .o_busy        (eltwise_busy),
+        .o_done        (eltwise_done)
     );
 
     // ===================================================================

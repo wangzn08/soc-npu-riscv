@@ -6,6 +6,7 @@
 #include "yolo_c2f.h"
 
 #define WGT_BASE 0u
+#define C2F_ELTWISE_ACT 0u
 
 static void wr_word(uint32_t a, uint32_t w, const uint32_t l[4])
 {
@@ -49,6 +50,9 @@ static int32_t lane_s8(uint32_t w, uint32_t k) {
 // CPU residual add over one 128-bit word: add = clamp(round((prev-prev_zp)*ratio>>sh) + mcv2)
 static void add_word(uint32_t prev_ddr, uint32_t mcv2_ddr, uint32_t widx,
                      uint32_t ratio_mul, uint32_t ratio_sh, int32_t prev_zp,
+                     uint32_t dst, uint32_t dw) __attribute__((unused));
+static void add_word(uint32_t prev_ddr, uint32_t mcv2_ddr, uint32_t widx,
+                     uint32_t ratio_mul, uint32_t ratio_sh, int32_t prev_zp,
                      uint32_t dst, uint32_t dw)
 {
     uint32_t pv[4], cv[4], out[4] = {0u,0u,0u,0u}; uint32_t k;
@@ -86,6 +90,16 @@ static uint32_t wgt_src(const yolo_c2f_cfg_t *cfg, uint32_t blob_addr,
     return cfg->wgt_ddr;
 }
 
+// i-th bottleneck's half_c output ("add") base. Folded: a slot inside the
+// contiguous concat buffer [s0|s1|add0|add1|...]; legacy: the separate add_ddr[i].
+static uint32_t add_slot(const yolo_c2f_cfg_t *cfg, uint32_t i,
+                         uint32_t full_groups, uint32_t half_groups, uint32_t sp)
+{
+    if (cfg->cv2_folded)
+        return cfg->concat_ddr + (full_groups + i * half_groups) * sp * 16u;
+    return cfg->add_ddr[i];
+}
+
 int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
 {
     uint32_t half_groups = (cfg->full_c / 2u) / 16u;
@@ -93,6 +107,13 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
     uint32_t sp = cfg->spatial;
     uint32_t strip = (cfg->strip != 0u) ? cfg->strip : 16u;
     uint32_t i, pos, g;
+
+    // Concat-folded mode: the per-source requant is baked into cv2's weights, so
+    // cv1 writes s0|s1 straight into the contiguous concat buffer and each residual
+    // add_i is written into the concat add slot (no cat_req copy). add_dst() resolves
+    // the i-th half_c block's base inside concat_ddr ([s0|s1|add0|add1|...]).
+    uint32_t fold    = cfg->cv2_folded;
+    uint32_t cv1_out = fold ? cfg->concat_ddr : cfg->cv1_out_ddr;
 
     if (cfg->n_bottleneck == 0u || cfg->n_bottleneck > YOLO_C2F_MAX_BN)
         return 0;
@@ -102,7 +123,7 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
         uint32_t wd = wgt_src(cfg, cfg->cv1_wgt_ddr, cfg->cv1_wgt, cfg->cv1_wgt_words);
         uint32_t f = silu_setup(cfg, cfg->cv1_silu_lut, cfg->cv1_rq_mul,
                                 cfg->cv1_rq_shift, cfg->cv1_rq_zp);
-        if (!yolo_run_conv2d_tiled(cfg->in_ddr, wd, WGT_BASE, cfg->cv1_out_ddr,
+        if (!yolo_run_conv2d_tiled(cfg->in_ddr, wd, WGT_BASE, cv1_out,
                                    cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
                                    1u, 1u, 1u, 0u,
                                    cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
@@ -116,9 +137,9 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
         // bottleneck input (half_c) lives in DDR: i==0 => s1 slice, i>0 => add_{i-1}.
         uint32_t prev_ddr;
         if (i == 0u)
-            prev_ddr = cfg->cv1_out_ddr + (half_groups * sp) * 16u; // s1 slice base
+            prev_ddr = cv1_out + (half_groups * sp) * 16u; // s1 slice base
         else
-            prev_ddr = cfg->add_ddr[i-1u];
+            prev_ddr = add_slot(cfg, i-1u, full_groups, half_groups, sp);
 
         // Large-IC 3x3 (exact mode, half_c/16 > ICG_BUF) can't fit the im2col
         // window: stream IC via INT32 psum accumulate (CPU final SiLU). Otherwise
@@ -176,21 +197,29 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
             }
         }
 
-        // residual add (CPU) -> add_ddr[i]; or pass-through when !shortcut.
-        for (g = 0u; g < half_groups; g++)
-            for (pos = 0u; pos < sp; pos++) {
-                uint32_t widx = g * sp + pos;
-                if (cfg->shortcut)
-                    add_word(prev_ddr, cfg->mcv2_ddr, widx, cfg->add_ratio_mul[i],
-                             cfg->add_ratio_shift, cfg->add_prev_zp[i], cfg->add_ddr[i], widx);
-                else {
+        // residual add -> add slot; shortcut uses the generic Act-SRAM eltwise
+        // engine in chunks so large early C2f tensors do not require more SRAM.
+        uint32_t add_dst = add_slot(cfg, i, full_groups, half_groups, sp);
+        if (cfg->shortcut) {
+            if (!yolo_run_eltwise_add_ddr(prev_ddr, cfg->mcv2_ddr, add_dst,
+                                          C2F_ELTWISE_ACT, half_groups * sp,
+                                          cfg->add_prev_zp[i], 1u,
+                                          cfg->add_ratio_mul[i], cfg->add_ratio_shift))
+                return 0;
+        } else {
+            for (g = 0u; g < half_groups; g++)
+                for (pos = 0u; pos < sp; pos++) {
+                    uint32_t widx = g * sp + pos;
                     uint32_t cw[4]; rd_word(cfg->mcv2_ddr, widx, cw);
-                    wr_word(cfg->add_ddr[i], widx, cw);
+                    wr_word(add_dst, widx, cw);
                 }
-            }
+        }
     }
 
     // ---------- concat(s0, s1, add_0..add_{n-1}) requant to cv2 in-scale ----------
+    // Folded: cv2 weights already absorb the per-source requant and the concat
+    // buffer is filled in place, so this whole CPU loop is skipped.
+    if (!fold)
     for (pos = 0u; pos < sp; pos++) {
         uint32_t dstg = 0u;
         for (g = 0u; g < half_groups; g++)

@@ -36,6 +36,8 @@ rtl/axi_dma.v
 rtl/sram_copy.v
 rtl/img_expand.v
 rtl/upsample2x.v
+rtl/maxpool5x5.v
+rtl/eltwise_add_engine.v
 rtl/dfl_unit.v
 rtl/global_avg.v
 rtl/depthwise_engine.v
