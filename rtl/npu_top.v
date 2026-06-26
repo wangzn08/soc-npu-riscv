@@ -236,12 +236,24 @@ module npu_top #(
     wire                            desc_abort;
     wire                            desc_irq_en;
     wire                            desc_clear_done;
-    wire                            desc_busy = 1'b0;
-    wire                            desc_done = 1'b0;
-    wire                            desc_err = 1'b0;
-    wire                            desc_aborted = 1'b0;
-    wire [15:0]                     desc_pc = 16'd0;
-    wire [7:0]                      desc_err_code = 8'd0;
+    wire                            desc_busy;
+    wire                            desc_done;
+    wire                            desc_err;
+    wire                            desc_aborted;
+    wire [15:0]                     desc_pc;
+    wire [7:0]                      desc_err_code;
+    wire                            desc_irq;
+    wire                            desc_arvalid;
+    wire                            desc_arready;
+    wire [AXI_ADDR_W-1:0]           desc_araddr;
+    wire [7:0]                      desc_arlen;
+    wire [2:0]                      desc_arsize;
+    wire [1:0]                      desc_arburst;
+    wire                            desc_rvalid;
+    wire                            desc_rready;
+    wire [AXI_DATA_W-1:0]           desc_rdata;
+    wire [1:0]                      desc_rresp;
+    wire                            desc_rlast;
 
     wire [SRAM_ADDR_W-1:0]          cfg_act_addr_ping;
     wire [SRAM_ADDR_W-1:0]          cfg_act_addr_pong;
@@ -491,6 +503,40 @@ module npu_top #(
         .i_perf_wr_beat    (perf_wr_beat),
         .i_perf_rd_busy    (perf_rd_busy_r),
         .i_perf_wr_busy    (perf_wr_busy_r)
+    );
+
+    descriptor_engine #(
+        .ADDR_W      (AXI_ADDR_W),
+        .SRAM_ADDR_W (SRAM_ADDR_W)
+    ) u_descriptor_engine (
+        .clk                (clk),
+        .rst_n              (rst_n),
+        .i_desc_base_lo     (desc_base_lo),
+        .i_desc_base_hi     (desc_base_hi),
+        .i_desc_count       (desc_count),
+        .i_desc_start       (desc_start),
+        .i_desc_abort       (desc_abort),
+        .i_desc_irq_en      (desc_irq_en),
+        .i_desc_clear_done  (desc_clear_done),
+        .i_global_idle      (~npu_busy_visible),
+        .o_busy             (desc_busy),
+        .o_done             (desc_done),
+        .o_err              (desc_err),
+        .o_aborted          (desc_aborted),
+        .o_pc               (desc_pc),
+        .o_err_code         (desc_err_code),
+        .o_irq              (desc_irq),
+        .m_axi_arvalid      (desc_arvalid),
+        .m_axi_arready      (desc_arready),
+        .m_axi_araddr       (desc_araddr),
+        .m_axi_arlen        (desc_arlen),
+        .m_axi_arsize       (desc_arsize),
+        .m_axi_arburst      (desc_arburst),
+        .m_axi_rvalid       (desc_rvalid),
+        .m_axi_rready       (desc_rready),
+        .m_axi_rdata        (desc_rdata),
+        .m_axi_rresp        (desc_rresp),
+        .m_axi_rlast        (desc_rlast)
     );
 
     // ===================================================================
@@ -760,7 +806,7 @@ module npu_top #(
     // Status signals
     assign status_done_irq = npu_done_irq;
     assign status_busy     = npu_busy_visible;
-    assign irq_done        = npu_done_irq;
+    assign irq_done        = npu_done_irq | desc_irq;
 
     // ===================================================================
     // Weight Reader
@@ -1624,6 +1670,36 @@ module npu_top #(
     // ===================================================================
     // AXI DMA — connect to SRAM Port B (DDR ↔ SRAM)
     // ===================================================================
+    wire                         dma_axi_arvalid;
+    wire                         dma_axi_arready;
+    wire [AXI_ID_W-1:0]          dma_axi_arid;
+    wire [AXI_ADDR_W-1:0]        dma_axi_araddr;
+    wire [AXI_LEN_W-1:0]         dma_axi_arlen;
+    wire [2:0]                   dma_axi_arsize;
+    wire [1:0]                   dma_axi_arburst;
+    wire                         dma_axi_rvalid;
+    wire                         dma_axi_rready;
+    wire [AXI_ID_W-1:0]          dma_axi_rid;
+    wire [AXI_DATA_W-1:0]        dma_axi_rdata;
+    wire [1:0]                   dma_axi_rresp;
+    wire                         dma_axi_rlast;
+    wire                         dma_axi_awvalid;
+    wire                         dma_axi_awready;
+    wire [AXI_ID_W-1:0]          dma_axi_awid;
+    wire [AXI_ADDR_W-1:0]        dma_axi_awaddr;
+    wire [AXI_LEN_W-1:0]         dma_axi_awlen;
+    wire [2:0]                   dma_axi_awsize;
+    wire [1:0]                   dma_axi_awburst;
+    wire                         dma_axi_wvalid;
+    wire                         dma_axi_wready;
+    wire [AXI_DATA_W-1:0]        dma_axi_wdata;
+    wire [AXI_DATA_W/8-1:0]      dma_axi_wstrb;
+    wire                         dma_axi_wlast;
+    wire                         dma_axi_bvalid;
+    wire                         dma_axi_bready;
+    wire [AXI_ID_W-1:0]          dma_axi_bid;
+    wire [1:0]                   dma_axi_bresp;
+
     axi_dma #(
         .AXI_ADDR_W  (AXI_ADDR_W),
         .AXI_DATA_W  (AXI_DATA_W),
@@ -1660,35 +1736,72 @@ module npu_top #(
         .i_sram_rd_data    (dma_sram_rd_data),
 
         // AXI4-Full Master
-        .m_axi_arvalid   (m_axi_arvalid),
-        .m_axi_arready   (m_axi_arready),
-        .m_axi_arid      (m_axi_arid),
-        .m_axi_araddr    (m_axi_araddr),
-        .m_axi_arlen     (m_axi_arlen),
-        .m_axi_arsize    (m_axi_arsize),
-        .m_axi_arburst   (m_axi_arburst),
-        .m_axi_rvalid    (m_axi_rvalid),
-        .m_axi_rready    (m_axi_rready),
-        .m_axi_rid       (m_axi_rid),
-        .m_axi_rdata     (m_axi_rdata),
-        .m_axi_rresp     (m_axi_rresp),
-        .m_axi_rlast     (m_axi_rlast),
-        .m_axi_awvalid   (m_axi_awvalid),
-        .m_axi_awready   (m_axi_awready),
-        .m_axi_awid      (m_axi_awid),
-        .m_axi_awaddr    (m_axi_awaddr),
-        .m_axi_awlen     (m_axi_awlen),
-        .m_axi_awsize    (m_axi_awsize),
-        .m_axi_awburst   (m_axi_awburst),
-        .m_axi_wvalid    (m_axi_wvalid),
-        .m_axi_wready    (m_axi_wready),
-        .m_axi_wdata     (m_axi_wdata),
-        .m_axi_wstrb     (m_axi_wstrb),
-        .m_axi_wlast     (m_axi_wlast),
-        .m_axi_bvalid    (m_axi_bvalid),
-        .m_axi_bready    (m_axi_bready),
-        .m_axi_bid       (m_axi_bid),
-        .m_axi_bresp     (m_axi_bresp)
+        .m_axi_arvalid   (dma_axi_arvalid),
+        .m_axi_arready   (dma_axi_arready),
+        .m_axi_arid      (dma_axi_arid),
+        .m_axi_araddr    (dma_axi_araddr),
+        .m_axi_arlen     (dma_axi_arlen),
+        .m_axi_arsize    (dma_axi_arsize),
+        .m_axi_arburst   (dma_axi_arburst),
+        .m_axi_rvalid    (dma_axi_rvalid),
+        .m_axi_rready    (dma_axi_rready),
+        .m_axi_rid       (dma_axi_rid),
+        .m_axi_rdata     (dma_axi_rdata),
+        .m_axi_rresp     (dma_axi_rresp),
+        .m_axi_rlast     (dma_axi_rlast),
+        .m_axi_awvalid   (dma_axi_awvalid),
+        .m_axi_awready   (dma_axi_awready),
+        .m_axi_awid      (dma_axi_awid),
+        .m_axi_awaddr    (dma_axi_awaddr),
+        .m_axi_awlen     (dma_axi_awlen),
+        .m_axi_awsize    (dma_axi_awsize),
+        .m_axi_awburst   (dma_axi_awburst),
+        .m_axi_wvalid    (dma_axi_wvalid),
+        .m_axi_wready    (dma_axi_wready),
+        .m_axi_wdata     (dma_axi_wdata),
+        .m_axi_wstrb     (dma_axi_wstrb),
+        .m_axi_wlast     (dma_axi_wlast),
+        .m_axi_bvalid    (dma_axi_bvalid),
+        .m_axi_bready    (dma_axi_bready),
+        .m_axi_bid       (dma_axi_bid),
+        .m_axi_bresp     (dma_axi_bresp)
     );
+
+    assign m_axi_arvalid   = desc_busy ? desc_arvalid : dma_axi_arvalid;
+    assign m_axi_arid      = desc_busy ? {AXI_ID_W{1'b0}} : dma_axi_arid;
+    assign m_axi_araddr    = desc_busy ? desc_araddr : dma_axi_araddr;
+    assign m_axi_arlen     = desc_busy ? desc_arlen : dma_axi_arlen;
+    assign m_axi_arsize    = desc_busy ? desc_arsize : dma_axi_arsize;
+    assign m_axi_arburst   = desc_busy ? desc_arburst : dma_axi_arburst;
+    assign desc_arready    = desc_busy ? m_axi_arready : 1'b0;
+    assign dma_axi_arready = desc_busy ? 1'b0 : m_axi_arready;
+
+    assign desc_rvalid     = desc_busy ? m_axi_rvalid : 1'b0;
+    assign desc_rdata      = m_axi_rdata;
+    assign desc_rresp      = m_axi_rresp;
+    assign desc_rlast      = m_axi_rlast;
+    assign dma_axi_rvalid  = desc_busy ? 1'b0 : m_axi_rvalid;
+    assign dma_axi_rid     = m_axi_rid;
+    assign dma_axi_rdata   = m_axi_rdata;
+    assign dma_axi_rresp   = m_axi_rresp;
+    assign dma_axi_rlast   = m_axi_rlast;
+    assign m_axi_rready    = desc_busy ? desc_rready : dma_axi_rready;
+
+    assign m_axi_awvalid   = dma_axi_awvalid;
+    assign m_axi_awid      = dma_axi_awid;
+    assign m_axi_awaddr    = dma_axi_awaddr;
+    assign m_axi_awlen     = dma_axi_awlen;
+    assign m_axi_awsize    = dma_axi_awsize;
+    assign m_axi_awburst   = dma_axi_awburst;
+    assign dma_axi_awready = m_axi_awready;
+    assign m_axi_wvalid    = dma_axi_wvalid;
+    assign m_axi_wdata     = dma_axi_wdata;
+    assign m_axi_wstrb     = dma_axi_wstrb;
+    assign m_axi_wlast     = dma_axi_wlast;
+    assign dma_axi_wready  = m_axi_wready;
+    assign dma_axi_bvalid  = m_axi_bvalid;
+    assign dma_axi_bid     = m_axi_bid;
+    assign dma_axi_bresp   = m_axi_bresp;
+    assign m_axi_bready    = dma_axi_bready;
 
 endmodule
