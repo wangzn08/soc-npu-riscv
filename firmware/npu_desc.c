@@ -16,6 +16,26 @@ extern int yolo_copy_ddr_to_ddr_via_act(uint32_t src_ddr,
                                         uint32_t dst_ddr,
                                         uint32_t scratch_act_base,
                                         uint32_t words) __attribute__((weak));
+extern int yolo_run_conv2d_tiled(uint32_t in_ddr,
+                                 uint32_t wgt_all_ddr,
+                                 uint32_t wgt_base,
+                                 uint32_t out_ddr,
+                                 uint32_t pad_row_ddr,
+                                 uint32_t in_w,
+                                 uint32_t in_h,
+                                 uint32_t in_c,
+                                 uint32_t out_c,
+                                 uint32_t kernel_h,
+                                 uint32_t kernel_w,
+                                 uint32_t stride,
+                                 uint32_t pad,
+                                 const int32_t *bias,
+                                 const uint32_t *scale_mul,
+                                 const uint32_t *scale_shift,
+                                 uint32_t ctrl_flags,
+                                 uint32_t wgt_words_per_oc,
+                                 uint32_t strip_out_rows,
+                                 int32_t pad_value) __attribute__((weak));
 
 int npu_desc_validate(const npu_desc_t *d)
 {
@@ -68,7 +88,14 @@ int npu_desc_run(const npu_desc_t *d)
             return 0;
         return yolo_copy_ddr_to_ddr_via_act(d->src0, d->dst, d->scratch0, d->words);
     case NPU_DESC_OP_CONV2D_TILED:
-        return 0;
+        if (yolo_run_conv2d_tiled == (void *)0)
+            return 0;
+        return yolo_run_conv2d_tiled(d->src0, d->wgt, d->scratch0, d->dst, d->scratch1,
+                                     d->in_w, d->in_h, d->in_c, d->out_c,
+                                     d->kh, d->kw, d->stride, d->pad,
+                                     d->bias, d->scale_mul, d->scale_shift,
+                                     d->flags, d->wgt_words_per_oc,
+                                     d->strip_out_rows, d->pad_value);
     default:
         return 0;
     }
