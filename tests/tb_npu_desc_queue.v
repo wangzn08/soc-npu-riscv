@@ -56,9 +56,10 @@ module tb_npu_desc_queue;
 
     always #5 clk = ~clk;
 
-    reg [127:0] ddr [0:15];
+    reg [127:0] ddr [0:63];
     reg [7:0] rd_base;
-    reg [1:0] rd_cnt;
+    reg [7:0] rd_cnt;
+    reg [7:0] rd_last_cnt;
     integer errors = 0;
     integer wait_i;
     reg [31:0] rd_data;
@@ -68,20 +69,22 @@ module tb_npu_desc_queue;
             m_axi_rvalid <= 1'b0;
             m_axi_rlast <= 1'b0;
             rd_base <= 8'd0;
-            rd_cnt <= 2'd0;
+            rd_cnt <= 8'd0;
+            rd_last_cnt <= 8'd0;
         end else begin
             if (m_axi_arvalid && m_axi_arready) begin
                 rd_base <= m_axi_araddr[9:4];
-                rd_cnt <= 2'd0;
+                rd_cnt <= 8'd0;
+                rd_last_cnt <= m_axi_arlen;
                 m_axi_rvalid <= 1'b1;
-                m_axi_rlast <= 1'b0;
+                m_axi_rlast <= (m_axi_arlen == 8'd0);
             end else if (m_axi_rvalid && m_axi_rready) begin
-                if (rd_cnt == 2'd3) begin
+                if (rd_cnt == rd_last_cnt) begin
                     m_axi_rvalid <= 1'b0;
                     m_axi_rlast <= 1'b0;
                 end else begin
-                    rd_cnt <= rd_cnt + 2'd1;
-                    m_axi_rlast <= (rd_cnt == 2'd2);
+                    rd_cnt <= rd_cnt + 8'd1;
+                    m_axi_rlast <= (rd_cnt + 8'd1 == rd_last_cnt);
                 end
             end
         end
@@ -122,14 +125,16 @@ module tb_npu_desc_queue;
         s_axi_awvalid=0; s_axi_wvalid=0; s_axi_arvalid=0; s_axi_bready=0; s_axi_rready=0;
         s_axi_awaddr=0; s_axi_wdata=0; s_axi_wstrb=0; s_axi_araddr=0;
 
-        ddr[0] = {32'h0, 32'h0, 32'h0, 32'h0000_0100}; // NOP
-        ddr[1] = 128'h0;
+        ddr[0] = {32'h0, 32'h4000_0100, 32'h0, 32'h0000_0101}; // DMA_DDR_TO_ACT
+        ddr[1] = {32'd2, 32'h0, 32'h0, 32'd4};
         ddr[2] = 128'h0;
         ddr[3] = 128'h0;
         ddr[4] = {32'h0, 32'h0, 32'h0, 32'h0000_0108}; // STOP_IRQ
         ddr[5] = 128'h0;
         ddr[6] = 128'h0;
         ddr[7] = 128'h0;
+        ddr[16] = 128'h00112233445566778899aabbccddeeff;
+        ddr[17] = 128'hffeeddccbbaa99887766554433221100;
 
         repeat (5) @(posedge clk);
         rst_n = 1'b1;
@@ -158,6 +163,14 @@ module tb_npu_desc_queue;
         reg_read(12'h414, rd_data);
         if (rd_data != 32'd1) begin
             $display("FAIL desc pc=%0d", rd_data);
+            errors = errors + 1;
+        end
+        if (dut.u_act_sram.u_bram.mem[4] !== 128'h00112233445566778899aabbccddeeff) begin
+            $display("FAIL act[4]=0x%032h", dut.u_act_sram.u_bram.mem[4]);
+            errors = errors + 1;
+        end
+        if (dut.u_act_sram.u_bram.mem[5] !== 128'hffeeddccbbaa99887766554433221100) begin
+            $display("FAIL act[5]=0x%032h", dut.u_act_sram.u_bram.mem[5]);
             errors = errors + 1;
         end
 

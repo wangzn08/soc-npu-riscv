@@ -16,6 +16,13 @@ module tb_descriptor_engine;
     wire busy, done, err, aborted, irq;
     wire [15:0] pc;
     wire [7:0] err_code;
+    wire dma_rd_req, dma_wr_req, copy_trig, expand_trig;
+    wire [31:0] dma_rd_ddr_addr, dma_wr_ddr_addr;
+    wire [15:0] dma_rd_len, dma_wr_len;
+    wire [13:0] dma_rd_sram_base, dma_wr_sram_base;
+    wire dma_sram_sel, dma_out_rd_sel;
+    wire [1:0] dma_rd_sram_sel;
+    wire dma_act_ping_sel, dma_wgt_ping_sel, dma_out_ping_sel;
 
     wire arvalid;
     reg arready = 1'b1;
@@ -57,7 +64,27 @@ module tb_descriptor_engine;
         .m_axi_rready(rready),
         .m_axi_rdata(rdata),
         .m_axi_rresp(rresp),
-        .m_axi_rlast(rlast)
+        .m_axi_rlast(rlast),
+        .o_dma_rd_req(dma_rd_req),
+        .o_dma_wr_req(dma_wr_req),
+        .o_dma_rd_ddr_addr(dma_rd_ddr_addr),
+        .o_dma_wr_ddr_addr(dma_wr_ddr_addr),
+        .o_dma_rd_len(dma_rd_len),
+        .o_dma_wr_len(dma_wr_len),
+        .o_dma_rd_sram_base(dma_rd_sram_base),
+        .o_dma_wr_sram_base(dma_wr_sram_base),
+        .o_dma_sram_sel(dma_sram_sel),
+        .o_dma_out_rd_sel(dma_out_rd_sel),
+        .o_dma_rd_sram_sel(dma_rd_sram_sel),
+        .o_dma_act_ping_sel(dma_act_ping_sel),
+        .o_dma_wgt_ping_sel(dma_wgt_ping_sel),
+        .o_dma_out_ping_sel(dma_out_ping_sel),
+        .o_copy_trig(copy_trig),
+        .o_expand_trig(expand_trig),
+        .i_dma_rd_done(1'b0),
+        .i_dma_wr_done(1'b0),
+        .i_copy_done(1'b0),
+        .i_expand_done(1'b0)
     );
 
     always #5 clk = ~clk;

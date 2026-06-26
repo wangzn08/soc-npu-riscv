@@ -307,6 +307,39 @@ module npu_top #(
     wire                            cfg_dma_act_ping_sel; // DMA Act SRAM buffer select
     wire                            cfg_dma_wgt_ping_sel; // DMA Wgt SRAM buffer select
     wire                            cfg_dma_out_ping_sel; // DMA Out SRAM read bank (decoupled from NPU write bank)
+    wire                            desc_dma_rd_req;
+    wire                            desc_dma_wr_req;
+    wire [31:0]                     desc_dma_rd_ddr_addr;
+    wire [31:0]                     desc_dma_wr_ddr_addr;
+    wire [15:0]                     desc_dma_rd_len;
+    wire [15:0]                     desc_dma_wr_len;
+    wire [SRAM_ADDR_W-1:0]          desc_dma_rd_sram_base;
+    wire [SRAM_ADDR_W-1:0]          desc_dma_wr_sram_base;
+    wire                            desc_dma_sram_sel;
+    wire                            desc_dma_out_rd_sel;
+    wire [1:0]                      desc_dma_rd_sram_sel;
+    wire                            desc_dma_act_ping_sel;
+    wire                            desc_dma_wgt_ping_sel;
+    wire                            desc_dma_out_ping_sel;
+    wire                            desc_copy_trig;
+    wire                            desc_expand_trig;
+
+    wire                            run_dma_rd_req       = desc_busy ? desc_dma_rd_req       : cfg_dma_rd_req;
+    wire [31:0]                     run_dma_rd_ddr_addr  = desc_busy ? desc_dma_rd_ddr_addr  : cfg_dma_rd_ddr_addr;
+    wire [15:0]                     run_dma_rd_len       = desc_busy ? desc_dma_rd_len       : cfg_dma_rd_len;
+    wire [SRAM_ADDR_W-1:0]          run_dma_rd_sram_base = desc_busy ? desc_dma_rd_sram_base : cfg_dma_rd_sram_base;
+    wire                            run_dma_wr_req       = desc_busy ? desc_dma_wr_req       : cfg_dma_wr_req;
+    wire [31:0]                     run_dma_wr_ddr_addr  = desc_busy ? desc_dma_wr_ddr_addr  : cfg_dma_wr_ddr_addr;
+    wire [15:0]                     run_dma_wr_len       = desc_busy ? desc_dma_wr_len       : cfg_dma_wr_len;
+    wire [SRAM_ADDR_W-1:0]          run_dma_wr_sram_base = desc_busy ? desc_dma_wr_sram_base : cfg_dma_wr_sram_base;
+    wire                            run_dma_sram_sel     = desc_busy ? desc_dma_sram_sel     : cfg_dma_sram_sel;
+    wire                            run_dma_out_rd_sel   = desc_busy ? desc_dma_out_rd_sel   : cfg_dma_out_rd_sel;
+    wire [1:0]                      run_dma_rd_sram_sel  = desc_busy ? desc_dma_rd_sram_sel  : cfg_dma_rd_sram_sel;
+    wire                            run_dma_act_ping_sel = desc_busy ? desc_dma_act_ping_sel : cfg_dma_act_ping_sel;
+    wire                            run_dma_wgt_ping_sel = desc_busy ? desc_dma_wgt_ping_sel : cfg_dma_wgt_ping_sel;
+    wire                            run_dma_out_ping_sel = desc_busy ? desc_dma_out_ping_sel : cfg_dma_out_ping_sel;
+    wire                            run_copy_trig        = desc_busy ? desc_copy_trig        : cfg_copy_trig;
+    wire                            run_expand_trig      = desc_busy ? desc_expand_trig      : cfg_expand_trig;
 
     // ===================================================================
     // Performance counter event strobes (fed to param_regfile @0x3A4+).
@@ -536,7 +569,27 @@ module npu_top #(
         .m_axi_rready       (desc_rready),
         .m_axi_rdata        (desc_rdata),
         .m_axi_rresp        (desc_rresp),
-        .m_axi_rlast        (desc_rlast)
+        .m_axi_rlast        (desc_rlast),
+        .o_dma_rd_req       (desc_dma_rd_req),
+        .o_dma_wr_req       (desc_dma_wr_req),
+        .o_dma_rd_ddr_addr  (desc_dma_rd_ddr_addr),
+        .o_dma_wr_ddr_addr  (desc_dma_wr_ddr_addr),
+        .o_dma_rd_len       (desc_dma_rd_len),
+        .o_dma_wr_len       (desc_dma_wr_len),
+        .o_dma_rd_sram_base (desc_dma_rd_sram_base),
+        .o_dma_wr_sram_base (desc_dma_wr_sram_base),
+        .o_dma_sram_sel     (desc_dma_sram_sel),
+        .o_dma_out_rd_sel   (desc_dma_out_rd_sel),
+        .o_dma_rd_sram_sel  (desc_dma_rd_sram_sel),
+        .o_dma_act_ping_sel (desc_dma_act_ping_sel),
+        .o_dma_wgt_ping_sel (desc_dma_wgt_ping_sel),
+        .o_dma_out_ping_sel (desc_dma_out_ping_sel),
+        .o_copy_trig        (desc_copy_trig),
+        .o_expand_trig      (desc_expand_trig),
+        .i_dma_rd_done      (dma_rd_done),
+        .i_dma_wr_done      (dma_wr_done),
+        .i_copy_done        (copy_done),
+        .i_expand_done      (expand_done)
     );
 
     // ===================================================================
@@ -568,7 +621,7 @@ module npu_top #(
         .dib           (act_sram_dib),
         .dob           (act_sram_dob),
         .npu_ping_sel  (cfg_ping_pong_sel),
-        .dma_ping_sel  (cfg_dma_act_ping_sel)
+        .dma_ping_sel  (run_dma_act_ping_sel)
     );
 
     // Wgt SRAM: Port A = NPU read (wgt_reader), Port B = DMA
@@ -597,7 +650,7 @@ module npu_top #(
         .dib           (wgt_sram_dib),
         .dob           (wgt_sram_dob),
         .npu_ping_sel  (cfg_ping_pong_sel),
-        .dma_ping_sel  (cfg_dma_wgt_ping_sel)
+        .dma_ping_sel  (run_dma_wgt_ping_sel)
     );
 
     // Out SRAM: Port A = NPU write (post-process output), Port B = DMA
@@ -630,7 +683,7 @@ module npu_top #(
         .dib           (out_sram_dib),
         .dob           (out_sram_dob),
         .npu_ping_sel  (cfg_out_ping_sel),     // NPU write bank for Out SRAM (CTRL[6]), independent of global ping_pong
-        .dma_ping_sel  (cfg_dma_out_ping_sel) // DMA Out SRAM read bank is independent of NPU write bank
+        .dma_ping_sel  (run_dma_out_ping_sel) // DMA Out SRAM read bank is independent of NPU write bank
     );
 
     // synthesis translate_off
@@ -1428,8 +1481,8 @@ module npu_top #(
 
     // Act SRAM Port B: DMA writes (sel=0) or DMA reads (rd_sram_sel=1)
     // DMA read/write are mutually exclusive; write has priority
-    wire act_dma_wr_active = dma_sram_wr_en & ~cfg_dma_sram_sel;
-    wire act_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd1);
+    wire act_dma_wr_active = dma_sram_wr_en & ~run_dma_sram_sel;
+    wire act_dma_rd_active = dma_sram_rd_en & (run_dma_rd_sram_sel == 2'd1);
 
     // dfl_unit / maxpool5x5 / eltwise_add / img_expand / upsample2x / sram_copy take Act Port B while busy; else DMA muxes.
     assign act_sram_addrb = dfl_busy ? dfl_addr
@@ -1460,8 +1513,8 @@ module npu_top #(
                           : copy_busy ? copy_act_wr_en : act_dma_wr_active;
 
     // Wgt SRAM Port B: DMA writes (sel=1) or DMA reads (rd_sram_sel=2)
-    wire wgt_dma_wr_active = dma_sram_wr_en & cfg_dma_sram_sel;
-    wire wgt_dma_rd_active = dma_sram_rd_en & (cfg_dma_rd_sram_sel == 2'd2);
+    wire wgt_dma_wr_active = dma_sram_wr_en & run_dma_sram_sel;
+    wire wgt_dma_rd_active = dma_sram_rd_en & (run_dma_rd_sram_sel == 2'd2);
 
     assign wgt_sram_addrb = wgt_dma_wr_active ? dma_sram_wr_addr : dma_sram_rd_addr;
     assign wgt_sram_enb   = wgt_dma_wr_active | wgt_dma_rd_active;
@@ -1470,7 +1523,7 @@ module npu_top #(
 
     // Out SRAM Port B: mux between skip-read path and DMA read
     // Skip path: reads previous layer's output for eltwise addition
-    wire skip_rd_en = cfg_eltwise_en & pp_feat_vld & ~cfg_dma_out_rd_sel;
+    wire skip_rd_en = cfg_eltwise_en & pp_feat_vld & ~run_dma_out_rd_sel;
     // Residual skip source: configurable base (NPU_SKIP_BASE) + the write-position
     // offset. cfg_skip_base=0 ⇒ same-address legacy in-place accumulate.
     wire [OUT_SRAM_ADDR_W-1:0] skip_rd_addr =
@@ -1480,8 +1533,8 @@ module npu_top #(
     wire [OUT_SRAM_ADDR_W-1:0] out_sram_addrb_mux;
     wire                       out_sram_enb_mux;
 
-    assign out_sram_addrb_mux = cfg_dma_out_rd_sel ? out_sram_addrb_dma : skip_rd_addr;
-    assign out_sram_enb_mux   = cfg_dma_out_rd_sel ? out_sram_enb_dma   : skip_rd_en;
+    assign out_sram_addrb_mux = run_dma_out_rd_sel ? out_sram_addrb_dma : skip_rd_addr;
+    assign out_sram_enb_mux   = run_dma_out_rd_sel ? out_sram_enb_dma   : skip_rd_en;
 
     // sram_copy takes Out Port B while busy (reads); else the skip/DMA mux.
     assign out_sram_addrb = copy_busy ? copy_out_rd_addr : out_sram_addrb_mux;
@@ -1491,14 +1544,14 @@ module npu_top #(
 
     // DMA SRAM read data mux: select source based on cfg_dma_rd_sram_sel
     // 0=Out SRAM, 1=Act SRAM, 2=Wgt SRAM
-    assign dma_sram_rd_data = (cfg_dma_rd_sram_sel == 2'd1) ? act_sram_dob :
-                              (cfg_dma_rd_sram_sel == 2'd2) ? wgt_sram_dob :
+    assign dma_sram_rd_data = (run_dma_rd_sram_sel == 2'd1) ? act_sram_dob :
+                              (run_dma_rd_sram_sel == 2'd2) ? wgt_sram_dob :
                                                                out_sram_dob;
 
     // synthesis translate_off
     `ifdef DEBUG
     always @(posedge clk) begin
-        if (out_sram_enb_mux && cfg_dma_out_rd_sel)
+        if (out_sram_enb_mux && run_dma_out_rd_sel)
             $display("OUTSRAM_RD: addr=%0h data=%0h ping=%0b dma_ping=%0b",
                      out_sram_addrb_mux, out_sram_dob, cfg_ping_pong_sel, ~cfg_ping_pong_sel);
     end
@@ -1518,10 +1571,10 @@ module npu_top #(
     ) u_sram_copy (
         .clk           (clk),
         .rst_n         (rst_n),
-        .i_trig        (cfg_copy_trig),
-        .i_src_base    (cfg_dma_rd_sram_base),
-        .i_dst_base    (cfg_dma_wr_sram_base),
-        .i_len         (cfg_dma_rd_len),
+        .i_trig        (run_copy_trig),
+        .i_src_base    (run_dma_rd_sram_base),
+        .i_dst_base    (run_dma_wr_sram_base),
+        .i_len         (run_dma_rd_len),
         .o_out_rd_addr (copy_out_rd_addr),
         .o_out_rd_en   (copy_out_rd_en),
         .i_out_rd_data (out_sram_dob),
@@ -1543,10 +1596,10 @@ module npu_top #(
     ) u_img_expand (
         .clk        (clk),
         .rst_n      (rst_n),
-        .i_trig     (cfg_expand_trig),
-        .i_src_base (cfg_dma_rd_sram_base),
-        .i_dst_base (cfg_dma_wr_sram_base),
-        .i_n_out    (cfg_dma_rd_len),
+        .i_trig     (run_expand_trig),
+        .i_src_base (run_dma_rd_sram_base),
+        .i_dst_base (run_dma_wr_sram_base),
+        .i_n_out    (run_dma_rd_len),
         .o_addr     (expand_addr),
         .o_en       (expand_en),
         .o_we       (expand_we),
@@ -1711,17 +1764,17 @@ module npu_top #(
         .clk               (clk),
         .rst_n             (rst_n),
 
-        .i_dma_rd_req      (cfg_dma_rd_req),
-        .i_dma_rd_ddr_addr (cfg_dma_rd_ddr_addr),
-        .i_dma_rd_len      (cfg_dma_rd_len[7:0]),
-        .i_dma_rd_sram_base(cfg_dma_rd_sram_base),
+        .i_dma_rd_req      (run_dma_rd_req),
+        .i_dma_rd_ddr_addr (run_dma_rd_ddr_addr),
+        .i_dma_rd_len      (run_dma_rd_len[7:0]),
+        .i_dma_rd_sram_base(run_dma_rd_sram_base),
         .o_dma_rd_done     (dma_rd_done),
         .o_dma_rd_err      (dma_rd_err),
 
-        .i_dma_wr_req      (cfg_dma_wr_req),
-        .i_dma_wr_ddr_addr (cfg_dma_wr_ddr_addr),
-        .i_dma_wr_len      (cfg_dma_wr_len[7:0]),
-        .i_dma_wr_sram_base(cfg_dma_wr_sram_base),
+        .i_dma_wr_req      (run_dma_wr_req),
+        .i_dma_wr_ddr_addr (run_dma_wr_ddr_addr),
+        .i_dma_wr_len      (run_dma_wr_len[7:0]),
+        .i_dma_wr_sram_base(run_dma_wr_sram_base),
         .o_dma_wr_done     (dma_wr_done),
         .o_dma_wr_err      (dma_wr_err),
 
@@ -1767,25 +1820,26 @@ module npu_top #(
         .m_axi_bresp     (dma_axi_bresp)
     );
 
-    assign m_axi_arvalid   = desc_busy ? desc_arvalid : dma_axi_arvalid;
-    assign m_axi_arid      = desc_busy ? {AXI_ID_W{1'b0}} : dma_axi_arid;
-    assign m_axi_araddr    = desc_busy ? desc_araddr : dma_axi_araddr;
-    assign m_axi_arlen     = desc_busy ? desc_arlen : dma_axi_arlen;
-    assign m_axi_arsize    = desc_busy ? desc_arsize : dma_axi_arsize;
-    assign m_axi_arburst   = desc_busy ? desc_arburst : dma_axi_arburst;
-    assign desc_arready    = desc_busy ? m_axi_arready : 1'b0;
-    assign dma_axi_arready = desc_busy ? 1'b0 : m_axi_arready;
+    wire desc_axi_rd_sel = desc_arvalid | desc_rready;
+    assign m_axi_arvalid   = desc_axi_rd_sel ? desc_arvalid : dma_axi_arvalid;
+    assign m_axi_arid      = desc_axi_rd_sel ? {AXI_ID_W{1'b0}} : dma_axi_arid;
+    assign m_axi_araddr    = desc_axi_rd_sel ? desc_araddr : dma_axi_araddr;
+    assign m_axi_arlen     = desc_axi_rd_sel ? desc_arlen : dma_axi_arlen;
+    assign m_axi_arsize    = desc_axi_rd_sel ? desc_arsize : dma_axi_arsize;
+    assign m_axi_arburst   = desc_axi_rd_sel ? desc_arburst : dma_axi_arburst;
+    assign desc_arready    = desc_axi_rd_sel ? m_axi_arready : 1'b0;
+    assign dma_axi_arready = desc_axi_rd_sel ? 1'b0 : m_axi_arready;
 
-    assign desc_rvalid     = desc_busy ? m_axi_rvalid : 1'b0;
+    assign desc_rvalid     = desc_axi_rd_sel ? m_axi_rvalid : 1'b0;
     assign desc_rdata      = m_axi_rdata;
     assign desc_rresp      = m_axi_rresp;
     assign desc_rlast      = m_axi_rlast;
-    assign dma_axi_rvalid  = desc_busy ? 1'b0 : m_axi_rvalid;
+    assign dma_axi_rvalid  = desc_axi_rd_sel ? 1'b0 : m_axi_rvalid;
     assign dma_axi_rid     = m_axi_rid;
     assign dma_axi_rdata   = m_axi_rdata;
     assign dma_axi_rresp   = m_axi_rresp;
     assign dma_axi_rlast   = m_axi_rlast;
-    assign m_axi_rready    = desc_busy ? desc_rready : dma_axi_rready;
+    assign m_axi_rready    = desc_axi_rd_sel ? desc_rready : dma_axi_rready;
 
     assign m_axi_awvalid   = dma_axi_awvalid;
     assign m_axi_awid      = dma_axi_awid;

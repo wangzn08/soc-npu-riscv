@@ -41,9 +41,35 @@ module descriptor_engine #(
     input  wire [127:0]     m_axi_rdata,
     input  wire [1:0]       m_axi_rresp,
     input  wire             m_axi_rlast
+
+    ,output reg             o_dma_rd_req
+    ,output reg             o_dma_wr_req
+    ,output reg [31:0]      o_dma_rd_ddr_addr
+    ,output reg [31:0]      o_dma_wr_ddr_addr
+    ,output reg [15:0]      o_dma_rd_len
+    ,output reg [15:0]      o_dma_wr_len
+    ,output reg [SRAM_ADDR_W-1:0] o_dma_rd_sram_base
+    ,output reg [SRAM_ADDR_W-1:0] o_dma_wr_sram_base
+    ,output reg             o_dma_sram_sel
+    ,output reg             o_dma_out_rd_sel
+    ,output reg [1:0]       o_dma_rd_sram_sel
+    ,output reg             o_dma_act_ping_sel
+    ,output reg             o_dma_wgt_ping_sel
+    ,output reg             o_dma_out_ping_sel
+    ,output reg             o_copy_trig
+    ,output reg             o_expand_trig
+    ,input  wire            i_dma_rd_done
+    ,input  wire            i_dma_wr_done
+    ,input  wire            i_copy_done
+    ,input  wire            i_expand_done
 );
 
     localparam OP_NOP      = 8'h00;
+    localparam OP_DMA_DDR_TO_ACT       = 8'h01;
+    localparam OP_DMA_ACT_TO_DDR       = 8'h02;
+    localparam OP_DMA_OUT_TO_DDR       = 8'h03;
+    localparam OP_IMG_EXPAND           = 8'h04;
+    localparam OP_SRAM_COPY_OUT_TO_ACT = 8'h05;
     localparam OP_STOP_IRQ = 8'h08;
     localparam VERSION     = 8'h01;
 
@@ -51,6 +77,7 @@ module descriptor_engine #(
     localparam ERR_BAD_VERSION   = 8'd1;
     localparam ERR_BAD_OPCODE    = 8'd2;
     localparam ERR_BAD_COUNT     = 8'd4;
+    localparam ERR_BAD_SHAPE     = 8'd6;
     localparam ERR_BUSY_AT_START = 8'd7;
     localparam ERR_AXI_DESC_READ = 8'd8;
 
@@ -59,13 +86,22 @@ module descriptor_engine #(
     localparam S_FETCH_R  = 4'd2;
     localparam S_DECODE   = 4'd3;
     localparam S_ADVANCE  = 4'd4;
-    localparam S_DONE     = 4'd5;
-    localparam S_ERROR    = 4'd6;
-    localparam S_ABORT    = 4'd7;
+    localparam S_START_OP = 4'd5;
+    localparam S_WAIT_OP  = 4'd6;
+    localparam S_DONE     = 4'd7;
+    localparam S_ERROR    = 4'd8;
+    localparam S_ABORT    = 4'd9;
+
+    localparam WAIT_NONE   = 3'd0;
+    localparam WAIT_DMA_RD = 3'd1;
+    localparam WAIT_DMA_WR = 3'd2;
+    localparam WAIT_COPY   = 3'd3;
+    localparam WAIT_EXPAND = 3'd4;
 
     reg [3:0] state;
     reg [1:0] beat_idx;
     reg [31:0] desc_w [0:15];
+    reg [2:0] wait_kind;
     integer i;
 
     wire [7:0] desc_op      = desc_w[0][7:0];
@@ -100,9 +136,31 @@ module descriptor_engine #(
             m_axi_arlen <= 8'd0;
             m_axi_rready <= 1'b0;
             beat_idx <= 2'd0;
+            wait_kind <= WAIT_NONE;
+            o_dma_rd_req <= 1'b0;
+            o_dma_wr_req <= 1'b0;
+            o_dma_rd_ddr_addr <= 32'd0;
+            o_dma_wr_ddr_addr <= 32'd0;
+            o_dma_rd_len <= 16'd0;
+            o_dma_wr_len <= 16'd0;
+            o_dma_rd_sram_base <= {SRAM_ADDR_W{1'b0}};
+            o_dma_wr_sram_base <= {SRAM_ADDR_W{1'b0}};
+            o_dma_sram_sel <= 1'b0;
+            o_dma_out_rd_sel <= 1'b0;
+            o_dma_rd_sram_sel <= 2'd0;
+            o_dma_act_ping_sel <= 1'b0;
+            o_dma_wgt_ping_sel <= 1'b0;
+            o_dma_out_ping_sel <= 1'b0;
+            o_copy_trig <= 1'b0;
+            o_expand_trig <= 1'b0;
             for (i = 0; i < 16; i = i + 1)
                 desc_w[i] <= 32'd0;
         end else begin
+            o_dma_rd_req <= 1'b0;
+            o_dma_wr_req <= 1'b0;
+            o_copy_trig <= 1'b0;
+            o_expand_trig <= 1'b0;
+
             if (i_desc_clear_done) begin
                 o_done <= 1'b0;
                 if (!o_busy) begin
@@ -181,8 +239,87 @@ module descriptor_engine #(
                         o_busy <= 1'b0;
                         o_done <= 1'b1;
                         state <= S_DONE;
+                    end else if (desc_op == OP_DMA_DDR_TO_ACT ||
+                                 desc_op == OP_DMA_ACT_TO_DDR ||
+                                 desc_op == OP_DMA_OUT_TO_DDR ||
+                                 desc_op == OP_IMG_EXPAND ||
+                                 desc_op == OP_SRAM_COPY_OUT_TO_ACT) begin
+                        if (desc_w[7] == 32'd0)
+                            set_error(ERR_BAD_SHAPE);
+                        else
+                            state <= S_START_OP;
                     end else begin
                         set_error(ERR_BAD_OPCODE);
+                    end
+                end
+
+                S_START_OP: begin
+                    case (desc_op)
+                    OP_DMA_DDR_TO_ACT: begin
+                        o_dma_sram_sel <= 1'b0;
+                        o_dma_out_rd_sel <= 1'b0;
+                        o_dma_rd_sram_sel <= 2'd1;
+                        o_dma_rd_ddr_addr <= desc_w[2];
+                        o_dma_rd_len <= desc_w[7][15:0] - 16'd1;
+                        o_dma_rd_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];
+                        o_dma_rd_req <= 1'b1;
+                        wait_kind <= WAIT_DMA_RD;
+                        state <= S_WAIT_OP;
+                    end
+                    OP_DMA_ACT_TO_DDR: begin
+                        o_dma_out_rd_sel <= 1'b0;
+                        o_dma_rd_sram_sel <= 2'd1;
+                        o_dma_wr_ddr_addr <= desc_w[4];
+                        o_dma_wr_len <= desc_w[7][15:0] - 16'd1;
+                        o_dma_wr_sram_base <= desc_w[2][SRAM_ADDR_W-1:0];
+                        o_dma_wr_req <= 1'b1;
+                        wait_kind <= WAIT_DMA_WR;
+                        state <= S_WAIT_OP;
+                    end
+                    OP_DMA_OUT_TO_DDR: begin
+                        o_dma_out_rd_sel <= 1'b1;
+                        o_dma_rd_sram_sel <= 2'd0;
+                        o_dma_wr_ddr_addr <= desc_w[4];
+                        o_dma_wr_len <= desc_w[7][15:0] - 16'd1;
+                        o_dma_wr_sram_base <= desc_w[2][SRAM_ADDR_W-1:0];
+                        o_dma_out_ping_sel <= desc_w[1][2];
+                        o_dma_wr_req <= 1'b1;
+                        wait_kind <= WAIT_DMA_WR;
+                        state <= S_WAIT_OP;
+                    end
+                    OP_IMG_EXPAND: begin
+                        o_dma_act_ping_sel <= desc_w[1][0];
+                        o_dma_wgt_ping_sel <= desc_w[1][1];
+                        o_dma_out_ping_sel <= desc_w[1][2];
+                        o_dma_rd_sram_base <= desc_w[2][SRAM_ADDR_W-1:0];
+                        o_dma_wr_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];
+                        o_dma_rd_len <= desc_w[7][15:0];
+                        o_expand_trig <= 1'b1;
+                        wait_kind <= WAIT_EXPAND;
+                        state <= S_WAIT_OP;
+                    end
+                    OP_SRAM_COPY_OUT_TO_ACT: begin
+                        o_dma_act_ping_sel <= desc_w[1][0];
+                        o_dma_wgt_ping_sel <= desc_w[1][1];
+                        o_dma_out_ping_sel <= desc_w[1][2];
+                        o_dma_rd_sram_base <= desc_w[2][SRAM_ADDR_W-1:0];
+                        o_dma_wr_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];
+                        o_dma_rd_len <= desc_w[7][15:0];
+                        o_copy_trig <= 1'b1;
+                        wait_kind <= WAIT_COPY;
+                        state <= S_WAIT_OP;
+                    end
+                    default: set_error(ERR_BAD_OPCODE);
+                    endcase
+                end
+
+                S_WAIT_OP: begin
+                    if ((wait_kind == WAIT_DMA_RD && i_dma_rd_done) ||
+                        (wait_kind == WAIT_DMA_WR && i_dma_wr_done) ||
+                        (wait_kind == WAIT_COPY   && i_copy_done) ||
+                        (wait_kind == WAIT_EXPAND && i_expand_done)) begin
+                        wait_kind <= WAIT_NONE;
+                        state <= S_ADVANCE;
                     end
                 end
 
