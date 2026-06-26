@@ -43,4 +43,54 @@ int npu_desc_validate(const npu_desc_t *d);
 int npu_desc_run(const npu_desc_t *d);
 int npu_desc_run_many(const npu_desc_t *list, uint32_t count);
 
+#define NPU_HW_DESC_VERSION 1u
+#define NPU_HW_DESC_WORDS   16u
+
+#define NPU_HW_DESC_OP_NOP                  0x00u
+#define NPU_HW_DESC_OP_DMA_DDR_TO_ACT       0x01u
+#define NPU_HW_DESC_OP_DMA_ACT_TO_DDR       0x02u
+#define NPU_HW_DESC_OP_DMA_OUT_TO_DDR       0x03u
+#define NPU_HW_DESC_OP_IMG_EXPAND           0x04u
+#define NPU_HW_DESC_OP_SRAM_COPY_OUT_TO_ACT 0x05u
+#define NPU_HW_DESC_OP_CONV2D               0x06u
+#define NPU_HW_DESC_OP_GEMM                 0x07u
+#define NPU_HW_DESC_OP_STOP_IRQ             0x08u
+
+#define NPU_HW_DESC_OP_UPSAMPLE2X           0x20u
+#define NPU_HW_DESC_OP_MAXPOOL5X5           0x21u
+#define NPU_HW_DESC_OP_ELTWISE_ADD          0x22u
+#define NPU_HW_DESC_OP_DFL                  0x23u
+#define NPU_HW_DESC_OP_LUT_LOAD             0x24u
+#define NPU_HW_DESC_OP_ACTIVATION_CFG       0x25u
+
+#define NPU_HW_DESC_ERR_NONE                0u
+#define NPU_HW_DESC_ERR_BAD_VERSION         1u
+#define NPU_HW_DESC_ERR_BAD_OPCODE          2u
+#define NPU_HW_DESC_ERR_UNSUPPORTED_OP      3u
+#define NPU_HW_DESC_ERR_BAD_COUNT           4u
+#define NPU_HW_DESC_ERR_BAD_ALIGNMENT       5u
+#define NPU_HW_DESC_ERR_BAD_SHAPE           6u
+#define NPU_HW_DESC_ERR_BUSY_AT_START       7u
+#define NPU_HW_DESC_ERR_AXI_DESC_READ       8u
+#define NPU_HW_DESC_ERR_AXI_QPARAM_READ     9u
+#define NPU_HW_DESC_ERR_ENGINE_TIMEOUT      10u
+
+typedef struct {
+    uint32_t w[NPU_HW_DESC_WORDS];
+} npu_hw_desc_t;
+
+static inline void npu_hw_desc_clear(npu_hw_desc_t *d)
+{
+    uint32_t i;
+    for (i = 0u; i < NPU_HW_DESC_WORDS; i++)
+        d->w[i] = 0u;
+}
+
+static inline void npu_hw_desc_set_op(npu_hw_desc_t *d, uint32_t op, uint32_t flags)
+{
+    d->w[0] = (op & 0xFFu) | ((NPU_HW_DESC_VERSION & 0xFFu) << 8) |
+              ((flags & 0xFFFFu) << 16);
+    d->w[1] = flags >> 16;
+}
+
 #endif

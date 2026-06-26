@@ -16,6 +16,7 @@
 - Descriptor v1 is linear: no branches, loops, dynamic graph import, or automatic memory planning.
 - Descriptor opcodes and fields must reserve YOLO phase-2 needs: `flags`, `scratch0`, `scratch1`, `wgt_words_per_oc`, `strip_out_rows`, `pad_value`, and reserved YOLO opcodes.
 - Register-map changes must update both `rtl/param_regfile.v` and `firmware/firmware.h`.
+- Descriptor registers live at offsets `0x400..0x418`; widen `REG_ADDR_W`/`ADDR_W` from 10 to 12 bits along the NPU register path so the existing 4KB NPU MMIO window (`0x3000_0000..0x3000_0FFF`) is fully reachable.
 - New RTL files must be added to `axi_sys.f`.
 - Firmware C must remain warning-clean under existing strict CFLAGS.
 - Verification uses ModelSim/Questa through `bash run_all.sh`, not VCS.

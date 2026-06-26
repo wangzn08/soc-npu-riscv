@@ -159,6 +159,27 @@ void usercode7(void);
 #define NPU_ACC_ADD    2u
 #define NPU_ACC_FINAL  3u
 
+// Hardware descriptor queue registers. These live above the legacy 0x3FF
+// param_regfile range; RTL widens the NPU register address path to the full
+// 4KB MMIO window before enabling them.
+#define NPU_DESC_BASE_LO   (NPU_BASE + 0x400)
+#define NPU_DESC_BASE_HI   (NPU_BASE + 0x404)  // reserved, write 0 in v1
+#define NPU_DESC_COUNT     (NPU_BASE + 0x408)
+#define NPU_DESC_CTRL      (NPU_BASE + 0x40C)
+#define NPU_DESC_STATUS    (NPU_BASE + 0x410)
+#define NPU_DESC_PC        (NPU_BASE + 0x414)
+#define NPU_DESC_ERR       (NPU_BASE + 0x418)
+
+#define NPU_DESC_CTRL_START      (1u << 0)
+#define NPU_DESC_CTRL_ABORT      (1u << 1)
+#define NPU_DESC_CTRL_IRQ_EN     (1u << 2)
+#define NPU_DESC_CTRL_CLEAR_DONE (1u << 3)
+
+#define NPU_DESC_STATUS_BUSY    (1u << 0)
+#define NPU_DESC_STATUS_DONE    (1u << 1)
+#define NPU_DESC_STATUS_ERR     (1u << 2)
+#define NPU_DESC_STATUS_ABORTED (1u << 3)
+
 // STATUS bits
 #define NPU_STATUS_DONE_IRQ   (1 << 0)
 #define NPU_STATUS_BUSY       (1 << 1)
