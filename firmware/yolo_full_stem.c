@@ -8,6 +8,7 @@
 // Build: touch .yolo_ddr; bash run_all.sh sim yolo_full_stem.c yolo_c2f.c yolo_ops.c
 
 #include "firmware.h"
+#include "npu_desc.h"
 #include "yolo_ops.h"
 #include "yolo_c2f.h"
 #include "yolo_conv0_320_noact_data.h"
@@ -643,12 +644,28 @@ void usercode7(void)
     // ================= NECK (FPN/PAN, model.10-21) =================
     // ---- FPN: P5 up + concat(P4=c2f6) -> c2f_12 -> fpn_mid (20x20x128) ----
     // cat folded into c2f_12 cv1 weights: build raw [up|tap] native (no requant).
-    if (errors == 0u && !yolo_run_upsample2x_ddr(SPPF_OUT, NK_CAT1, 0u, 10u, 10u, 256u/16u)) {
-        print_str("  neck up1 fail\n"); errors++;
-    }
-    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(C2F6_OUT, NK_CAT1 + (256u/16u)*(20u*20u)*16u,
-                                                       0u, (128u/16u)*(20u*20u))) {
-        print_str("  neck cat1 tap fail\n"); errors++;
+    {
+        const npu_desc_t descs[] = {
+            {
+                .op = NPU_DESC_OP_UPSAMPLE2X_DDR,
+                .src0 = SPPF_OUT,
+                .dst = NK_CAT1,
+                .scratch0 = 0u,
+                .in_w = 10u,
+                .in_h = 10u,
+                .in_c = 256u
+            },
+            {
+                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
+                .src0 = C2F6_OUT,
+                .dst = NK_CAT1 + (256u/16u)*(20u*20u)*16u,
+                .scratch0 = 0u,
+                .words = (128u/16u)*(20u*20u)
+            }
+        };
+        if (errors == 0u && !npu_desc_run_many(descs, 2u)) {
+            print_str("  neck cat1 desc fail\n"); errors++;
+        }
     }
     prof_mark("neck_up1_cat1_DMA");
     NECK_C2F(YOLO_NK_C12, yolo_nk_c12, NK_CAT1, NK_FMID, WGT_OF(27),WGT_OF(28),WGT_OF(29),WGT_OF(30));
@@ -656,12 +673,28 @@ void usercode7(void)
     prof_mark("neck_c2f12");
 
     // ---- FPN: fpn_mid up + concat(P3=c2f4) -> c2f_15 -> pan_p3 (40x40x64) ----
-    if (errors == 0u && !yolo_run_upsample2x_ddr(NK_FMID, NK_CAT2, 0u, 20u, 20u, 128u/16u)) {
-        print_str("  neck up2 fail\n"); errors++;
-    }
-    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(C2F4_OUT, NK_CAT2 + (128u/16u)*(40u*40u)*16u,
-                                                       0u, (64u/16u)*(40u*40u))) {
-        print_str("  neck cat2 tap fail\n"); errors++;
+    {
+        const npu_desc_t descs[] = {
+            {
+                .op = NPU_DESC_OP_UPSAMPLE2X_DDR,
+                .src0 = NK_FMID,
+                .dst = NK_CAT2,
+                .scratch0 = 0u,
+                .in_w = 20u,
+                .in_h = 20u,
+                .in_c = 128u
+            },
+            {
+                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
+                .src0 = C2F4_OUT,
+                .dst = NK_CAT2 + (128u/16u)*(40u*40u)*16u,
+                .scratch0 = 0u,
+                .words = (64u/16u)*(40u*40u)
+            }
+        };
+        if (errors == 0u && !npu_desc_run_many(descs, 2u)) {
+            print_str("  neck cat2 desc fail\n"); errors++;
+        }
     }
     prof_mark("neck_up2_cat2_DMA");
     NECK_C2F(YOLO_NK_C15, yolo_nk_c15, NK_CAT2, NK_PANP3, WGT_OF(31),WGT_OF(32),WGT_OF(33),WGT_OF(34));
@@ -679,12 +712,26 @@ void usercode7(void)
                                yolo_nk_c35_bias, yolo_nk_c35_mul, yolo_nk_c35_shift,
                                NPU_CTRL_SILU_EXACT_EN, 4u*9u, 16u, YOLO_NK_C35_PAD)) { print_str("  conv35 fail\n"); errors++; }
     prof_mark("neck_conv35_s2");
-    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(NK_C35, NK_CAT3, 0u, (64u/16u)*(20u*20u))) {
-        print_str("  neck cat3 src0 fail\n"); errors++;
-    }
-    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(NK_FMID, NK_CAT3 + (64u/16u)*(20u*20u)*16u,
-                                                       0u, (128u/16u)*(20u*20u))) {
-        print_str("  neck cat3 tap fail\n"); errors++;
+    {
+        const npu_desc_t descs[] = {
+            {
+                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
+                .src0 = NK_C35,
+                .dst = NK_CAT3,
+                .scratch0 = 0u,
+                .words = (64u/16u)*(20u*20u)
+            },
+            {
+                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
+                .src0 = NK_FMID,
+                .dst = NK_CAT3 + (64u/16u)*(20u*20u)*16u,
+                .scratch0 = 0u,
+                .words = (128u/16u)*(20u*20u)
+            }
+        };
+        if (errors == 0u && !npu_desc_run_many(descs, 2u)) {
+            print_str("  neck cat3 desc fail\n"); errors++;
+        }
     }
     prof_mark("neck_cat3_DMA");
     NECK_C2F(YOLO_NK_C18, yolo_nk_c18, NK_CAT3, NK_PANP4, WGT_OF(40),WGT_OF(43),WGT_OF(44),WGT_OF(45));
@@ -704,12 +751,26 @@ void usercode7(void)
                                yolo_nk_c46_bias, yolo_nk_c46_mul, yolo_nk_c46_shift,
                                NPU_CTRL_SILU_EXACT_EN, (128u/16u)*9u, 16u, YOLO_NK_C46_PAD)) { print_str("  conv46 fail\n"); errors++; }
     prof_mark("neck_conv46_s2_icstream");
-    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(NK_C46, NK_CAT4, 0u, (128u/16u)*(10u*10u))) {
-        print_str("  neck cat4 src0 fail\n"); errors++;
-    }
-    if (errors == 0u && !yolo_copy_ddr_to_ddr_via_act(C2F8_OUT, NK_CAT4 + (128u/16u)*(10u*10u)*16u,
-                                                       0u, (256u/16u)*(10u*10u))) {
-        print_str("  neck cat4 tap fail\n"); errors++;
+    {
+        const npu_desc_t descs[] = {
+            {
+                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
+                .src0 = NK_C46,
+                .dst = NK_CAT4,
+                .scratch0 = 0u,
+                .words = (128u/16u)*(10u*10u)
+            },
+            {
+                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
+                .src0 = C2F8_OUT,
+                .dst = NK_CAT4 + (128u/16u)*(10u*10u)*16u,
+                .scratch0 = 0u,
+                .words = (256u/16u)*(10u*10u)
+            }
+        };
+        if (errors == 0u && !npu_desc_run_many(descs, 2u)) {
+            print_str("  neck cat4 desc fail\n"); errors++;
+        }
     }
     prof_mark("neck_cat4_DMA");
     NECK_C2F(YOLO_NK_C21, yolo_nk_c21, NK_CAT4, NK_PANP5, WGT_OF(51),WGT_OF(54),WGT_OF(55),WGT_OF(56));
