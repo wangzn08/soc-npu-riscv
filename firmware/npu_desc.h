@@ -56,6 +56,11 @@ int npu_desc_run_many(const npu_desc_t *list, uint32_t count);
 #define NPU_HW_DESC_OP_GEMM                 0x07u
 #define NPU_HW_DESC_OP_STOP_IRQ             0x08u
 
+/* Act-SRAM spatial movement ops (implemented in descriptor_engine.v):
+ * OP_UPSAMPLE2X / OP_MAXPOOL5X5 share w[2]=src base, w[4]=dst base,
+ *   w[8]={in_h,in_w}, w[9][15:0]=in_c, w[1][0]=act bank.
+ * OP_ELTWISE_ADD: w[2]=src0 base, w[4]=dst base, w[5]=src1(skip) base,
+ *   w[6]=packed NPU_ELTWISE_ZP (zp/ratio), w[7]=len words, w[1][0]=act bank. */
 #define NPU_HW_DESC_OP_UPSAMPLE2X           0x20u
 #define NPU_HW_DESC_OP_MAXPOOL5X5           0x21u
 #define NPU_HW_DESC_OP_ELTWISE_ADD          0x22u

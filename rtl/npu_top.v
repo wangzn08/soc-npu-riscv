@@ -358,6 +358,12 @@ module npu_top #(
     wire [7:0]                      desc_act_clip_max;
     wire                            desc_upsample_trig;
     wire                            desc_maxpool5_trig;
+    wire                            desc_eltwise_trig;
+    wire [SRAM_ADDR_W-1:0]          desc_skip_base;
+    wire [7:0]                      desc_elt_zp;
+    wire                            desc_elt_ratio_en;
+    wire [16:0]                     desc_elt_ratio_mul;
+    wire [5:0]                      desc_elt_ratio_shift;
 
     reg [31:0] desc_bias_val [0:63];
     reg [31:0] desc_scale_mul [0:63];
@@ -458,6 +464,12 @@ module npu_top #(
     wire [15:0]                     run_upsample_in_h      = desc_busy ? desc_in_h          : cfg_upsample_in_h;
     wire [15:0]                     run_upsample_ic_groups = desc_busy ? {11'd0, run_ic_groups} : cfg_upsample_ic_groups;
     wire                            run_maxpool5_trig      = desc_busy ? desc_maxpool5_trig : cfg_maxpool5_trig;
+    wire                            run_eltwise_trig       = desc_busy ? desc_eltwise_trig : cfg_eltwise_trig;
+    wire [SRAM_ADDR_W-1:0]          run_skip_base          = desc_busy ? desc_skip_base : cfg_skip_base;
+    wire [7:0]                      run_elt_zp             = desc_busy ? desc_elt_zp : cfg_elt_zp;
+    wire                            run_elt_ratio_en       = desc_busy ? desc_elt_ratio_en : cfg_elt_ratio_en;
+    wire [16:0]                     run_elt_ratio_mul      = desc_busy ? desc_elt_ratio_mul : cfg_elt_ratio_mul;
+    wire [5:0]                      run_elt_ratio_shift    = desc_busy ? desc_elt_ratio_shift : cfg_elt_ratio_shift;
 
     // ===================================================================
     // Performance counter event strobes (fed to param_regfile @0x3A4+).
@@ -745,7 +757,14 @@ module npu_top #(
         .o_upsample_trig         (desc_upsample_trig),
         .i_upsample_done         (upsample_done),
         .o_maxpool5_trig         (desc_maxpool5_trig),
-        .i_maxpool5_done         (maxpool5_done)
+        .i_maxpool5_done         (maxpool5_done),
+        .o_eltwise_trig          (desc_eltwise_trig),
+        .o_skip_base             (desc_skip_base),
+        .o_elt_zp                (desc_elt_zp),
+        .o_elt_ratio_en          (desc_elt_ratio_en),
+        .o_elt_ratio_mul         (desc_elt_ratio_mul),
+        .o_elt_ratio_shift       (desc_elt_ratio_shift),
+        .i_eltwise_done          (eltwise_done)
     );
 
     // ===================================================================
@@ -1826,15 +1845,15 @@ module npu_top #(
     ) u_eltwise_add_engine (
         .clk           (clk),
         .rst_n         (rst_n),
-        .i_trig        (cfg_eltwise_trig),
-        .i_src0_base   (cfg_dma_rd_sram_base),
-        .i_src1_base   (cfg_skip_base),
-        .i_dst_base    (cfg_dma_wr_sram_base),
-        .i_len         (cfg_dma_rd_len),
-        .i_zp          (cfg_elt_zp),
-        .i_ratio_en    (cfg_elt_ratio_en),
-        .i_ratio_mul   (cfg_elt_ratio_mul),
-        .i_ratio_shift (cfg_elt_ratio_shift),
+        .i_trig        (run_eltwise_trig),
+        .i_src0_base   (run_dma_rd_sram_base),
+        .i_src1_base   (run_skip_base),
+        .i_dst_base    (run_dma_wr_sram_base),
+        .i_len         (run_dma_rd_len),
+        .i_zp          (run_elt_zp),
+        .i_ratio_en    (run_elt_ratio_en),
+        .i_ratio_mul   (run_elt_ratio_mul),
+        .i_ratio_shift (run_elt_ratio_shift),
         .o_addr        (eltwise_addr),
         .o_en          (eltwise_en),
         .o_we          (eltwise_we),

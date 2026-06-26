@@ -560,6 +560,53 @@ module tb_npu_desc_queue;
             end
         end
 
+        // ---- Test 9: OP_ELTWISE_ADD (signed residual, zp=0, ratio off) ----
+        reg_write(12'h40C, 32'hC); // clear_done + irq_en
+        repeat (5) @(posedge clk);
+
+        // src0 @0..3 (lane=w+1), src1 @8..11 (lane=10), dst @16..19. out=src0+src1.
+        for (kk = 0; kk < 4; kk = kk + 1) begin
+            actw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1)
+                actw[ic*8 +: 8] = (kk + 1);
+            act_poke(kk, actw);
+            wgtw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1)
+                wgtw[ic*8 +: 8] = 8'd10;
+            act_poke(8 + kk, wgtw);
+            act_poke(16 + kk, 128'd0);
+        end
+
+        ddr[16] = {32'h0, 32'h0, 32'h0, 32'h0000_0122}; // OP_ELTWISE_ADD, src0=0
+        ddr[17] = {32'd4, 32'd0, 32'd8, 32'd16};        // w4=dst16 w5=src1=8 w6=cfg0 w7=len4
+        ddr[18] = 128'h0;
+        ddr[19] = 128'h0;
+        ddr[20] = {32'h0, 32'h0, 32'h0, 32'h0000_0108}; // STOP_IRQ
+        ddr[21] = 128'h0; ddr[22] = 128'h0; ddr[23] = 128'h0;
+
+        reg_write(12'h400, 32'h4000_0100);
+        reg_write(12'h404, 32'h0);
+        reg_write(12'h408, 32'd2);
+        reg_write(12'h40C, 32'h5); // start + irq_en
+
+        wait_i = 0;
+        while (!irq_done && wait_i < 5000) begin
+            @(posedge clk);
+            wait_i = wait_i + 1;
+        end
+        if (!irq_done) begin
+            $display("FAIL timeout waiting ELTWISE_ADD irq");
+            errors = errors + 1;
+        end
+        for (kk = 0; kk < 4; kk = kk + 1) begin
+            got = dut.u_act_sram.u_bram.mem[16 + kk][7:0];
+            exp = (kk + 1) + 10;
+            if (got !== exp) begin
+                $display("FAIL eltwise dst[%0d]=%0d exp=%0d", kk, got, exp);
+                errors = errors + 1;
+            end
+        end
+
         if (errors == 0)
             $display("NPU DESC QUEUE TEST PASS");
         else

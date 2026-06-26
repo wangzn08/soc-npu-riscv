@@ -89,6 +89,15 @@ module descriptor_engine #(
     ,input  wire            i_upsample_done
     ,output reg             o_maxpool5_trig
     ,input  wire            i_maxpool5_done
+    // Eltwise-add (C2f residual): src0 reuses the DMA rd base, dst the DMA wr
+    // base, len the DMA rd len; src1 + zp/ratio are dedicated config outputs.
+    ,output reg             o_eltwise_trig
+    ,output reg [SRAM_ADDR_W-1:0] o_skip_base
+    ,output reg [7:0]       o_elt_zp
+    ,output reg             o_elt_ratio_en
+    ,output reg [16:0]      o_elt_ratio_mul
+    ,output reg [5:0]       o_elt_ratio_shift
+    ,input  wire            i_eltwise_done
     // Exact-SiLU LUT streaming load (OP_LUT_LOAD): one (idx,val) per cycle,
     // mirrors the CPU NPU_SILU_LOAD MMIO write so YOLO convs can carry their
     // own per-layer LUT inside the descriptor program.
@@ -119,6 +128,7 @@ module descriptor_engine #(
     localparam OP_STOP_IRQ = 8'h08;
     localparam OP_UPSAMPLE2X = 8'h20; // 2x nearest-neighbour upsample (Act SRAM)
     localparam OP_MAXPOOL5X5 = 8'h21; // 5x5 stride-1 signed maxpool (Act SRAM)
+    localparam OP_ELTWISE_ADD = 8'h22; // signed eltwise add (C2f residual)
     localparam OP_LUT_LOAD = 8'h24;   // load 256-entry exact-SiLU LUT from DDR
     localparam OP_ACT_CFG  = 8'h25;   // latch per-layer activation/requant config
     localparam VERSION     = 8'h01;
@@ -150,19 +160,20 @@ module descriptor_engine #(
     localparam S_LUT_R    = 4'd14;
     localparam S_LUT_WR   = 4'd15;
 
-    localparam WAIT_NONE   = 3'd0;
-    localparam WAIT_DMA_RD = 3'd1;
-    localparam WAIT_DMA_WR = 3'd2;
-    localparam WAIT_COPY   = 3'd3;
-    localparam WAIT_EXPAND = 3'd4;
-    localparam WAIT_NPU    = 3'd5;
-    localparam WAIT_UPSAMPLE = 3'd6;
-    localparam WAIT_MAXPOOL  = 3'd7;
+    localparam WAIT_NONE   = 4'd0;
+    localparam WAIT_DMA_RD = 4'd1;
+    localparam WAIT_DMA_WR = 4'd2;
+    localparam WAIT_COPY   = 4'd3;
+    localparam WAIT_EXPAND = 4'd4;
+    localparam WAIT_NPU    = 4'd5;
+    localparam WAIT_UPSAMPLE = 4'd6;
+    localparam WAIT_MAXPOOL  = 4'd7;
+    localparam WAIT_ELTWISE  = 4'd8;
 
     reg [3:0] state;
     reg [1:0] beat_idx;
     reg [31:0] desc_w [0:15];
-    reg [2:0] wait_kind;
+    reg [3:0] wait_kind;
     reg       wait_guard;   // skip the first S_WAIT_OP cycle: the trig pulse is
                             // still in flight, so the engine's level-type done
                             // (copy/expand/dma) has not yet cleared its STALE
@@ -258,6 +269,12 @@ module descriptor_engine #(
         o_act_clip_max = 8'd127;
         o_upsample_trig = 1'b0;
         o_maxpool5_trig = 1'b0;
+        o_eltwise_trig = 1'b0;
+        o_skip_base = {SRAM_ADDR_W{1'b0}};
+        o_elt_zp = 8'd0;
+        o_elt_ratio_en = 1'b0;
+        o_elt_ratio_mul = 17'd0;
+        o_elt_ratio_shift = 6'd0;
     end
 
     task set_error;
@@ -340,6 +357,12 @@ module descriptor_engine #(
             o_act_clip_max <= 8'd127;
             o_upsample_trig <= 1'b0;
             o_maxpool5_trig <= 1'b0;
+            o_eltwise_trig <= 1'b0;
+            o_skip_base <= {SRAM_ADDR_W{1'b0}};
+            o_elt_zp <= 8'd0;
+            o_elt_ratio_en <= 1'b0;
+            o_elt_ratio_mul <= 17'd0;
+            o_elt_ratio_shift <= 6'd0;
             for (i = 0; i < 16; i = i + 1)
                 desc_w[i] <= 32'd0;
         end else begin
@@ -351,6 +374,7 @@ module descriptor_engine #(
             o_silu_load_en <= 1'b0;
             o_upsample_trig <= 1'b0;
             o_maxpool5_trig <= 1'b0;
+            o_eltwise_trig <= 1'b0;
             o_npu_start <= 1'b0;
 
             if (i_desc_clear_done) begin
@@ -452,6 +476,11 @@ module descriptor_engine #(
                     end else if (desc_op == OP_UPSAMPLE2X ||
                                  desc_op == OP_MAXPOOL5X5) begin
                         if (desc_w[8] == 32'd0 || desc_w[9] == 32'd0)
+                            set_error(ERR_BAD_SHAPE);
+                        else
+                            state <= S_START_OP;
+                    end else if (desc_op == OP_ELTWISE_ADD) begin
+                        if (desc_w[7] == 32'd0)
                             set_error(ERR_BAD_SHAPE);
                         else
                             state <= S_START_OP;
@@ -585,6 +614,22 @@ module descriptor_engine #(
                         wait_kind <= WAIT_MAXPOOL;
                         state <= S_WAIT_OP;
                     end
+                    OP_ELTWISE_ADD: begin
+                        // src0 = DMA rd base, dst = DMA wr base, len = DMA rd len;
+                        // w[5] = src1 (skip) base, w[6] = packed NPU_ELTWISE_ZP.
+                        o_dma_act_ping_sel <= desc_w[1][0];
+                        o_dma_rd_sram_base <= desc_w[2][SRAM_ADDR_W-1:0];
+                        o_dma_wr_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];
+                        o_skip_base        <= desc_w[5][SRAM_ADDR_W-1:0];
+                        o_dma_rd_len       <= desc_w[7][15:0];
+                        o_elt_zp           <= desc_w[6][7:0];
+                        o_elt_ratio_shift  <= desc_w[6][13:8];
+                        o_elt_ratio_en     <= desc_w[6][14];
+                        o_elt_ratio_mul    <= desc_w[6][31:15];
+                        o_eltwise_trig     <= 1'b1;
+                        wait_kind <= WAIT_ELTWISE;
+                        state <= S_WAIT_OP;
+                    end
                     default: set_error(ERR_BAD_OPCODE);
                     endcase
                 end
@@ -683,6 +728,7 @@ module descriptor_engine #(
                         (wait_kind == WAIT_EXPAND && i_expand_done) ||
                         (wait_kind == WAIT_UPSAMPLE && i_upsample_done) ||
                         (wait_kind == WAIT_MAXPOOL && i_maxpool5_done) ||
+                        (wait_kind == WAIT_ELTWISE && i_eltwise_done) ||
                         (wait_kind == WAIT_NPU    && i_npu_done)) begin
                         wait_kind <= WAIT_NONE;
                         state <= S_ADVANCE;
