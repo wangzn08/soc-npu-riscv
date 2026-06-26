@@ -398,6 +398,76 @@ module tb_npu_desc_queue;
             errors = errors + 1;
         end
 
+        // ---- Test 6: LUT_LOAD + ACTIVATION_CFG(silu_exact) + GEMM end-to-end ----
+        // Proves the YOLO conv datapath through descriptors: the GEMM preact
+        // s2[oc]=oc+1 (act=1s, triangular wgt) is mapped through a non-identity
+        // exact-SiLU LUT, so out[oc] must equal lut[oc+1] = 255-(oc+1).
+        reg_write(12'h40C, 32'hC); // clear_done + irq_en
+        repeat (5) @(posedge clk);
+
+        for (bw = 0; bw < 16; bw = bw + 1) begin
+            lutw = 128'd0;
+            for (bj = 0; bj < 16; bj = bj + 1)
+                lutw[bj*8 +: 8] = (255 - (bw * 16 + bj)) & 8'hFF;
+            ddr[bw] = lutw;
+        end
+        actw = 128'd0;
+        for (ic = 0; ic < 16; ic = ic + 1)
+            actw[ic*8 +: 8] = 8'd1;
+        act_poke(0, actw);
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            wgtw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1)
+                if (ic <= oc)
+                    wgtw[ic*8 +: 8] = 8'd1;
+            wgt_poke(oc, wgtw);
+        end
+        out_clear(8);
+        for (oc = 0; oc < 16; oc = oc + 1)
+            ddr[48 + oc] = {26'd0, 6'd0, 32'd0, 32'd1, 32'd0}; // bias0 scale1 shift0
+
+        // 4-descriptor program at 0x4000_0100 (words 16..31).
+        ddr[16] = {32'h0, 32'h4000_0000, 32'h0, 32'h0000_0124}; // LUT_LOAD lut@0x40000000
+        ddr[17] = 128'h0; ddr[18] = 128'h0; ddr[19] = 128'h0;
+        ddr[20] = {32'h0, 32'h0, 32'h0, 32'h0000_0125};         // ACTIVATION_CFG
+        ddr[21] = {32'h0, 32'h0, 32'h0, 32'h0000_0001};         // w[4]=silu_exact_en
+        ddr[22] = 128'h0; ddr[23] = 128'h0;
+        ddr[24] = {32'h0, 32'h0, 32'h0, 32'h0000_0107};         // GEMM (silu_exact overrides relu)
+        ddr[25] = {32'h0, 32'h0, 32'h0, 32'd8};                 // out=8
+        ddr[26] = {32'h4000_0300, 32'h0001_0101, 32'h0010_0010, 32'h0001_0001};
+        ddr[27] = {32'h0, 32'h0, 32'h0, 32'd16};                // qparam_count=16
+        ddr[28] = {32'h0, 32'h0, 32'h0, 32'h0000_0108};         // STOP_IRQ
+        ddr[29] = 128'h0; ddr[30] = 128'h0; ddr[31] = 128'h0;
+
+        reg_write(12'h400, 32'h4000_0100);
+        reg_write(12'h404, 32'h0);
+        reg_write(12'h408, 32'd4);
+        reg_write(12'h40C, 32'h5); // start + irq_en
+
+        wait_i = 0;
+        while (!irq_done && wait_i < 8000) begin
+            @(posedge clk);
+            wait_i = wait_i + 1;
+        end
+        if (!irq_done) begin
+            $display("FAIL timeout waiting silu_exact GEMM irq");
+            errors = errors + 1;
+        end
+        reg_read(12'h410, rd_data);
+        if ((rd_data & 32'h2) == 0 || (rd_data & 32'h4) != 0) begin
+            $display("FAIL silu_exact desc status=0x%08h", rd_data);
+            errors = errors + 1;
+        end
+        outw = dut.u_out_sram.u_bram.mem[8];
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            got = outw[oc*8 +: 8];
+            exp = (255 - (oc + 1)) & 8'hFF;
+            if (got !== exp) begin
+                $display("FAIL silu_exact out[%0d]=%0d exp=%0d", oc, got, exp);
+                errors = errors + 1;
+            end
+        end
+
         if (errors == 0)
             $display("NPU DESC QUEUE TEST PASS");
         else
