@@ -53,13 +53,24 @@ FW_C_SRCS=(
     "$FW_DIR/irq.c"
     "$FW_DIR/print.c"
     "$FW_DIR/libgcc_stub.c"
+    "$FW_DIR/npu_desc.c"
     "$FW_DIR/$FW_USER_C"
 )
 FW_EXTRA_C_SRCS=()
 if [ "$#" -gt 2 ]; then
     for extra_src in "${@:3}"; do
         FW_EXTRA_C_SRCS+=("$extra_src")
-        FW_C_SRCS+=("$FW_DIR/$extra_src")
+        extra_path="$FW_DIR/$extra_src"
+        already_added=0
+        for src in "${FW_C_SRCS[@]}"; do
+            if [ "$src" = "$extra_path" ]; then
+                already_added=1
+                break
+            fi
+        done
+        if [ "$already_added" -eq 0 ]; then
+            FW_C_SRCS+=("$extra_path")
+        fi
     done
 fi
 FW_S_SRCS=(
