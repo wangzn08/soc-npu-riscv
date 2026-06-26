@@ -21,6 +21,7 @@ rtl/axi_upsizer_32_128.v
 # NPU Wrapper + NPU RTL
 rtl/npu_axi_wrapper.v
 rtl/npu_top.v
+rtl/descriptor_engine.v
 rtl/param_regfile.v
 rtl/top_controller_fsm.v
 rtl/im2col_line_buffer.v
