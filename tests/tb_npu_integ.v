@@ -18,7 +18,7 @@
 //   => out[oc] = sum_ic act*wgt = oc+1  (bias 0, scale 1, shift 0, ReLU)
 // ===================================================================
 module tb_npu_integ;
-    localparam REG_ADDR_W = 10, REG_DATA_W = 32;
+    localparam REG_ADDR_W = 12, REG_DATA_W = 32;
 
     reg clk = 1, rst_n = 0;
 
@@ -75,7 +75,7 @@ module tb_npu_integ;
     integer errors = 0;
 
     // ---- AXI-Lite single register write (param_regfile is always-ready) ----
-    task reg_write(input [9:0] addr, input [31:0] data);
+    task reg_write(input [11:0] addr, input [31:0] data);
         begin
             @(negedge clk);
             s_axi_awvalid = 1; s_axi_awaddr = addr;
@@ -105,12 +105,12 @@ module tb_npu_integ;
     localparam C_PW = 32'h4000;  // CTRL[14] pw_en
     localparam C_DW = 32'h8000;  // CTRL[15] dw_en
     // Register byte offsets
-    localparam R_CTRL=10'h00, R_INW=10'h20, R_INH=10'h24, R_IC=10'h28, R_OC=10'h2C,
-               R_KERN=10'h30, R_STR=10'h34, R_ACTA=10'h08, R_WGTA=10'h10, R_OUTA=10'h18,
-               R_PAD=10'h150;
-    function [9:0] R_BIAS (input integer ch); R_BIAS  = 10'h40 + ch*4; endfunction
-    function [9:0] R_SCALE(input integer ch); R_SCALE = 10'h80 + ch*4; endfunction
-    function [9:0] R_SHIFT(input integer ch); R_SHIFT = 10'hC0 + ch*4; endfunction
+    localparam R_CTRL=12'h000, R_INW=12'h020, R_INH=12'h024, R_IC=12'h028, R_OC=12'h02C,
+               R_KERN=12'h030, R_STR=12'h034, R_ACTA=12'h008, R_WGTA=12'h010, R_OUTA=12'h018,
+               R_PAD=12'h150;
+    function [11:0] R_BIAS (input integer ch); R_BIAS  = 12'h040 + ch*4; endfunction
+    function [11:0] R_SCALE(input integer ch); R_SCALE = 12'h080 + ch*4; endfunction
+    function [11:0] R_SHIFT(input integer ch); R_SHIFT = 12'h0C0 + ch*4; endfunction
 
     integer ic, oc, p, t, oy, ox, ev;
     reg [127:0] actw, wgtw, outw;

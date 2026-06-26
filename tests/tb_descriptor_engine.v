@@ -28,6 +28,11 @@ module tb_descriptor_engine;
     wire [31:0] qparam_bias;
     wire [31:0] qparam_scale;
     wire [5:0] qparam_shift;
+    wire npu_start;
+    wire [31:0] ctrl_flags;
+    wire [15:0] in_w, in_h, in_c, out_c;
+    wire [7:0] kernel_kh, kernel_kw, stride_sx, stride_sy, pad_w, pad_h;
+    wire [13:0] act_addr, wgt_addr, out_addr;
 
     wire arvalid;
     reg arready = 1'b1;
@@ -94,7 +99,23 @@ module tb_descriptor_engine;
         .o_qparam_idx(qparam_idx),
         .o_qparam_bias(qparam_bias),
         .o_qparam_scale(qparam_scale),
-        .o_qparam_shift(qparam_shift)
+        .o_qparam_shift(qparam_shift),
+        .o_npu_start(npu_start),
+        .o_ctrl_flags(ctrl_flags),
+        .o_in_w(in_w),
+        .o_in_h(in_h),
+        .o_in_c(in_c),
+        .o_out_c(out_c),
+        .o_kernel_kh(kernel_kh),
+        .o_kernel_kw(kernel_kw),
+        .o_stride_sx(stride_sx),
+        .o_stride_sy(stride_sy),
+        .o_pad_w(pad_w),
+        .o_pad_h(pad_h),
+        .o_act_addr(act_addr),
+        .o_wgt_addr(wgt_addr),
+        .o_out_addr(out_addr),
+        .i_npu_done(1'b0)
     );
 
     always #5 clk = ~clk;

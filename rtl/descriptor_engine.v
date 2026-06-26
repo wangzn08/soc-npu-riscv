@@ -67,6 +67,22 @@ module descriptor_engine #(
     ,output reg [31:0]      o_qparam_bias
     ,output reg [31:0]      o_qparam_scale
     ,output reg [5:0]       o_qparam_shift
+    ,output reg             o_npu_start
+    ,output reg [31:0]      o_ctrl_flags
+    ,output reg [15:0]      o_in_w
+    ,output reg [15:0]      o_in_h
+    ,output reg [15:0]      o_in_c
+    ,output reg [15:0]      o_out_c
+    ,output reg [7:0]       o_kernel_kh
+    ,output reg [7:0]       o_kernel_kw
+    ,output reg [7:0]       o_stride_sx
+    ,output reg [7:0]       o_stride_sy
+    ,output reg [7:0]       o_pad_w
+    ,output reg [7:0]       o_pad_h
+    ,output reg [SRAM_ADDR_W-1:0] o_act_addr
+    ,output reg [SRAM_ADDR_W-1:0] o_wgt_addr
+    ,output reg [SRAM_ADDR_W-1:0] o_out_addr
+    ,input  wire            i_npu_done
 );
 
     localparam OP_NOP      = 8'h00;
@@ -75,6 +91,8 @@ module descriptor_engine #(
     localparam OP_DMA_OUT_TO_DDR       = 8'h03;
     localparam OP_IMG_EXPAND           = 8'h04;
     localparam OP_SRAM_COPY_OUT_TO_ACT = 8'h05;
+    localparam OP_CONV2D               = 8'h06;
+    localparam OP_GEMM                 = 8'h07;
     localparam OP_STOP_IRQ = 8'h08;
     localparam VERSION     = 8'h01;
 
@@ -99,12 +117,14 @@ module descriptor_engine #(
     localparam S_DONE     = 4'd9;
     localparam S_ERROR    = 4'd10;
     localparam S_ABORT    = 4'd11;
+    localparam S_NPU_START = 4'd12;
 
     localparam WAIT_NONE   = 3'd0;
     localparam WAIT_DMA_RD = 3'd1;
     localparam WAIT_DMA_WR = 3'd2;
     localparam WAIT_COPY   = 3'd3;
     localparam WAIT_EXPAND = 3'd4;
+    localparam WAIT_NPU    = 3'd5;
 
     reg [3:0] state;
     reg [1:0] beat_idx;
@@ -123,6 +143,60 @@ module descriptor_engine #(
     assign m_axi_arsize  = 3'd4; // 16 bytes per beat
     assign m_axi_arburst = 2'b01; // INCR
     assign o_irq = o_done & i_desc_irq_en;
+
+    initial begin
+        state = S_IDLE;
+        o_busy = 1'b0;
+        o_done = 1'b0;
+        o_err = 1'b0;
+        o_aborted = 1'b0;
+        o_pc = 16'd0;
+        o_err_code = ERR_NONE;
+        m_axi_arvalid = 1'b0;
+        m_axi_araddr = {ADDR_W{1'b0}};
+        m_axi_arlen = 8'd0;
+        m_axi_rready = 1'b0;
+        beat_idx = 2'd0;
+        wait_kind = WAIT_NONE;
+        o_dma_rd_req = 1'b0;
+        o_dma_wr_req = 1'b0;
+        o_dma_rd_ddr_addr = 32'd0;
+        o_dma_wr_ddr_addr = 32'd0;
+        o_dma_rd_len = 16'd0;
+        o_dma_wr_len = 16'd0;
+        o_dma_rd_sram_base = {SRAM_ADDR_W{1'b0}};
+        o_dma_wr_sram_base = {SRAM_ADDR_W{1'b0}};
+        o_dma_sram_sel = 1'b0;
+        o_dma_out_rd_sel = 1'b0;
+        o_dma_rd_sram_sel = 2'd0;
+        o_dma_act_ping_sel = 1'b0;
+        o_dma_wgt_ping_sel = 1'b0;
+        o_dma_out_ping_sel = 1'b0;
+        o_copy_trig = 1'b0;
+        o_expand_trig = 1'b0;
+        o_qparam_we = 1'b0;
+        o_qparam_idx = 6'd0;
+        o_qparam_bias = 32'd0;
+        o_qparam_scale = 32'd0;
+        o_qparam_shift = 6'd0;
+        o_npu_start = 1'b0;
+        o_ctrl_flags = 32'd0;
+        o_in_w = 16'd0;
+        o_in_h = 16'd0;
+        o_in_c = 16'd0;
+        o_out_c = 16'd0;
+        o_kernel_kh = 8'd0;
+        o_kernel_kw = 8'd0;
+        o_stride_sx = 8'd0;
+        o_stride_sy = 8'd0;
+        o_pad_w = 8'd0;
+        o_pad_h = 8'd0;
+        o_act_addr = {SRAM_ADDR_W{1'b0}};
+        o_wgt_addr = {SRAM_ADDR_W{1'b0}};
+        o_out_addr = {SRAM_ADDR_W{1'b0}};
+        qparam_loaded = 1'b0;
+        qparam_idx = 6'd0;
+    end
 
     task set_error;
         input [7:0] code;
@@ -170,6 +244,21 @@ module descriptor_engine #(
             o_qparam_bias <= 32'd0;
             o_qparam_scale <= 32'd0;
             o_qparam_shift <= 6'd0;
+            o_npu_start <= 1'b0;
+            o_ctrl_flags <= 32'd0;
+            o_in_w <= 16'd0;
+            o_in_h <= 16'd0;
+            o_in_c <= 16'd0;
+            o_out_c <= 16'd0;
+            o_kernel_kh <= 8'd0;
+            o_kernel_kw <= 8'd0;
+            o_stride_sx <= 8'd0;
+            o_stride_sy <= 8'd0;
+            o_pad_w <= 8'd0;
+            o_pad_h <= 8'd0;
+            o_act_addr <= {SRAM_ADDR_W{1'b0}};
+            o_wgt_addr <= {SRAM_ADDR_W{1'b0}};
+            o_out_addr <= {SRAM_ADDR_W{1'b0}};
             qparam_loaded <= 1'b0;
             qparam_idx <= 6'd0;
             for (i = 0; i < 16; i = i + 1)
@@ -180,6 +269,7 @@ module descriptor_engine #(
             o_copy_trig <= 1'b0;
             o_expand_trig <= 1'b0;
             o_qparam_we <= 1'b0;
+            o_npu_start <= 1'b0;
 
             if (i_desc_clear_done) begin
                 o_done <= 1'b0;
@@ -272,6 +362,11 @@ module descriptor_engine #(
                             set_error(ERR_BAD_SHAPE);
                         else
                             state <= S_START_OP;
+                    end else if (desc_op == OP_CONV2D || desc_op == OP_GEMM) begin
+                        if (desc_w[8] == 32'd0 || desc_w[9] == 32'd0)
+                            set_error(ERR_BAD_SHAPE);
+                        else
+                            state <= S_START_OP;
                     end else begin
                         set_error(ERR_BAD_OPCODE);
                     end
@@ -333,8 +428,32 @@ module descriptor_engine #(
                         wait_kind <= WAIT_COPY;
                         state <= S_WAIT_OP;
                     end
+                    OP_CONV2D, OP_GEMM: begin
+                        o_ctrl_flags <= {desc_w[1][15:0], desc_w[0][31:16]} |
+                                        (desc_op == OP_GEMM ? 32'h0000_0080 : 32'd0);
+                        o_act_addr <= desc_w[2][SRAM_ADDR_W-1:0];
+                        o_wgt_addr <= desc_w[3][SRAM_ADDR_W-1:0];
+                        o_out_addr <= desc_w[4][SRAM_ADDR_W-1:0];
+                        o_in_w <= desc_w[8][15:0];
+                        o_in_h <= desc_w[8][31:16];
+                        o_in_c <= desc_w[9][15:0];
+                        o_out_c <= desc_w[9][31:16];
+                        o_kernel_kw <= desc_w[10][7:0];
+                        o_kernel_kh <= desc_w[10][15:8];
+                        o_stride_sx <= desc_w[10][23:16];
+                        o_stride_sy <= desc_w[10][23:16];
+                        o_pad_w <= desc_w[10][31:24];
+                        o_pad_h <= desc_w[10][31:24];
+                        state <= S_NPU_START;
+                    end
                     default: set_error(ERR_BAD_OPCODE);
                     endcase
+                end
+
+                S_NPU_START: begin
+                    o_npu_start <= 1'b1;
+                    wait_kind <= WAIT_NPU;
+                    state <= S_WAIT_OP;
                 end
 
                 S_QPARAM_AR: begin
@@ -375,7 +494,8 @@ module descriptor_engine #(
                     if ((wait_kind == WAIT_DMA_RD && i_dma_rd_done) ||
                         (wait_kind == WAIT_DMA_WR && i_dma_wr_done) ||
                         (wait_kind == WAIT_COPY   && i_copy_done) ||
-                        (wait_kind == WAIT_EXPAND && i_expand_done)) begin
+                        (wait_kind == WAIT_EXPAND && i_expand_done) ||
+                        (wait_kind == WAIT_NPU    && i_npu_done)) begin
                         wait_kind <= WAIT_NONE;
                         state <= S_ADVANCE;
                     end

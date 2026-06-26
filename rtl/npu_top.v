@@ -328,6 +328,21 @@ module npu_top #(
     wire [31:0]                     desc_qparam_bias;
     wire [31:0]                     desc_qparam_scale;
     wire [5:0]                      desc_qparam_shift;
+    wire                            desc_npu_start;
+    wire [31:0]                     desc_ctrl_flags;
+    wire [15:0]                     desc_in_w;
+    wire [15:0]                     desc_in_h;
+    wire [15:0]                     desc_in_c;
+    wire [15:0]                     desc_out_c;
+    wire [7:0]                      desc_kernel_kh;
+    wire [7:0]                      desc_kernel_kw;
+    wire [7:0]                      desc_stride_sx;
+    wire [7:0]                      desc_stride_sy;
+    wire [7:0]                      desc_pad_w;
+    wire [7:0]                      desc_pad_h;
+    wire [SRAM_ADDR_W-1:0]          desc_act_addr;
+    wire [SRAM_ADDR_W-1:0]          desc_wgt_addr;
+    wire [SRAM_ADDR_W-1:0]          desc_out_addr;
 
     reg [31:0] desc_bias_val [0:63];
     reg [31:0] desc_scale_mul [0:63];
@@ -340,6 +355,22 @@ module npu_top #(
             desc_scale_shift[desc_qparam_idx] <= desc_qparam_shift;
         end
     end
+
+    wire [ARRAY_COLS-1:0][PSUM_WIDTH-1:0] run_bias_val;
+    wire [ARRAY_COLS-1:0][31:0]           run_scale_mul;
+    wire [ARRAY_COLS-1:0][5:0]            run_scale_shift;
+    genvar desc_q_ch;
+    generate
+        for (desc_q_ch = 0; desc_q_ch < ARRAY_COLS; desc_q_ch = desc_q_ch + 1) begin : gen_desc_qparam_mux
+            wire [5:0] desc_qparam_sel = {fsm_oc_tile_sel[1:0], desc_q_ch[3:0]};
+            assign run_bias_val[desc_q_ch] =
+                desc_busy ? desc_bias_val[desc_qparam_sel] : cfg_bias_val[desc_q_ch];
+            assign run_scale_mul[desc_q_ch] =
+                desc_busy ? desc_scale_mul[desc_qparam_sel] : cfg_scale_mul[desc_q_ch];
+            assign run_scale_shift[desc_q_ch] =
+                desc_busy ? desc_scale_shift[desc_qparam_sel] : cfg_scale_shift[desc_q_ch];
+        end
+    endgenerate
 
     wire                            run_dma_rd_req       = desc_busy ? desc_dma_rd_req       : cfg_dma_rd_req;
     wire [31:0]                     run_dma_rd_ddr_addr  = desc_busy ? desc_dma_rd_ddr_addr  : cfg_dma_rd_ddr_addr;
@@ -357,6 +388,41 @@ module npu_top #(
     wire                            run_dma_out_ping_sel = desc_busy ? desc_dma_out_ping_sel : cfg_dma_out_ping_sel;
     wire                            run_copy_trig        = desc_busy ? desc_copy_trig        : cfg_copy_trig;
     wire                            run_expand_trig      = desc_busy ? desc_expand_trig      : cfg_expand_trig;
+
+    wire                            run_start         = desc_busy ? desc_npu_start      : cfg_start;
+    wire                            run_ping_pong_sel = desc_busy ? desc_ctrl_flags[1]  : cfg_ping_pong_sel;
+    wire                            run_pool_en       = desc_busy ? desc_ctrl_flags[2]  : cfg_pool_en;
+    wire                            run_eltwise_en    = desc_busy ? desc_ctrl_flags[3]  : cfg_eltwise_en;
+    wire                            run_relu_en       = desc_busy ? desc_ctrl_flags[5]  : cfg_relu_en;
+    wire                            run_out_ping_sel  = desc_busy ? desc_ctrl_flags[6]  : cfg_out_ping_sel;
+    wire                            run_gemm_en       = desc_busy ? desc_ctrl_flags[7]  : cfg_gemm_en;
+    wire                            run_hw_pad        = desc_busy ? desc_ctrl_flags[8]  : cfg_hw_pad;
+    wire                            run_row_par_en    = desc_busy ? desc_ctrl_flags[9]  : cfg_row_par_en;
+    wire                            run_gemm_reduce   = desc_busy ? desc_ctrl_flags[10] : cfg_gemm_reduce;
+    wire                            run_row_block_en  = desc_busy ? desc_ctrl_flags[11] : cfg_row_block_en;
+    wire                            run_oc_single     = desc_busy ? desc_ctrl_flags[12] : cfg_oc_single;
+    wire                            run_int32_out     = desc_busy ? desc_ctrl_flags[13] : cfg_int32_out;
+    wire                            run_pw_en         = desc_busy ? desc_ctrl_flags[14] : cfg_pw_en;
+    wire                            run_dw_en         = desc_busy ? desc_ctrl_flags[15] : cfg_dw_en;
+    wire                            run_pool_avg      = desc_busy ? desc_ctrl_flags[16] : cfg_pool_avg;
+    wire                            run_gpool_en      = desc_busy ? desc_ctrl_flags[17] : cfg_gpool_en;
+    wire                            run_ic_stream     = desc_busy ? desc_ctrl_flags[23] : cfg_ic_stream;
+    wire [7:0]                      run_pad_w         = desc_busy ? desc_pad_w          : cfg_pad_w;
+    wire [7:0]                      run_pad_h         = desc_busy ? desc_pad_h          : cfg_pad_h;
+    wire [7:0]                      run_pad_value     = desc_busy ? 8'd0                : cfg_pad_value;
+    wire [SRAM_ADDR_W-1:0]          run_act_addr      = desc_busy ? desc_act_addr       : cfg_act_addr_ping;
+    wire [SRAM_ADDR_W-1:0]          run_wgt_addr      = desc_busy ? desc_wgt_addr       : cfg_wgt_addr_ping;
+    wire [SRAM_ADDR_W-1:0]          run_out_addr      = desc_busy ? desc_out_addr       : cfg_out_addr_ping;
+    wire [15:0]                     run_dim_in_w      = desc_busy ? desc_in_w           : cfg_dim_in_w;
+    wire [15:0]                     run_dim_in_h      = desc_busy ? desc_in_h           : cfg_dim_in_h;
+    wire [15:0]                     run_dim_in_c      = desc_busy ? desc_in_c           : cfg_dim_in_c;
+    wire [15:0]                     run_dim_out_c     = desc_busy ? desc_out_c          : cfg_dim_out_c;
+    wire [7:0]                      run_kh            = desc_busy ? desc_kernel_kh      : cfg_kh;
+    wire [7:0]                      run_kw            = desc_busy ? desc_kernel_kw      : cfg_kw;
+    wire [7:0]                      run_sx            = desc_busy ? desc_stride_sx      : cfg_sx;
+    wire [7:0]                      run_sy            = desc_busy ? desc_stride_sy      : cfg_sy;
+    wire [2:0]                      run_oc_tiles_total = (run_dim_out_c + 16'd15) >> 4;
+    wire [4:0]                      run_ic_groups      = (run_dim_in_c + 16'd15) >> 4;
 
     // ===================================================================
     // Performance counter event strobes (fed to param_regfile @0x3A4+).
@@ -611,7 +677,23 @@ module npu_top #(
         .o_qparam_idx       (desc_qparam_idx),
         .o_qparam_bias      (desc_qparam_bias),
         .o_qparam_scale     (desc_qparam_scale),
-        .o_qparam_shift     (desc_qparam_shift)
+        .o_qparam_shift     (desc_qparam_shift),
+        .o_npu_start        (desc_npu_start),
+        .o_ctrl_flags       (desc_ctrl_flags),
+        .o_in_w             (desc_in_w),
+        .o_in_h             (desc_in_h),
+        .o_in_c             (desc_in_c),
+        .o_out_c            (desc_out_c),
+        .o_kernel_kh        (desc_kernel_kh),
+        .o_kernel_kw        (desc_kernel_kw),
+        .o_stride_sx        (desc_stride_sx),
+        .o_stride_sy        (desc_stride_sy),
+        .o_pad_w            (desc_pad_w),
+        .o_pad_h            (desc_pad_h),
+        .o_act_addr         (desc_act_addr),
+        .o_wgt_addr         (desc_wgt_addr),
+        .o_out_addr         (desc_out_addr),
+        .i_npu_done         (npu_done_irq)
     );
 
     // ===================================================================
@@ -704,7 +786,7 @@ module npu_top #(
         .addrb         (out_sram_addrb),
         .dib           (out_sram_dib),
         .dob           (out_sram_dob),
-        .npu_ping_sel  (cfg_out_ping_sel),     // NPU write bank for Out SRAM (CTRL[6]), independent of global ping_pong
+        .npu_ping_sel  (run_out_ping_sel),     // NPU write bank for Out SRAM (CTRL[6]), independent of global ping_pong
         .dma_ping_sel  (run_dma_out_ping_sel) // DMA Out SRAM read bank is independent of NPU write bank
     );
 
@@ -786,28 +868,28 @@ module npu_top #(
     ) u_controller (
         .clk                  (clk),
         .rst_n                (rst_n),
-        .i_start              (cfg_start),
-        .i_ping_pong_sel      (cfg_ping_pong_sel),
-        .i_pool_en            (cfg_pool_en),
-        .i_eltwise_en         (cfg_eltwise_en),
-        .i_gemm_en            (cfg_gemm_en),
-        .i_hw_pad             (cfg_hw_pad),
-        .i_pad_w              (cfg_pad_w),
-        .i_pad_h              (cfg_pad_h),
-        .i_act_base_ping      (cfg_act_addr_ping),
-        .i_act_base_pong      (cfg_act_addr_pong),
-        .i_wgt_base_ping      (cfg_wgt_addr_ping),
-        .i_wgt_base_pong      (cfg_wgt_addr_pong),
-        .i_out_base_ping      (cfg_out_addr_ping),
-        .i_out_base_pong      (cfg_out_addr_pong),
-        .i_dim_in_w           (cfg_dim_in_w),
-        .i_dim_in_h           (cfg_dim_in_h),
-        .i_dim_in_c           (cfg_dim_in_c),
-        .i_dim_out_c          (cfg_dim_out_c),
-        .i_kernel_kh          (cfg_kh),
-        .i_kernel_kw          (cfg_kw),
-        .i_stride_sx          (cfg_sx),
-        .i_stride_sy          (cfg_sy),
+        .i_start              (run_start),
+        .i_ping_pong_sel      (run_ping_pong_sel),
+        .i_pool_en            (run_pool_en),
+        .i_eltwise_en         (run_eltwise_en),
+        .i_gemm_en            (run_gemm_en),
+        .i_hw_pad             (run_hw_pad),
+        .i_pad_w              (run_pad_w),
+        .i_pad_h              (run_pad_h),
+        .i_act_base_ping      (run_act_addr),
+        .i_act_base_pong      (desc_busy ? desc_act_addr : cfg_act_addr_pong),
+        .i_wgt_base_ping      (run_wgt_addr),
+        .i_wgt_base_pong      (desc_busy ? desc_wgt_addr : cfg_wgt_addr_pong),
+        .i_out_base_ping      (run_out_addr),
+        .i_out_base_pong      (desc_busy ? desc_out_addr : cfg_out_addr_pong),
+        .i_dim_in_w           (run_dim_in_w),
+        .i_dim_in_h           (run_dim_in_h),
+        .i_dim_in_c           (run_dim_in_c),
+        .i_dim_out_c          (run_dim_out_c),
+        .i_kernel_kh          (run_kh),
+        .i_kernel_kw          (run_kw),
+        .i_stride_sx          (run_sx),
+        .i_stride_sy          (run_sy),
 
         .o_act_sram_addr      (fsm_act_sram_addr),
         .o_act_sram_en        (fsm_act_sram_en),
@@ -829,12 +911,12 @@ module npu_top #(
         .o_im2col_pixel_data  (fsm_im2col_pixel_data),
         .o_im2col_pixel_vld   (fsm_im2col_pixel_vld),
         .o_border             (fsm_border),
-        .i_row_par_en         (cfg_row_par_en),
-        .i_gemm_reduce        (cfg_gemm_reduce),
-        .i_row_block_en       (cfg_row_block_en),
-        .i_oc_single          (cfg_oc_single),
-        .i_ic_stream          (cfg_ic_stream),
-        .i_pw_en              (cfg_pw_en),
+        .i_row_par_en         (run_row_par_en),
+        .i_gemm_reduce        (run_gemm_reduce),
+        .i_row_block_en       (run_row_block_en),
+        .i_oc_single          (run_oc_single),
+        .i_ic_stream          (run_ic_stream),
+        .i_pw_en              (run_pw_en),
         .o_oc_tile_sel        (fsm_oc_tile_sel),
         .o_rows_per_grp       (fsm_rows_per_grp),
         .o_im2col_load_tile   (fsm_im2col_load_tile),
@@ -881,7 +963,7 @@ module npu_top #(
     // Status signals
     assign status_done_irq = npu_done_irq;
     assign status_busy     = npu_busy_visible;
-    assign irq_done        = npu_done_irq | desc_irq;
+    assign irq_done        = desc_irq | (desc_busy ? 1'b0 : npu_done_irq);
 
     // ===================================================================
     // Weight Reader
@@ -892,7 +974,7 @@ module npu_top #(
     wire                     wgt_reader_wgt_vld;
 
     // Runtime kernel-offset count for wgt_reader (conv 3x3 -> 9, GEMM 1x1 -> 1)
-    wire [7:0] cfg_kernel_offsets = {4'd0, cfg_kh[3:0]} * {4'd0, cfg_kw[3:0]};
+    wire [7:0] cfg_kernel_offsets = {4'd0, run_kh[3:0]} * {4'd0, run_kw[3:0]};
 
     wgt_reader #(
         .NUM_OC         (ARRAY_COLS),
@@ -912,13 +994,13 @@ module npu_top #(
         .i_prefetch_all    (fsm_prefetch_all),
         .i_wgt_ic_sel      (fsm_wgt_ic_sel),
         .o_prefetch_done   (fsm_wgt_prefetch_done),
-        .i_oc_single       (cfg_oc_single),
-        .i_oc_tiles_total  (cfg_oc_tiles_total),
+        .i_oc_single       (run_oc_single),
+        .i_oc_tiles_total  (run_oc_tiles_total),
         .i_oc_tile_sel     (fsm_wgt_oc_tile_sel),
         .i_wgt_offset      (fsm_im2col_offset_sel),
         .o_wgt             (wgt_reader_wgt),
         .o_wgt_vld         (wgt_reader_wgt_vld),
-        .i_gemm_reduce     (cfg_gemm_reduce),
+        .i_gemm_reduce     (run_gemm_reduce),
         .i_plane_trig      (fsm_wgt_plane_trig),
         .i_superstep       (fsm_superstep),
         .o_wgt_plane       (wgt_reader_plane),
@@ -963,7 +1045,7 @@ module npu_top #(
     // -----------------------------------------------------------------
     localparam ICG_MAX = 16; // im2col window holds 16 IC tiles (256 ch): lets icg<=16 3x3
                              // convs run the resident path instead of CPU ic_stream psum.
-    wire [4:0] cfg_ic_groups = (cfg_dim_in_c + 16'd15) >> 4;  // 1..ICG_MAX
+    wire [4:0] cfg_ic_groups = run_ic_groups;  // 1..ICG_MAX
 
     // SRAM Read Latency Compensation
     reg fsm_im2col_pixel_vld_d;
@@ -986,7 +1068,7 @@ module npu_top #(
 
     // hw-pad: inject configured border byte (default 0, YOLO uses input zero-point).
     wire [ACT_DATA_W-1:0] im2col_pixel_data_mux =
-        fsm_border_d ? {16{cfg_pad_value}} : fsm_im2col_pixel_data;
+        fsm_border_d ? {16{run_pad_value}} : fsm_im2col_pixel_data;
 
     im2col_line_buffer #(
         .MAX_WIDTH   (MAX_WIDTH),
@@ -1000,15 +1082,15 @@ module npu_top #(
         .i_pixel_tile    (fsm_im2col_load_tile_d),
         .i_ic_groups     (cfg_ic_groups),
         .i_win_tile      ({1'b0, fsm_cur_ic_tile[7:4]}),
-        .i_width         (cfg_dim_in_w),
-        .i_height        (cfg_dim_in_h),
+        .i_width         (run_dim_in_w),
+        .i_height        (run_dim_in_h),
         .i_row_start     (fsm_im2col_row_start),
         .i_win_advance   (fsm_im2col_win_advance_d),
         .i_win_freeze    (fsm_im2col_win_freeze),
         .i_offset_sel    (fsm_im2col_offset_sel),
-        .i_row_par_en    (cfg_row_par_en),
+        .i_row_par_en    (run_row_par_en),
         .i_group_base    (fsm_im2col_group_base),
-        .i_row_block_en  (cfg_row_block_en),
+        .i_row_block_en  (run_row_block_en),
         .i_group_size    (fsm_group_size),
         .i_rows_per_grp  (fsm_rows_per_grp),
         .o_act_window    (im2col_act_window),
@@ -1068,12 +1150,12 @@ module npu_top #(
         // rows (same replication im2col does for conv) — every PE in a column
         // computes the identical dot product, so drain/POST capture is
         // phase-independent. Conv mode: im2col window as before.
-        .i_act       (cfg_gemm_reduce       ? act_row_bus
-                    : (cfg_gemm_en|cfg_pw_en) ? {ARRAY_ROWS{act_sram_doa}}
+        .i_act       (run_gemm_reduce       ? act_row_bus
+                    : (run_gemm_en|run_pw_en) ? {ARRAY_ROWS{act_sram_doa}}
                     :                         im2col_act_window),
         .i_wgt       (wgt_reader_wgt),
         .i_wgt_plane (wgt_reader_plane),
-        .i_reduce    (cfg_gemm_reduce),
+        .i_reduce    (run_gemm_reduce),
         .o_psum_col  (array_psum_col),
         .i_vld       (fsm_array_vld),
         .i_k_end     (fsm_array_k_end),
@@ -1143,8 +1225,8 @@ module npu_top #(
     // ===================================================================
     // Conv output width for pooling row boundary detection
     // ===================================================================
-    wire [15:0] conv_out_w = (cfg_dim_in_w - {8'd0, cfg_kw}) / {8'd0, cfg_sx} + 16'd1;
-    wire [15:0] conv_out_h = (cfg_dim_in_h - {8'd0, cfg_kh}) / {8'd0, cfg_sy} + 16'd1;
+    wire [15:0] conv_out_w = (run_dim_in_w - {8'd0, run_kw}) / {8'd0, run_sx} + 16'd1;
+    wire [15:0] conv_out_h = (run_dim_in_h - {8'd0, run_kh}) / {8'd0, run_sy} + 16'd1;
     // Decision O: pooled words per OC-tile = (conv_out_w/2)*(conv_out_h/2). Used to
     // place each OC tile's pooled output tile-major in the single-start (oc_single).
     wire [SRAM_ADDR_W-1:0] pool_tile_words =
@@ -1168,8 +1250,8 @@ module npu_top #(
         .NUM_CH(ARRAY_COLS), .PSUM_WIDTH(PSUM_WIDTH), .SRAM_ADDR_W(SRAM_ADDR_W)
     ) u_depthwise (
         .clk(clk), .rst_n(rst_n),
-        .i_start(cfg_start & cfg_dw_en),   // only borrow Wgt port / accumulate in depthwise mode
-        .i_wgt_base(cfg_ping_pong_sel ? cfg_wgt_addr_pong : cfg_wgt_addr_ping),
+        .i_start(run_start & run_dw_en),   // only borrow Wgt port / accumulate in depthwise mode
+        .i_wgt_base(run_ping_pong_sel ? (desc_busy ? desc_wgt_addr : cfg_wgt_addr_pong) : run_wgt_addr),
         .o_wgt_rd_addr(dw_wgt_rd_addr),
         .o_wgt_rd_en(dw_wgt_rd_en),
         .o_wgt_active(dw_wgt_active),
@@ -1191,16 +1273,16 @@ module npu_top #(
     ) u_post_process (
         .clk           (clk),
         .rst_n         (rst_n),
-        .i_start       (cfg_start),
-        .i_psum        (cfg_dw_en ? dw_psum : array_psum_col),  // depthwise bypasses the array
+        .i_start       (run_start),
+        .i_psum        (run_dw_en ? dw_psum : array_psum_col),  // depthwise bypasses the array
         .i_psum_vld    (pp_input_vld),
-        .i_bias        (cfg_bias_val),
-        .i_scale_mul   (cfg_scale_mul),
-        .i_scale_shift (cfg_scale_shift),
+        .i_bias        (run_bias_val),
+        .i_scale_mul   (run_scale_mul),
+        .i_scale_shift (run_scale_shift),
         .i_width       (conv_out_w),
-        .i_pool_en     (cfg_pool_en),
-        .i_pool_avg    (cfg_pool_avg),
-        .i_relu_en     (cfg_relu_en),
+        .i_pool_en     (run_pool_en),
+        .i_pool_avg    (run_pool_avg),
+        .i_relu_en     (run_relu_en),
         .i_silu_en     (cfg_silu_en),
         .i_silu_requant_en(cfg_silu_requant_en),
         .i_silu_requant_mul(cfg_silu_requant_mul),
@@ -1217,7 +1299,7 @@ module npu_top #(
         .i_silu_load_val(cfg_silu_load_val),
         .i_in_drain    (fsm_in_drain),
         .i_in_post     (fsm_in_post),
-        .i_row_par_en  (cfg_row_par_en),
+        .i_row_par_en  (run_row_par_en),
         .i_group_size  (fsm_group_size),
         .i_rows_per_grp(fsm_rows_per_grp),
         .i_oc_tile     (fsm_oc_tile_sel[1:0]),
@@ -1311,7 +1393,7 @@ module npu_top #(
             rp_in_drain_d <= fsm_in_drain;
             if (fsm_in_drain && !rp_in_drain_d) begin   // rising edge: drain start
                 rp_vld_cnt <= 5'd0;
-                rp_active  <= cfg_row_par_en & ~cfg_pool_en;
+                rp_active  <= run_row_par_en & ~run_pool_en;
             end else if (rp_active && pp_feat_vld) begin
                 if (rp_vld_cnt == 5'd15)
                     rp_active <= 1'b0;                   // 16 drained pixels captured
@@ -1322,10 +1404,10 @@ module npu_top #(
     // Drained array row r = 15 - rp_vld_cnt. #4 row-block: r → block b=r/gs
     // (output row cur_oy+b), col c=r%gs; legacy (R=1): b=0, c=r.
     wire [4:0]  rb_arr_row = 5'd15 - rp_vld_cnt;
-    wire        rb_b = cfg_row_block_en && ({11'd0, rb_arr_row} >= fsm_group_size);
+    wire        rb_b = run_row_block_en && ({11'd0, rb_arr_row} >= fsm_group_size);
     wire [15:0] rb_c = {11'd0, rb_arr_row} - (rb_b ? fsm_group_size : 16'd0);
     wire [15:0] rp_col = fsm_group_base
-                       + (cfg_row_block_en ? rb_c : {11'd0, rb_arr_row});
+                       + (run_row_block_en ? rb_c : {11'd0, rb_arr_row});
     wire        rp_col_valid = rp_active && pp_feat_vld
                              && (rp_col >= fsm_group_base)
                              && (rp_col <  fsm_group_base + fsm_group_size);
@@ -1336,7 +1418,7 @@ module npu_top #(
                              - fsm_group_base[SRAM_ADDR_W-1:0]
                              + rp_col[SRAM_ADDR_W-1:0]
                              + (rb_b ? conv_out_w[SRAM_ADDR_W-1:0] : {SRAM_ADDR_W{1'b0}});
-    wire rp_wr_en = cfg_row_par_en & ~cfg_pool_en & rp_col_valid;
+    wire rp_wr_en = run_row_par_en & ~run_pool_en & rp_col_valid;
     wire rp_done  = rp_active && (rp_vld_cnt == 5'd15) && pp_feat_vld;
 
     // ---- Decision Q: raw INT32 output write sequencer (GEMM/final-FC) ----
@@ -1354,13 +1436,13 @@ module npu_top #(
         if (!rst_n) begin
             i32_buf <= {NUM_CH*32{1'b0}}; i32_cnt <= 2'd0;
             i32_active <= 1'b0; i32_base <= {SRAM_ADDR_W{1'b0}};
-        end else if (cfg_int32_out && fsm_out_wr_en && !i32_active) begin
+        end else if (run_int32_out && fsm_out_wr_en && !i32_active) begin
             i32_buf    <= pp_feat32;                    // 16×INT32 latched at the GEMM write
             // FC (single position): base = addr. Spatial INT32 (ic_stream, large-IC
             // streaming partials): each output position owns 4 words, so space the
             // base x4 to avoid overlap with the next position. Positions in a conv
             // sweep are >>4 cycles apart, so the 4-cycle serialize never drops.
-            i32_base   <= cfg_ic_stream ? {fsm_out_wr_addr[SRAM_ADDR_W-3:0], 2'b00}
+            i32_base   <= run_ic_stream ? {fsm_out_wr_addr[SRAM_ADDR_W-3:0], 2'b00}
                                         : fsm_out_wr_addr;
             i32_cnt    <= 2'd0;
             i32_active <= 1'b1;
@@ -1383,11 +1465,11 @@ module npu_top #(
             i32_done_irq_r   <= 1'b0;
         end else begin
             i32_done_irq_r <= 1'b0;
-            if (cfg_start) begin
+            if (run_start) begin
                 i32_done_pending <= 1'b0;
             end
 
-            if (cfg_int32_out && fsm_done_irq) begin
+            if (run_int32_out && fsm_done_irq) begin
                 if (!i32_active || i32_last_write) begin
                     i32_done_pending <= 1'b0;
                     i32_done_irq_r   <= 1'b1;
@@ -1401,8 +1483,8 @@ module npu_top #(
         end
     end
 
-    assign npu_done_irq     = cfg_int32_out ? i32_done_irq_r : fsm_done_irq;
-    assign npu_busy_visible = fsm_busy | (cfg_int32_out & (i32_active | i32_done_pending));
+    assign npu_done_irq     = run_int32_out ? i32_done_irq_r : fsm_done_irq;
+    assign npu_busy_visible = fsm_busy | (run_int32_out & (i32_active | i32_done_pending));
 
     // -------------------------------------------------------------------
     // Global average pooling (CTRL[17] gpool_en). Accumulates the per-position
@@ -1446,19 +1528,19 @@ module npu_top #(
     // In pool mode the Out-SRAM write is self-timed by the pooler's output
     // valid (pool_vld = pp_feat_vld) with the contiguous pool_out_addr_cnt;
     // in non-pool mode it is FSM-driven exactly as before.
-    assign out_sram_ena   = cfg_gpool_en   ? gavg_feat_vld
-                          : cfg_int32_out  ? i32_wr_en
-                          : cfg_pool_en    ? pp_feat_vld
-                          : cfg_row_par_en ? rp_wr_en
+    assign out_sram_ena   = run_gpool_en   ? gavg_feat_vld
+                          : run_int32_out  ? i32_wr_en
+                          : run_pool_en    ? pp_feat_vld
+                          : run_row_par_en ? rp_wr_en
                           :                  fsm_out_wr_en;
     assign out_sram_wea   = out_sram_ena;
-    assign out_sram_addra = cfg_gpool_en   ? gpool_addr
-                          : cfg_int32_out  ? i32_wr_addr[OUT_SRAM_ADDR_W-1:0]
-                          : cfg_pool_en    ? pool_wr_addr[OUT_SRAM_ADDR_W-1:0]
-                          : cfg_row_par_en ? rp_wr_addr[OUT_SRAM_ADDR_W-1:0]
+    assign out_sram_addra = run_gpool_en   ? gpool_addr
+                          : run_int32_out  ? i32_wr_addr[OUT_SRAM_ADDR_W-1:0]
+                          : run_pool_en    ? pool_wr_addr[OUT_SRAM_ADDR_W-1:0]
+                          : run_row_par_en ? rp_wr_addr[OUT_SRAM_ADDR_W-1:0]
                           :                  fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
-    assign out_sram_dia   = cfg_gpool_en   ? gavg_feat
-                          : cfg_int32_out  ? i32_wr_data : alu_res;
+    assign out_sram_dia   = run_gpool_en   ? gavg_feat
+                          : run_int32_out  ? i32_wr_data : alu_res;
 
     // synthesis translate_off
     `ifdef DEBUG
@@ -1477,9 +1559,9 @@ module npu_top #(
     // point (pp_start pulses at S_POST entry) so the FSM does not stall on the
     // 3/4 of points where 2x2 pooling emits no output; the Out-SRAM write is
     // decoupled and self-timed by pp_feat_vld above.  Non-pool keeps alu_vld.
-    assign fsm_pp_done = (cfg_pool_en && cfg_row_par_en) ? rp_pool_done
-                       : cfg_pool_en                     ? fsm_pp_start
-                       : cfg_row_par_en                  ? rp_done
+    assign fsm_pp_done = (run_pool_en && run_row_par_en) ? rp_pool_done
+                       : run_pool_en                     ? fsm_pp_start
+                       : run_row_par_en                  ? rp_done
                        :                                   alu_vld;
 
     // ===================================================================
