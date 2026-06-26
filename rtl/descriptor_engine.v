@@ -83,6 +83,12 @@ module descriptor_engine #(
     ,output reg [SRAM_ADDR_W-1:0] o_wgt_addr
     ,output reg [SRAM_ADDR_W-1:0] o_out_addr
     ,input  wire            i_npu_done
+    // YOLO spatial movement engines (Act SRAM <-> Act SRAM). Trigger like the
+    // copy/expand engines and wait on their level-type done.
+    ,output reg             o_upsample_trig
+    ,input  wire            i_upsample_done
+    ,output reg             o_maxpool5_trig
+    ,input  wire            i_maxpool5_done
     // Exact-SiLU LUT streaming load (OP_LUT_LOAD): one (idx,val) per cycle,
     // mirrors the CPU NPU_SILU_LOAD MMIO write so YOLO convs can carry their
     // own per-layer LUT inside the descriptor program.
@@ -111,6 +117,8 @@ module descriptor_engine #(
     localparam OP_CONV2D               = 8'h06;
     localparam OP_GEMM                 = 8'h07;
     localparam OP_STOP_IRQ = 8'h08;
+    localparam OP_UPSAMPLE2X = 8'h20; // 2x nearest-neighbour upsample (Act SRAM)
+    localparam OP_MAXPOOL5X5 = 8'h21; // 5x5 stride-1 signed maxpool (Act SRAM)
     localparam OP_LUT_LOAD = 8'h24;   // load 256-entry exact-SiLU LUT from DDR
     localparam OP_ACT_CFG  = 8'h25;   // latch per-layer activation/requant config
     localparam VERSION     = 8'h01;
@@ -148,6 +156,8 @@ module descriptor_engine #(
     localparam WAIT_COPY   = 3'd3;
     localparam WAIT_EXPAND = 3'd4;
     localparam WAIT_NPU    = 3'd5;
+    localparam WAIT_UPSAMPLE = 3'd6;
+    localparam WAIT_MAXPOOL  = 3'd7;
 
     reg [3:0] state;
     reg [1:0] beat_idx;
@@ -246,6 +256,8 @@ module descriptor_engine #(
         o_act_silu_requant_shift = 6'd0;
         o_act_silu_requant_zp = 8'd0;
         o_act_clip_max = 8'd127;
+        o_upsample_trig = 1'b0;
+        o_maxpool5_trig = 1'b0;
     end
 
     task set_error;
@@ -326,6 +338,8 @@ module descriptor_engine #(
             o_act_silu_requant_shift <= 6'd0;
             o_act_silu_requant_zp <= 8'd0;
             o_act_clip_max <= 8'd127;
+            o_upsample_trig <= 1'b0;
+            o_maxpool5_trig <= 1'b0;
             for (i = 0; i < 16; i = i + 1)
                 desc_w[i] <= 32'd0;
         end else begin
@@ -335,6 +349,8 @@ module descriptor_engine #(
             o_expand_trig <= 1'b0;
             o_qparam_we <= 1'b0;
             o_silu_load_en <= 1'b0;
+            o_upsample_trig <= 1'b0;
+            o_maxpool5_trig <= 1'b0;
             o_npu_start <= 1'b0;
 
             if (i_desc_clear_done) begin
@@ -429,6 +445,12 @@ module descriptor_engine #(
                         else
                             state <= S_START_OP;
                     end else if (desc_op == OP_CONV2D || desc_op == OP_GEMM) begin
+                        if (desc_w[8] == 32'd0 || desc_w[9] == 32'd0)
+                            set_error(ERR_BAD_SHAPE);
+                        else
+                            state <= S_START_OP;
+                    end else if (desc_op == OP_UPSAMPLE2X ||
+                                 desc_op == OP_MAXPOOL5X5) begin
                         if (desc_w[8] == 32'd0 || desc_w[9] == 32'd0)
                             set_error(ERR_BAD_SHAPE);
                         else
@@ -539,6 +561,30 @@ module descriptor_engine #(
                         o_pad_h <= desc_w[10][31:24];
                         state <= S_NPU_START;
                     end
+                    OP_UPSAMPLE2X: begin
+                        // src/dst reuse the DMA SRAM-base regs; dims reuse the
+                        // conv in_w/in_h/in_c regs (engine derives ic_groups).
+                        o_dma_act_ping_sel <= desc_w[1][0];
+                        o_dma_rd_sram_base <= desc_w[2][SRAM_ADDR_W-1:0];
+                        o_dma_wr_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];
+                        o_in_w <= desc_w[8][15:0];
+                        o_in_h <= desc_w[8][31:16];
+                        o_in_c <= desc_w[9][15:0];
+                        o_upsample_trig <= 1'b1;
+                        wait_kind <= WAIT_UPSAMPLE;
+                        state <= S_WAIT_OP;
+                    end
+                    OP_MAXPOOL5X5: begin
+                        o_dma_act_ping_sel <= desc_w[1][0];
+                        o_dma_rd_sram_base <= desc_w[2][SRAM_ADDR_W-1:0];
+                        o_dma_wr_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];
+                        o_in_w <= desc_w[8][15:0];
+                        o_in_h <= desc_w[8][31:16];
+                        o_in_c <= desc_w[9][15:0];
+                        o_maxpool5_trig <= 1'b1;
+                        wait_kind <= WAIT_MAXPOOL;
+                        state <= S_WAIT_OP;
+                    end
                     default: set_error(ERR_BAD_OPCODE);
                     endcase
                 end
@@ -635,6 +681,8 @@ module descriptor_engine #(
                         (wait_kind == WAIT_DMA_WR && i_dma_wr_done) ||
                         (wait_kind == WAIT_COPY   && i_copy_done) ||
                         (wait_kind == WAIT_EXPAND && i_expand_done) ||
+                        (wait_kind == WAIT_UPSAMPLE && i_upsample_done) ||
+                        (wait_kind == WAIT_MAXPOOL && i_maxpool5_done) ||
                         (wait_kind == WAIT_NPU    && i_npu_done)) begin
                         wait_kind <= WAIT_NONE;
                         state <= S_ADVANCE;

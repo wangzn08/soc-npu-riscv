@@ -468,6 +468,98 @@ module tb_npu_desc_queue;
             end
         end
 
+        // ---- Test 7: OP_UPSAMPLE2X (2x2x1 -> 4x4x1, nearest neighbour) ----
+        reg_write(12'h40C, 32'hC); // clear_done + irq_en
+        repeat (5) @(posedge clk);
+
+        // src 2x2 (ic_group 0) at Act PING words 0..3: pixel value = y*2+x+1.
+        for (kk = 0; kk < 4; kk = kk + 1) begin
+            actw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1)
+                actw[ic*8 +: 8] = (kk + 1);
+            act_poke(kk, actw);
+        end
+        for (kk = 0; kk < 16; kk = kk + 1)
+            act_poke(32 + kk, 128'd0);  // clear dst region
+
+        // descriptor program: UPSAMPLE2X (in 2x2, ic=16) src@0 dst@32, STOP.
+        ddr[16] = {32'h0, 32'h0, 32'h0, 32'h0000_0120}; // w0=op, w2=src=0
+        ddr[17] = {32'h0, 32'h0, 32'h0, 32'h0000_0020}; // w4=dst=32
+        ddr[18] = {32'h0, 32'h0, 32'h0010_0010, 32'h0002_0002}; // w8=in 2x2, w9=ic16/oc16
+        ddr[19] = 128'h0;
+        ddr[20] = {32'h0, 32'h0, 32'h0, 32'h0000_0108}; // STOP_IRQ
+        ddr[21] = 128'h0; ddr[22] = 128'h0; ddr[23] = 128'h0;
+
+        reg_write(12'h400, 32'h4000_0100);
+        reg_write(12'h404, 32'h0);
+        reg_write(12'h408, 32'd2);
+        reg_write(12'h40C, 32'h5); // start + irq_en
+
+        wait_i = 0;
+        while (!irq_done && wait_i < 5000) begin
+            @(posedge clk);
+            wait_i = wait_i + 1;
+        end
+        if (!irq_done) begin
+            $display("FAIL timeout waiting UPSAMPLE2X irq");
+            errors = errors + 1;
+        end
+        // out(oy,ox) = in(oy/2, ox/2); check lane 0 of each of the 16 dst words.
+        for (kk = 0; kk < 16; kk = kk + 1) begin
+            // oy=kk/4, ox=kk%4 ; in pixel = (oy/2)*2 + (ox/2)  -> value +1
+            got = dut.u_act_sram.u_bram.mem[32 + kk][7:0];
+            exp = ((kk / 4) / 2) * 2 + ((kk % 4) / 2) + 1;
+            if (got !== exp) begin
+                $display("FAIL upsample dst[%0d]=%0d exp=%0d", kk, got, exp);
+                errors = errors + 1;
+            end
+        end
+
+        // ---- Test 8: OP_MAXPOOL5X5 (5x5 stride-1 pad2, signed) ----
+        reg_write(12'h40C, 32'hC); // clear_done + irq_en
+        repeat (5) @(posedge clk);
+
+        // 5x5 input, peak 50 at (0,0), background 1. dst at words 32..56.
+        for (kk = 0; kk < 25; kk = kk + 1) begin
+            actw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1)
+                actw[ic*8 +: 8] = (kk == 0) ? 8'd50 : 8'd1;
+            act_poke(kk, actw);
+        end
+        for (kk = 0; kk < 25; kk = kk + 1)
+            act_poke(32 + kk, 128'd0);
+
+        ddr[16] = {32'h0, 32'h0, 32'h0, 32'h0000_0121}; // OP_MAXPOOL5X5, src=0
+        ddr[17] = {32'h0, 32'h0, 32'h0, 32'h0000_0020}; // dst=32
+        ddr[18] = {32'h0, 32'h0, 32'h0010_0010, 32'h0005_0005}; // 5x5, ic16
+        ddr[19] = 128'h0;
+        ddr[20] = {32'h0, 32'h0, 32'h0, 32'h0000_0108}; // STOP_IRQ
+        ddr[21] = 128'h0; ddr[22] = 128'h0; ddr[23] = 128'h0;
+
+        reg_write(12'h400, 32'h4000_0100);
+        reg_write(12'h404, 32'h0);
+        reg_write(12'h408, 32'd2);
+        reg_write(12'h40C, 32'h5); // start + irq_en
+
+        wait_i = 0;
+        while (!irq_done && wait_i < 8000) begin
+            @(posedge clk);
+            wait_i = wait_i + 1;
+        end
+        if (!irq_done) begin
+            $display("FAIL timeout waiting MAXPOOL5X5 irq");
+            errors = errors + 1;
+        end
+        // out(y,x) = 50 iff (0,0) in the +/-2 window -> y<=2 && x<=2, else 1.
+        for (kk = 0; kk < 25; kk = kk + 1) begin
+            got = dut.u_act_sram.u_bram.mem[32 + kk][7:0];
+            exp = ((kk / 5) <= 2 && (kk % 5) <= 2) ? 8'd50 : 8'd1;
+            if (got !== exp) begin
+                $display("FAIL maxpool dst[%0d]=%0d exp=%0d", kk, got, exp);
+                errors = errors + 1;
+            end
+        end
+
         if (errors == 0)
             $display("NPU DESC QUEUE TEST PASS");
         else

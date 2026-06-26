@@ -356,6 +356,8 @@ module npu_top #(
     wire [5:0]                      desc_act_silu_requant_shift;
     wire [7:0]                      desc_act_silu_requant_zp;
     wire [7:0]                      desc_act_clip_max;
+    wire                            desc_upsample_trig;
+    wire                            desc_maxpool5_trig;
 
     reg [31:0] desc_bias_val [0:63];
     reg [31:0] desc_scale_mul [0:63];
@@ -449,6 +451,13 @@ module npu_top #(
     wire [5:0]                      run_silu_requant_shift = desc_busy ? desc_act_silu_requant_shift : cfg_silu_requant_shift;
     wire [7:0]                      run_silu_requant_zp  = desc_busy ? desc_act_silu_requant_zp   : cfg_silu_requant_zp;
     wire [7:0]                      run_clip_max         = desc_busy ? desc_act_clip_max          : cfg_clip_max;
+    // YOLO spatial movement engines: descriptor (OP_UPSAMPLE2X) vs CPU MMIO.
+    // Bases reuse run_dma_rd/wr_sram_base; dims reuse the conv in_w/in_h regs.
+    wire                            run_upsample_trig      = desc_busy ? desc_upsample_trig : cfg_upsample_trig;
+    wire [15:0]                     run_upsample_in_w      = desc_busy ? desc_in_w          : cfg_upsample_in_w;
+    wire [15:0]                     run_upsample_in_h      = desc_busy ? desc_in_h          : cfg_upsample_in_h;
+    wire [15:0]                     run_upsample_ic_groups = desc_busy ? {11'd0, run_ic_groups} : cfg_upsample_ic_groups;
+    wire                            run_maxpool5_trig      = desc_busy ? desc_maxpool5_trig : cfg_maxpool5_trig;
 
     // ===================================================================
     // Performance counter event strobes (fed to param_regfile @0x3A4+).
@@ -732,7 +741,11 @@ module npu_top #(
         .o_act_silu_requant_mul  (desc_act_silu_requant_mul),
         .o_act_silu_requant_shift(desc_act_silu_requant_shift),
         .o_act_silu_requant_zp   (desc_act_silu_requant_zp),
-        .o_act_clip_max          (desc_act_clip_max)
+        .o_act_clip_max          (desc_act_clip_max),
+        .o_upsample_trig         (desc_upsample_trig),
+        .i_upsample_done         (upsample_done),
+        .o_maxpool5_trig         (desc_maxpool5_trig),
+        .i_maxpool5_done         (maxpool5_done)
     );
 
     // ===================================================================
@@ -1761,12 +1774,12 @@ module npu_top #(
     ) u_upsample2x (
         .clk         (clk),
         .rst_n       (rst_n),
-        .i_trig      (cfg_upsample_trig),
-        .i_src_base  (cfg_dma_rd_sram_base),
-        .i_dst_base  (cfg_dma_wr_sram_base),
-        .i_in_w      (cfg_upsample_in_w),
-        .i_in_h      (cfg_upsample_in_h),
-        .i_ic_groups (cfg_upsample_ic_groups),
+        .i_trig      (run_upsample_trig),
+        .i_src_base  (run_dma_rd_sram_base),
+        .i_dst_base  (run_dma_wr_sram_base),
+        .i_in_w      (run_upsample_in_w),
+        .i_in_h      (run_upsample_in_h),
+        .i_ic_groups (run_upsample_ic_groups),
         .o_addr      (upsample_addr),
         .o_en        (upsample_en),
         .o_we        (upsample_we),
@@ -1787,12 +1800,12 @@ module npu_top #(
     ) u_maxpool5x5 (
         .clk         (clk),
         .rst_n       (rst_n),
-        .i_trig      (cfg_maxpool5_trig),
-        .i_src_base  (cfg_dma_rd_sram_base),
-        .i_dst_base  (cfg_dma_wr_sram_base),
-        .i_w         (cfg_upsample_in_w),
-        .i_h         (cfg_upsample_in_h),
-        .i_ic_groups (cfg_upsample_ic_groups),
+        .i_trig      (run_maxpool5_trig),
+        .i_src_base  (run_dma_rd_sram_base),
+        .i_dst_base  (run_dma_wr_sram_base),
+        .i_w         (run_upsample_in_w),
+        .i_h         (run_upsample_in_h),
+        .i_ic_groups (run_upsample_ic_groups),
         .o_addr      (maxpool5_addr),
         .o_en        (maxpool5_en),
         .o_we        (maxpool5_we),
