@@ -586,8 +586,12 @@ module descriptor_engine #(
                         o_kernel_kh <= desc_w[10][15:8];
                         o_stride_sx <= desc_w[10][23:16];
                         o_stride_sy <= desc_w[10][23:16];
-                        o_pad_w <= desc_w[10][31:24];
-                        o_pad_h <= desc_w[10][31:24];
+                        // pad byte: [27:24]=pad_w, [31:28]=pad_h (separate so a
+                        // strip conv can HW-pad horizontally while the vertical
+                        // halo/pad rows are DMA'd in). Symmetric pads put the same
+                        // value in both nibbles (MNIST byte-identical).
+                        o_pad_w <= {4'd0, desc_w[10][27:24]};
+                        o_pad_h <= {4'd0, desc_w[10][31:28]};
                         state <= S_NPU_START;
                     end
                     OP_UPSAMPLE2X: begin

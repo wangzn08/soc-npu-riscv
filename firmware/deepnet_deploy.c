@@ -385,7 +385,8 @@ static void hw_desc_conv(uint32_t *idx, uint32_t act, uint32_t wgt, uint32_t out
     d[4] = out;
     d[8] = (in_h << 16) | in_w;
     d[9] = (oc << 16) | ic;
-    d[10] = (pad << 24) | (stride << 16) | (kh << 8) | kw;
+    // pad byte [31:28]=pad_h, [27:24]=pad_w; symmetric pad -> same in both nibbles.
+    d[10] = ((((pad & 0xFu) << 4) | (pad & 0xFu)) << 24) | (stride << 16) | (kh << 8) | kw;
     d[11] = qparam_base;
     d[12] = qparam_count;
 }
