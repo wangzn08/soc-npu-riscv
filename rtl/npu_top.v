@@ -27,7 +27,7 @@ module npu_top #(
     parameter AXI_DATA_W    = 128,
     parameter AXI_ID_W      = 4,
     parameter AXI_LEN_W     = 8,
-    parameter REG_ADDR_W    = 10,
+    parameter REG_ADDR_W    = 12,
     parameter REG_DATA_W    = 32,
     parameter SRAM_ADDR_W   = 14,
     parameter OUT_SRAM_ADDR_W = 13,
@@ -229,6 +229,19 @@ module npu_top #(
     wire                            npu_busy_visible;
     wire                            dma_rd_err;
     wire                            dma_wr_err;
+    wire [31:0]                     desc_base_lo;
+    wire [31:0]                     desc_base_hi;
+    wire [15:0]                     desc_count;
+    wire                            desc_start;
+    wire                            desc_abort;
+    wire                            desc_irq_en;
+    wire                            desc_clear_done;
+    wire                            desc_busy = 1'b0;
+    wire                            desc_done = 1'b0;
+    wire                            desc_err = 1'b0;
+    wire                            desc_aborted = 1'b0;
+    wire [15:0]                     desc_pc = 16'd0;
+    wire [7:0]                      desc_err_code = 8'd0;
 
     wire [SRAM_ADDR_W-1:0]          cfg_act_addr_ping;
     wire [SRAM_ADDR_W-1:0]          cfg_act_addr_pong;
@@ -439,6 +452,19 @@ module npu_top #(
         .o_upsample_in_w   (cfg_upsample_in_w),
         .o_upsample_in_h   (cfg_upsample_in_h),
         .o_upsample_ic_groups(cfg_upsample_ic_groups),
+        .o_desc_base_lo    (desc_base_lo),
+        .o_desc_base_hi    (desc_base_hi),
+        .o_desc_count      (desc_count),
+        .o_desc_start      (desc_start),
+        .o_desc_abort      (desc_abort),
+        .o_desc_irq_en     (desc_irq_en),
+        .o_desc_clear_done (desc_clear_done),
+        .i_desc_busy       (desc_busy),
+        .i_desc_done       (desc_done),
+        .i_desc_err        (desc_err),
+        .i_desc_aborted    (desc_aborted),
+        .i_desc_pc         (desc_pc),
+        .i_desc_err_code   (desc_err_code),
         .i_dfl_done        (dfl_done),
         .o_dfl_src         (cfg_dfl_src),
         .o_dfl_dst         (cfg_dfl_dst),

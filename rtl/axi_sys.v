@@ -168,10 +168,10 @@ module axi_sys #(
     wire        dma_wr_done_rise = npu_dma_wr_done & ~dma_wr_done_d;
 
     reg         npu_reg_wr_en;
-    reg  [9:0]  npu_reg_wr_addr;
+    reg  [11:0] npu_reg_wr_addr;
     reg  [31:0] npu_reg_wr_data;
     reg         npu_reg_rd_en;
-    reg  [9:0]  npu_reg_rd_addr;
+    reg  [11:0] npu_reg_rd_addr;
     wire [31:0] npu_reg_rd_data;
     wire        npu_reg_rd_data_valid;
     wire        npu_reg_wr_done;
@@ -360,7 +360,7 @@ module axi_sys #(
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
             npu_reg_rd_en   <= 1'b0;
-            npu_reg_rd_addr <= 10'b0;
+            npu_reg_rd_addr <= 12'b0;
         end else begin
             npu_reg_rd_en <= (cpu_axi_arvalid && cpu_axi_arready && ar_sel_npu && !mmio_rvalid);
             if (cpu_axi_arvalid && cpu_axi_arready && ar_sel_npu && !mmio_rvalid)
@@ -395,7 +395,7 @@ module axi_sys #(
         if (!resetn) begin
             tests_passed    <= 1'b0;
             npu_reg_wr_en   <= 1'b0;
-            npu_reg_wr_addr <= 10'b0;
+            npu_reg_wr_addr <= 12'b0;
             npu_reg_wr_data <= 32'b0;
         end else begin
             npu_reg_wr_en <= 1'b0;  // 默认清除，单周期脉冲
@@ -586,7 +586,7 @@ module axi_sys #(
         .AXI_ADDR_W     (32),
         .AXI_ID_W       (4),
         .AXI_LEN_W      (8),
-        .REG_ADDR_W      (10)
+        .REG_ADDR_W      (12)
     ) npu_wrapper (
         .clk                (clk),
         .rst_n              (resetn),

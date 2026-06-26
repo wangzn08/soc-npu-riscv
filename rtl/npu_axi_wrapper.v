@@ -18,7 +18,7 @@ module npu_axi_wrapper #(
     parameter AXI_ADDR_W      = 32,
     parameter AXI_ID_W        = 4,
     parameter AXI_LEN_W       = 8,
-    parameter REG_ADDR_W      = 10
+    parameter REG_ADDR_W      = 12
 ) (
     input  wire                         clk,
     input  wire                         rst_n,

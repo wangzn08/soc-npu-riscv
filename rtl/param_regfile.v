@@ -38,7 +38,7 @@
 module param_regfile #(
     parameter NUM_OC        = 16,
     parameter MAX_OC_RESIDENT = 64,   // decision O: all-OC-resident bias/scale/shift capacity
-    parameter ADDR_W        = 10,
+    parameter ADDR_W        = 12,
     parameter DATA_W        = 32,
     parameter PSUM_WIDTH    = 32,
     parameter ACT_WIDTH     = 8,
@@ -222,6 +222,21 @@ module param_regfile #(
     output wire [15:0]                  o_upsample_in_h,    // 0x3C0[31:16]
     output wire [15:0]                  o_upsample_ic_groups, // 0x3C4[15:0]
 
+    // Hardware descriptor queue control/status (0x400+)
+    output wire [31:0]                  o_desc_base_lo,
+    output wire [31:0]                  o_desc_base_hi,
+    output wire [15:0]                  o_desc_count,
+    output wire                         o_desc_start,
+    output wire                         o_desc_abort,
+    output wire                         o_desc_irq_en,
+    output wire                         o_desc_clear_done,
+    input  wire                         i_desc_busy,
+    input  wire                         i_desc_done,
+    input  wire                         i_desc_err,
+    input  wire                         i_desc_aborted,
+    input  wire [15:0]                  i_desc_pc,
+    input  wire [7:0]                   i_desc_err_code,
+
     // Performance counter event strobes (asserted for 1 cycle per event)
     input  wire                         i_perf_busy,        // NPU FSM busy
     input  wire                         i_perf_arr_active,  // systolic array accumulating (MAC cycle)
@@ -350,6 +365,13 @@ module param_regfile #(
     reg        dma_act_ping_sel; // 0=Ping, 1=Pong — Act SRAM DMA write target
     reg        dma_wgt_ping_sel; // 0=Ping, 1=Pong — Wgt SRAM DMA write target
     reg        dma_out_ping_sel; // 0=Ping, 1=Pong — Out SRAM DMA read source (independent of NPU write bank)
+    reg [31:0] desc_base_lo;
+    reg [31:0] desc_base_hi;
+    reg [15:0] desc_count;
+    reg        desc_irq_en;
+    reg        desc_start_pulse;
+    reg        desc_abort_pulse;
+    reg        desc_clear_done_pulse;
 
     // -------------------------------------------------------------------
     // Write channel: decode address and update register
@@ -481,6 +503,13 @@ module param_regfile #(
             dma_act_ping_sel <= 1'b0;  // Default: DMA writes to Ping (same as NPU default)
             dma_wgt_ping_sel <= 1'b0;
             dma_out_ping_sel <= 1'b0;  // Default: DMA reads Out SRAM Ping bank
+            desc_base_lo <= 32'd0;
+            desc_base_hi <= 32'd0;
+            desc_count <= 16'd0;
+            desc_irq_en <= 1'b0;
+            desc_start_pulse <= 1'b0;
+            desc_abort_pulse <= 1'b0;
+            desc_clear_done_pulse <= 1'b0;
             for (wi = 0; wi < MAX_OC_RESIDENT; wi = wi + 1) begin
                 bias_val[wi]    <= 32'd0;
                 scale_mul[wi]   <= 32'd0;
@@ -504,6 +533,9 @@ module param_regfile #(
             dfl_eload_en_d <= 1'b0;
             sigm_load_en_d <= 1'b0;
             silu_load_en_d <= 1'b0;
+            desc_start_pulse <= 1'b0;
+            desc_abort_pulse <= 1'b0;
+            desc_clear_done_pulse <= 1'b0;
 
             if (wr_en) begin
                 // synthesis translate_off
@@ -675,6 +707,15 @@ module param_regfile #(
                         silu_load_idx   <= s_axi_wdata[15:8];
                         silu_load_val   <= s_axi_wdata[7:0];
                     end
+                    12'h400: desc_base_lo <= s_axi_wdata;       // NPU_DESC_BASE_LO
+                    12'h404: desc_base_hi <= s_axi_wdata;       // NPU_DESC_BASE_HI
+                    12'h408: desc_count   <= s_axi_wdata[15:0]; // NPU_DESC_COUNT
+                    12'h40C: begin                              // NPU_DESC_CTRL
+                        desc_start_pulse      <= s_axi_wdata[0];
+                        desc_abort_pulse      <= s_axi_wdata[1];
+                        desc_irq_en           <= s_axi_wdata[2];
+                        desc_clear_done_pulse <= s_axi_wdata[3];
+                    end
 
                     default: ; // Ignore unmapped addresses
                 endcase
@@ -807,6 +848,13 @@ module param_regfile #(
                     10'h3CC: rdata <= {silu_requant_zp, 2'd0, silu_requant_shift, silu_requant_mul};
                     10'h3D0: rdata <= {24'd0, pad_value};
                     10'h3D4: rdata <= {elt_ratio_mul, elt_ratio_en, elt_ratio_shift, elt_zp};
+                    12'h400: rdata <= desc_base_lo;
+                    12'h404: rdata <= desc_base_hi;
+                    12'h408: rdata <= {16'd0, desc_count};
+                    12'h40C: rdata <= {29'd0, desc_irq_en, 2'b00};
+                    12'h410: rdata <= {28'd0, i_desc_aborted, i_desc_err, i_desc_done, i_desc_busy};
+                    12'h414: rdata <= {16'd0, i_desc_pc};
+                    12'h418: rdata <= {24'd0, i_desc_err_code};
 
                     default: rdata <= 32'd0;
                 endcase
@@ -953,5 +1001,12 @@ module param_regfile #(
     assign o_upsample_in_w    = upsample_in_w;
     assign o_upsample_in_h    = upsample_in_h;
     assign o_upsample_ic_groups = upsample_ic_groups;
+    assign o_desc_base_lo     = desc_base_lo;
+    assign o_desc_base_hi     = desc_base_hi;
+    assign o_desc_count       = desc_count;
+    assign o_desc_start       = desc_start_pulse;
+    assign o_desc_abort       = desc_abort_pulse;
+    assign o_desc_irq_en      = desc_irq_en;
+    assign o_desc_clear_done  = desc_clear_done_pulse;
 
 endmodule
