@@ -126,6 +126,7 @@ module tb_npu_desc_queue;
 
     task act_poke(input integer a, input [127:0] d); begin dut.u_act_sram.u_bram.mem[a] = d; end endtask
     task wgt_poke(input integer a, input [127:0] d); begin dut.u_wgt_sram.u_bram.mem[a] = d; end endtask
+    task out_clear(input integer a); begin dut.u_out_sram.u_bram.mem[a] = 128'd0; end endtask
 
     initial begin
         s_axi_awvalid=0; s_axi_wvalid=0; s_axi_arvalid=0; s_axi_bready=0; s_axi_rready=0;
@@ -232,6 +233,61 @@ module tb_npu_desc_queue;
             exp = oc + 1;
             if (got !== exp) begin
                 $display("FAIL GEMM desc out[%0d]=%0d exp=%0d", oc, got, exp);
+                errors = errors + 1;
+            end
+        end
+
+        reg_write(12'h40C, 32'hC); // clear_done + irq_en
+        repeat (5) @(posedge clk);
+
+        actw = 128'd0;
+        for (ic = 0; ic < 16; ic = ic + 1)
+            actw[ic*8 +: 8] = 8'd2;
+        act_poke(8192, actw);
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            wgtw = 128'd0;
+            for (ic = 0; ic < 16; ic = ic + 1)
+                if (ic < 4)
+                    wgtw[ic*8 +: 8] = 8'd1;
+            wgt_poke(8192 + oc, wgtw);
+        end
+        out_clear(12);
+
+        ddr[40] = {32'h0, 32'h0, 32'h0, 32'h0422_0107}; // GEMM + PONG + ReLU + reduce
+        ddr[41] = {32'h0, 32'h0, 32'h0, 32'd12};         // out=12
+        ddr[42] = {32'h4000_0300, 32'h0001_0101, 32'h0010_0010, 32'h0001_0001};
+        ddr[43] = {32'h0, 32'h0, 32'h0, 32'd16};         // qparam_count=16
+        ddr[44] = {32'h0, 32'h0, 32'h0, 32'h0000_0108}; // STOP_IRQ
+        ddr[45] = 128'h0;
+        ddr[46] = 128'h0;
+        ddr[47] = 128'h0;
+
+        reg_write(12'h400, 32'h4000_0280);
+        reg_write(12'h404, 32'h0);
+        reg_write(12'h408, 32'd2);
+        reg_write(12'h40C, 32'h5); // start + irq_en
+
+        wait_i = 0;
+        while (!irq_done && wait_i < 5000) begin
+            @(posedge clk);
+            wait_i = wait_i + 1;
+        end
+        if (!irq_done) begin
+            $display("FAIL timeout waiting PONG GEMM descriptor irq");
+            errors = errors + 1;
+        end
+
+        reg_read(12'h410, rd_data);
+        if ((rd_data & 32'h2) == 0 || (rd_data & 32'h4) != 0) begin
+            $display("FAIL PONG GEMM desc status=0x%08h", rd_data);
+            errors = errors + 1;
+        end
+        outw = dut.u_out_sram.u_bram.mem[12];
+        for (oc = 0; oc < 16; oc = oc + 1) begin
+            got = outw[oc*8 +: 8];
+            exp = 8;
+            if (got !== exp) begin
+                $display("FAIL PONG GEMM desc out[%0d]=%0d exp=%0d", oc, got, exp);
                 errors = errors + 1;
             end
         end
