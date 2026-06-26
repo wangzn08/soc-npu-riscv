@@ -204,6 +204,8 @@ module npu_top #(
     wire [7:0]                      cfg_sigm_load_val;
     wire                            cfg_silu_exact_en;
     wire                            cfg_ic_stream;      // CTRL[23]: large-IC conv streaming
+    wire [1:0]                      cfg_acc_mode;       // NPU_ACC_MODE: INT32 psum accumulate
+    wire [SRAM_ADDR_W-1:0]          cfg_psum_rd_base;   // NPU_PSUM_RD_BASE: psum readback base
     wire                            cfg_silu_load_en;
     wire [7:0]                      cfg_silu_load_idx;
     wire [7:0]                      cfg_silu_load_val;
@@ -610,6 +612,8 @@ module npu_top #(
         .o_sigm_load_val   (cfg_sigm_load_val),
         .o_silu_exact_en   (cfg_silu_exact_en),
         .o_ic_stream       (cfg_ic_stream),
+        .o_acc_mode        (cfg_acc_mode),
+        .o_psum_rd_base    (cfg_psum_rd_base),
         .o_silu_load_en    (cfg_silu_load_en),
         .o_silu_load_idx   (cfg_silu_load_idx),
         .o_silu_load_val   (cfg_silu_load_val),
@@ -724,7 +728,7 @@ module npu_top #(
         .addrb         (act_sram_addrb),
         .dib           (act_sram_dib),
         .dob           (act_sram_dob),
-        .npu_ping_sel  (cfg_ping_pong_sel),
+        .npu_ping_sel  (run_ping_pong_sel),
         .dma_ping_sel  (run_dma_act_ping_sel)
     );
 
@@ -753,7 +757,7 @@ module npu_top #(
         .addrb         (wgt_sram_addrb),
         .dib           (wgt_sram_dib),
         .dob           (wgt_sram_dob),
-        .npu_ping_sel  (cfg_ping_pong_sel),
+        .npu_ping_sel  (run_ping_pong_sel),
         .dma_ping_sel  (run_dma_wgt_ping_sel)
     );
 
@@ -1303,9 +1307,7 @@ module npu_top #(
         .i_group_size  (fsm_group_size),
         .i_rows_per_grp(fsm_rows_per_grp),
         .i_oc_tile     (fsm_oc_tile_sel[1:0]),
-        // INT32 psum accumulate modes: tied OFF here (wired by a later task);
-        // ACC_NONE = byte-identical legacy post-process.
-        .i_acc_mode     (2'd0),
+        .i_acc_mode     (cfg_acc_mode),
         .i_psum_readback({(16*32){1'b0}}),
         .o_pool_tile   (pp_pool_tile),
         .o_rp_pool_done(rp_pool_done),
@@ -1348,20 +1350,20 @@ module npu_top #(
     // tile-inner — each OC tile is revisited once per group-row, interleaved with the
     // other tiles. So the within-tile counter must be PER OC-tile (persist across a
     // tile's interleaved visits, NOT reset on every tile switch). pool_wr_addr adds a
-    // tile-major base (oc_t*pool_tile_words). oc_single off ⇒ only tile 0's counter,
-    // base 0, reset on cfg_start ⇒ byte-identical to the legacy single counter.
+    // tile-major base (oc_t*pool_tile_words). oc_single off => only tile 0's counter,
+    // base 0, reset on every effective NPU start (CPU MMIO or descriptor).
     localparam POOL_NTILES = 4;
     reg [SRAM_ADDR_W-1:0] pool_out_cnt [0:POOL_NTILES-1];
     // pp_pool_tile is registered in the pooler aligned with pp_feat_vld, so the
     // write address uses the tile of the pixel actually being written (not the FSM's
     // possibly-advanced oc_t). 0 when oc_single off.
-    wire [1:0] pool_act_tile = cfg_oc_single ? pp_pool_tile : 2'd0;
+    wire [1:0] pool_act_tile = run_oc_single ? pp_pool_tile : 2'd0;
     integer pti;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             for (pti = 0; pti < POOL_NTILES; pti = pti + 1)
                 pool_out_cnt[pti] <= {SRAM_ADDR_W{1'b0}};
-        else if (cfg_start)
+        else if (run_start)
             for (pti = 0; pti < POOL_NTILES; pti = pti + 1)
                 pool_out_cnt[pti] <= {SRAM_ADDR_W{1'b0}};
         else if (out_sram_ena)
@@ -1370,7 +1372,7 @@ module npu_top #(
     end
     // Tile-major pooled write address (oc_single adds the per-tile base).
     wire [SRAM_ADDR_W-1:0] pool_wr_addr = pool_out_cnt[pool_act_tile]
-         + (cfg_oc_single ? ({{(SRAM_ADDR_W-2){1'b0}}, pool_act_tile} * pool_tile_words)
+         + (run_oc_single ? ({{(SRAM_ADDR_W-2){1'b0}}, pool_act_tile} * pool_tile_words)
                           : {SRAM_ADDR_W{1'b0}});
 
     // ---- Row-parallel non-pool Out-SRAM write sequencer ----
@@ -1500,7 +1502,7 @@ module npu_top #(
 
     global_avg #(.NUM_CH(ARRAY_COLS)) u_global_avg (
         .clk(clk), .rst_n(rst_n),
-        .i_start(cfg_start),
+        .i_start(run_start),
         .i_feat(alu_res),
         .i_feat_vld(gpool_feed_vld),
         .i_last(gpool_last),
@@ -1517,7 +1519,7 @@ module npu_top #(
         if (!rst_n) begin
             gpool_addr     <= {OUT_SRAM_ADDR_W{1'b0}};
             gpool_addr_set <= 1'b0;
-        end else if (cfg_start) begin
+        end else if (run_start) begin
             gpool_addr_set <= 1'b0;
         end else if (cfg_gpool_en && fsm_out_wr_en && !gpool_addr_set) begin
             gpool_addr     <= fsm_out_wr_addr[OUT_SRAM_ADDR_W-1:0];
@@ -1924,7 +1926,19 @@ module npu_top #(
         .m_axi_bresp     (dma_axi_bresp)
     );
 
-    wire desc_axi_rd_sel = desc_arvalid | desc_rready;
+    reg dma_rd_inflight;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            dma_rd_inflight <= 1'b0;
+        else begin
+            if (dma_axi_arvalid && dma_axi_arready)
+                dma_rd_inflight <= 1'b1;
+            if (dma_axi_rvalid && dma_axi_rready && dma_axi_rlast)
+                dma_rd_inflight <= 1'b0;
+        end
+    end
+
+    wire desc_axi_rd_sel = (desc_arvalid | desc_rready) & ~dma_rd_inflight & ~dma_axi_arvalid;
     assign m_axi_arvalid   = desc_axi_rd_sel ? desc_arvalid : dma_axi_arvalid;
     assign m_axi_arid      = desc_axi_rd_sel ? {AXI_ID_W{1'b0}} : dma_axi_arid;
     assign m_axi_araddr    = desc_axi_rd_sel ? desc_araddr : dma_axi_araddr;

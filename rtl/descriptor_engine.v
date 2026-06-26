@@ -130,6 +130,12 @@ module descriptor_engine #(
     reg [1:0] beat_idx;
     reg [31:0] desc_w [0:15];
     reg [2:0] wait_kind;
+    reg       wait_guard;   // skip the first S_WAIT_OP cycle: the trig pulse is
+                            // still in flight, so the engine's level-type done
+                            // (copy/expand/dma) has not yet cleared its STALE
+                            // value from the previous op. Sampling done here
+                            // would falsely advance. fsm_done_irq is a pulse so
+                            // this guard is harmless for WAIT_NPU.
     reg       qparam_loaded;
     reg [5:0] qparam_idx;
     integer i;
@@ -137,7 +143,8 @@ module descriptor_engine #(
     wire [7:0] desc_op      = desc_w[0][7:0];
     wire [7:0] desc_version = desc_w[0][15:8];
     wire [31:0] desc_addr   = i_desc_base_lo + {14'd0, o_pc, 6'b0};
-    wire        qparam_needed = (desc_w[11] != 32'd0) && (desc_w[12][5:0] != 6'd0);
+    wire [6:0] qparam_count = desc_w[12][6:0];
+    wire        qparam_needed = (desc_w[11] != 32'd0) && (qparam_count != 7'd0);
     wire [31:0] qparam_addr = desc_w[11] + {22'd0, qparam_idx, 4'b0};
 
     assign m_axi_arsize  = 3'd4; // 16 bytes per beat
@@ -158,6 +165,7 @@ module descriptor_engine #(
         m_axi_rready = 1'b0;
         beat_idx = 2'd0;
         wait_kind = WAIT_NONE;
+        wait_guard = 1'b0;
         o_dma_rd_req = 1'b0;
         o_dma_wr_req = 1'b0;
         o_dma_rd_ddr_addr = 32'd0;
@@ -223,6 +231,7 @@ module descriptor_engine #(
             m_axi_rready <= 1'b0;
             beat_idx <= 2'd0;
             wait_kind <= WAIT_NONE;
+            wait_guard <= 1'b0;
             o_dma_rd_req <= 1'b0;
             o_dma_wr_req <= 1'b0;
             o_dma_rd_ddr_addr <= 32'd0;
@@ -373,11 +382,16 @@ module descriptor_engine #(
                 end
 
                 S_START_OP: begin
+                    // Arm the wait guard so the first S_WAIT_OP cycle ignores the
+                    // STALE level-done from the previous op (engines clear their
+                    // done one cycle after they sample the trig/req we issue here).
+                    wait_guard <= 1'b1;
                     case (desc_op)
                     OP_DMA_DDR_TO_ACT: begin
                         o_dma_sram_sel <= 1'b0;
                         o_dma_out_rd_sel <= 1'b0;
                         o_dma_rd_sram_sel <= 2'd1;
+                        o_dma_act_ping_sel <= desc_w[1][0];
                         o_dma_rd_ddr_addr <= desc_w[2];
                         o_dma_rd_len <= desc_w[7][15:0] - 16'd1;
                         o_dma_rd_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];
@@ -388,6 +402,7 @@ module descriptor_engine #(
                     OP_DMA_ACT_TO_DDR: begin
                         o_dma_out_rd_sel <= 1'b0;
                         o_dma_rd_sram_sel <= 2'd1;
+                        o_dma_act_ping_sel <= desc_w[1][0];
                         o_dma_wr_ddr_addr <= desc_w[4];
                         o_dma_wr_len <= desc_w[7][15:0] - 16'd1;
                         o_dma_wr_sram_base <= desc_w[2][SRAM_ADDR_W-1:0];
@@ -479,7 +494,7 @@ module descriptor_engine #(
                             o_qparam_scale <= m_axi_rdata[63:32];
                             o_qparam_shift <= m_axi_rdata[101:96];
                             m_axi_rready <= 1'b0;
-                            if (qparam_idx + 6'd1 >= desc_w[12][5:0]) begin
+                            if ({1'b0, qparam_idx} + 7'd1 >= qparam_count) begin
                                 qparam_loaded <= 1'b1;
                                 state <= S_DECODE;
                             end else begin
@@ -491,7 +506,11 @@ module descriptor_engine #(
                 end
 
                 S_WAIT_OP: begin
-                    if ((wait_kind == WAIT_DMA_RD && i_dma_rd_done) ||
+                    if (wait_guard) begin
+                        // First cycle after issuing the trig/req: the op's own
+                        // done has not cleared its stale value yet. Skip it.
+                        wait_guard <= 1'b0;
+                    end else if ((wait_kind == WAIT_DMA_RD && i_dma_rd_done) ||
                         (wait_kind == WAIT_DMA_WR && i_dma_wr_done) ||
                         (wait_kind == WAIT_COPY   && i_copy_done) ||
                         (wait_kind == WAIT_EXPAND && i_expand_done) ||

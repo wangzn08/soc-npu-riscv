@@ -24,6 +24,14 @@
 #define NPU_PROFILE 0
 #endif
 
+// ---- Hardware descriptor-queue deploy switch ----
+// 1 = drive the whole MNIST inference through the on-chip descriptor engine
+//     (descriptors + qparams resident in DDR, NPU executes them autonomously).
+// 0 = legacy per-layer CPU MMIO scheduling.
+#ifndef NPU_HW_DESC
+#define NPU_HW_DESC 0
+#endif
+
 #define WGT_DDR_BASE 0x40100000   // DDR resident weight image (8768 128-bit words)
 
 #define ACT_DDR_BASE 0x40140000   // DDR resident RAW images (camera model: 10*49 packed words)
@@ -241,6 +249,205 @@ static void dma_out_to_act(uint32_t act_dst_word, int nwords, int out_bank,
     npu_wr(NPU_DMA_PING_SEL, 0x0);                // restore default banks
     PROF_ADD(prof_load);
 }
+
+#if NPU_HW_DESC
+// ================================================================
+// Hardware descriptor-queue runtime (deploy path).
+// Build a list of 16-word descriptors + a resident qparam table in DDR, then
+// hand the whole inference to the on-chip descriptor engine. The CPU only
+// programs the queue base/count and waits for the done status.
+// ================================================================
+#define HW_DESC_DDR_BASE   0x4003C000u
+#define HW_QPARAM_DDR_BASE 0x4003E000u
+#define HW_DESC_MAX        32u
+#define HW_QPARAM_MAX      512u
+
+static uint32_t hw_qparam_cursor;
+
+static volatile uint32_t *hw_desc_word(uint32_t desc_idx)
+{
+    return (volatile uint32_t *)(HW_DESC_DDR_BASE + desc_idx * NPU_HW_DESC_WORDS * 4u);
+}
+
+static void hw_desc_clear_words(volatile uint32_t *d)
+{
+    for (uint32_t i = 0; i < NPU_HW_DESC_WORDS; i++)
+        d[i] = 0u;
+}
+
+static void hw_desc_set_op_words(volatile uint32_t *d, uint32_t op, uint32_t flags)
+{
+    d[0] = (op & 0xFFu) | ((NPU_HW_DESC_VERSION & 0xFFu) << 8) |
+           ((flags & 0xFFFFu) << 16);
+    d[1] = flags >> 16;
+}
+
+// Write `count` resident qparam entries (bias/scale/0/shift, 4 words each) to
+// DDR and return their base address. Channels >= valid_count are zero-padded.
+static uint32_t hw_qparams_write(const int32_t *biases, int count,
+                                 uint32_t scale_mul, uint32_t shift,
+                                 int valid_count)
+{
+    uint32_t base = HW_QPARAM_DDR_BASE + hw_qparam_cursor * 16u;
+    volatile uint32_t *q = (volatile uint32_t *)base;
+    for (int i = 0; i < count; i++) {
+        int valid = (i < valid_count);
+        q[i * 4 + 0] = valid ? (uint32_t)biases[i] : 0u;
+        q[i * 4 + 1] = valid ? scale_mul : 0u;
+        q[i * 4 + 2] = 0u;
+        q[i * 4 + 3] = valid ? shift : 0u;
+    }
+    hw_qparam_cursor += (uint32_t)count;
+    if (hw_qparam_cursor > HW_QPARAM_MAX)
+        print_str("  HW qparam overflow!\n");
+    return base;
+}
+
+// Same as above but the bias array is indexed from `offset` (used by FC1's
+// 16-OC passes that slice a 50-wide bias vector).
+static uint32_t hw_qparams_write_offset(const int32_t *biases, int offset,
+                                        int count, uint32_t scale_mul,
+                                        uint32_t shift, int total_valid)
+{
+    uint32_t base = HW_QPARAM_DDR_BASE + hw_qparam_cursor * 16u;
+    volatile uint32_t *q = (volatile uint32_t *)base;
+    for (int i = 0; i < count; i++) {
+        int oc = offset + i;
+        int valid = (oc < total_valid);
+        q[i * 4 + 0] = valid ? (uint32_t)biases[oc] : 0u;
+        q[i * 4 + 1] = valid ? scale_mul : 0u;
+        q[i * 4 + 2] = 0u;
+        q[i * 4 + 3] = valid ? shift : 0u;
+    }
+    hw_qparam_cursor += (uint32_t)count;
+    if (hw_qparam_cursor > HW_QPARAM_MAX)
+        print_str("  HW qparam overflow!\n");
+    return base;
+}
+
+static void hw_desc_dma_ddr_to_act(uint32_t *idx, uint32_t src, uint32_t act_base,
+                                   uint32_t words, uint32_t act_pong)
+{
+    volatile uint32_t *d = hw_desc_word((*idx)++);
+    hw_desc_clear_words(d);
+    hw_desc_set_op_words(d, NPU_HW_DESC_OP_DMA_DDR_TO_ACT, act_pong ? (1u << 16) : 0u);
+    d[2] = src;
+    d[4] = act_base;
+    d[7] = words;
+}
+
+static void hw_desc_dma_out_to_ddr(uint32_t *idx, uint32_t out_base,
+                                   uint32_t dst, uint32_t words, uint32_t out_pong)
+{
+    volatile uint32_t *d = hw_desc_word((*idx)++);
+    hw_desc_clear_words(d);
+    hw_desc_set_op_words(d, NPU_HW_DESC_OP_DMA_OUT_TO_DDR, out_pong ? (4u << 16) : 0u);
+    d[2] = out_base;
+    d[4] = dst;
+    d[7] = words;
+}
+
+static void hw_desc_img_expand(uint32_t *idx, uint32_t src_act,
+                               uint32_t dst_act, uint32_t words)
+{
+    volatile uint32_t *d = hw_desc_word((*idx)++);
+    hw_desc_clear_words(d);
+    hw_desc_set_op_words(d, NPU_HW_DESC_OP_IMG_EXPAND, 0u);
+    d[2] = src_act;
+    d[4] = dst_act;
+    d[7] = words;
+}
+
+static void hw_desc_copy_out_to_act(uint32_t *idx, uint32_t out_base,
+                                    uint32_t act_base, uint32_t words,
+                                    uint32_t act_pong, uint32_t out_pong)
+{
+    volatile uint32_t *d = hw_desc_word((*idx)++);
+    uint32_t flags = (act_pong ? (1u << 16) : 0u) | (out_pong ? (4u << 16) : 0u);
+    hw_desc_clear_words(d);
+    hw_desc_set_op_words(d, NPU_HW_DESC_OP_SRAM_COPY_OUT_TO_ACT, flags);
+    d[2] = out_base;
+    d[4] = act_base;
+    d[7] = words;
+}
+
+static void hw_desc_conv(uint32_t *idx, uint32_t act, uint32_t wgt, uint32_t out,
+                         uint32_t in_w, uint32_t in_h, uint32_t ic, uint32_t oc,
+                         uint32_t kh, uint32_t kw, uint32_t stride, uint32_t pad,
+                         uint32_t ctrl_flags, uint32_t qparam_base,
+                         uint32_t qparam_count)
+{
+    volatile uint32_t *d = hw_desc_word((*idx)++);
+    hw_desc_clear_words(d);
+    hw_desc_set_op_words(d, NPU_HW_DESC_OP_CONV2D, ctrl_flags);
+    d[2] = act;
+    d[3] = wgt;
+    d[4] = out;
+    d[8] = (in_h << 16) | in_w;
+    d[9] = (oc << 16) | ic;
+    d[10] = (pad << 24) | (stride << 16) | (kh << 8) | kw;
+    d[11] = qparam_base;
+    d[12] = qparam_count;
+}
+
+static void hw_desc_gemm(uint32_t *idx, uint32_t act, uint32_t wgt, uint32_t out,
+                         uint32_t ic, uint32_t oc, uint32_t ctrl_flags,
+                         uint32_t qparam_base, uint32_t qparam_count)
+{
+    volatile uint32_t *d = hw_desc_word((*idx)++);
+    hw_desc_clear_words(d);
+    hw_desc_set_op_words(d, NPU_HW_DESC_OP_GEMM, ctrl_flags);
+    d[2] = act;
+    d[3] = wgt;
+    d[4] = out;
+    d[8] = (1u << 16) | 1u;
+    d[9] = (oc << 16) | ic;
+    d[10] = (0u << 24) | (1u << 16) | (1u << 8) | 1u;
+    d[11] = qparam_base;
+    d[12] = qparam_count;
+}
+
+static void hw_desc_stop(uint32_t *idx)
+{
+    volatile uint32_t *d = hw_desc_word((*idx)++);
+    hw_desc_clear_words(d);
+    hw_desc_set_op_words(d, NPU_HW_DESC_OP_STOP_IRQ, 0u);
+}
+
+static int hw_desc_submit(uint32_t count)
+{
+    if (count == 0u || count > HW_DESC_MAX)
+        return 0;
+    npu_wr(NPU_DESC_BASE_LO, HW_DESC_DDR_BASE);
+    npu_wr(NPU_DESC_BASE_HI, 0u);
+    npu_wr(NPU_DESC_COUNT, count);
+    npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
+    npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_START);
+
+    int t = NPU_IRQ_TIMEOUT * 4;
+    while (t-- > 0) {
+        uint32_t st = npu_rd(NPU_DESC_STATUS);
+        if (st & NPU_DESC_STATUS_ERR) {
+            print_str("  DESC err pc=");
+            print_dec(npu_rd(NPU_DESC_PC));
+            print_str(" code=");
+            print_dec(npu_rd(NPU_DESC_ERR));
+            print_chr('\n');
+            return 0;
+        }
+        if (st & NPU_DESC_STATUS_DONE)
+            break;
+    }
+    if (t <= 0) {
+        print_str("  DESC timeout pc=");
+        print_dec(npu_rd(NPU_DESC_PC));
+        print_chr('\n');
+        return 0;
+    }
+    npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
+    return 1;
+}
+#endif
 
 // ================================================================
 // Pack one 16-output-channel tile [oc_start, oc_start+16) of conv weights
@@ -808,6 +1015,103 @@ static void print_perf(void)
     print_str("  peak=1.64 TOPS@200MHz; effective = array_util(arr/total) x peak\n");
 }
 
+#if NPU_HW_DESC
+// Append one conv layer (conv + on-chip residency copy) to the descriptor list.
+static void hw_desc_add_conv_layer(uint32_t *di,
+                                   int in_w, int in_h, int ic, int oc,
+                                   int kh, int kw, int stride, int pad,
+                                   int scale, const int32_t *biases,
+                                   int wgt_base, int pool_en,
+                                   int act_in, int act_dst, int act_dst_pong,
+                                   int row_par, int oc_single)
+{
+    int out_spatial = ((in_w - kw) / stride + 1) * ((in_h - kh) / stride + 1);
+    int out_words = pool_en ? (out_spatial >> 2) : out_spatial;
+    int oc_passes = (oc + 15) >> 4;
+    int row_block = row_par && (((in_w - kw) / stride + 1) == 8);
+    uint32_t flags = NPU_CTRL_RELU_EN |
+                     (pool_en ? NPU_CTRL_POOL_EN : 0u) |
+                     (pad ? NPU_CTRL_HW_PAD : 0u) |
+                     (row_par ? NPU_CTRL_ROW_PAR : 0u) |
+                     (row_block ? NPU_CTRL_ROW_BLOCK : 0u) |
+                     (oc_single ? NPU_CTRL_OC_SINGLE : 0u);
+    uint32_t qcnt = oc_single ? (uint32_t)oc : 16u;
+    uint32_t qbase = hw_qparams_write(biases, (int)qcnt,
+                                      (uint32_t)scale, SCALE_SHIFT, (int)qcnt);
+    hw_desc_conv(di, (uint32_t)act_in, (uint32_t)wgt_base, 0u,
+                 (uint32_t)in_w, (uint32_t)in_h, (uint32_t)ic, (uint32_t)oc,
+                 (uint32_t)kh, (uint32_t)kw, (uint32_t)stride, (uint32_t)pad,
+                 flags, qbase, qcnt);
+    hw_desc_copy_out_to_act(di, 0u, (uint32_t)act_dst,
+                            (uint32_t)(out_words * oc_passes),
+                            (uint32_t)act_dst_pong, 0u);
+}
+
+// Whole MNIST CNN+MLP described as a single descriptor program.
+static int deepnet_inference_hw_desc(int img_idx, int32_t *scores)
+{
+    uint32_t di = 0;
+    hw_qparam_cursor = 0;
+
+    hw_desc_dma_ddr_to_act(&di, ACT_DDR_BASE + (uint32_t)img_idx * IMG_RAW_WORDS * 16u,
+                           ACT_SCRATCH, IMG_RAW_WORDS, 0u);
+    hw_desc_img_expand(&di, ACT_SCRATCH, ACT_RES_R0, 28u * 28u);
+
+    hw_desc_add_conv_layer(&di, 30, 30, 16, 16, 3, 3, 1, 1,
+                           SCALE_CONV1, conv1_b, CONV1_WGT_BASE, 0,
+                           ACT_RES_R0, ACT_RES_B, 0, 1, 0);
+    hw_desc_add_conv_layer(&di, 30, 30, 16, 16, 3, 3, 1, 1,
+                           SCALE_CONV2, conv2_b, CONV2_WGT_BASE, 1,
+                           ACT_RES_B, ACT_RES_R0, 0, 1, 0);
+    hw_desc_add_conv_layer(&di, 16, 16, 16, 32, 3, 3, 1, 1,
+                           SCALE_CONV3, conv3_b, CONV3_WGT_BASE, 0,
+                           ACT_RES_R0, ACT_RES_B, 0, 1, 1);
+    hw_desc_add_conv_layer(&di, 18, 18, 32, 32, 3, 3, 1, 2,
+                           SCALE_CONV4, conv4_b, CONV4_WGT_BASE, 1,
+                           ACT_RES_B, ACT_RES_R0, 0, 1, 1);
+    hw_desc_add_conv_layer(&di, 10, 10, 32, 64, 3, 3, 1, 1,
+                           SCALE_CONV5, conv5_b, CONV5_WGT_BASE, 0,
+                           ACT_RES_R0, ACT_RES_B, 0, 1, 1);
+    hw_desc_add_conv_layer(&di, 10, 10, 64, 64, 3, 3, 1, 1,
+                           SCALE_CONV6, conv6_b, CONV6_WGT_BASE, 1,
+                           ACT_RES_B, 0, 1, 1, 1);
+
+    int fc1_tile_words = ((AFFINE1_IN + 15) >> 4) * 16;
+    int fc1_passes = (AFFINE1_OUT + 15) >> 4;
+    for (int pass = 0; pass < fc1_passes; pass++) {
+        uint32_t qbase = hw_qparams_write_offset(affine1_b, pass * 16, 16,
+                                                 SCALE_AFFINE1, SCALE_SHIFT,
+                                                 AFFINE1_OUT);
+        hw_desc_gemm(&di, 0u, (uint32_t)(FC1_WGT_BASE + pass * fc1_tile_words),
+                     (uint32_t)pass, AFFINE1_IN, 16u,
+                     NPU_CTRL_PING_PONG | NPU_CTRL_RELU_EN | NPU_CTRL_GEMM_REDUCE,
+                     qbase, 16u);
+    }
+    hw_desc_dma_out_to_ddr(&di, 0u, FC1_OUT_DDR, (uint32_t)fc1_passes, 0u);
+
+    hw_desc_dma_ddr_to_act(&di, FC1_OUT_DDR, 0u,
+                           (uint32_t)((AFFINE2_IN + 15) >> 4), 1u);
+    {
+        uint32_t qbase = hw_qparams_write_offset(affine2_b, 0, 16,
+                                                 SCALE_AFFINE2, SCALE_SHIFT,
+                                                 AFFINE2_OUT);
+        hw_desc_gemm(&di, 0u, FC2_WGT_BASE, 0u, AFFINE2_IN, 16u,
+                     NPU_CTRL_PING_PONG | NPU_CTRL_GEMM_REDUCE | NPU_CTRL_INT32_OUT,
+                     qbase, 16u);
+    }
+    hw_desc_dma_out_to_ddr(&di, 0u, FC2_OUT_DDR, 4u, 0u);
+    hw_desc_stop(&di);
+
+    if (!hw_desc_submit(di))
+        return 0;
+
+    volatile int32_t *f2 = (volatile int32_t *)FC2_OUT_DDR;
+    for (int oc = 0; oc < AFFINE2_OUT; oc++)
+        scores[oc] = f2[oc];
+    return 1;
+}
+#endif
+
 // ================================================================
 // usercode7: run inference on 2 MNIST test images
 // ================================================================
@@ -840,6 +1144,9 @@ void usercode7(void)
     volatile int32_t *scr = (volatile int32_t *)SCORES;
 
     int correct = 0;
+#if NPU_HW_DESC
+    (void)mnist_images;   // descriptor path selects images from resident DDR
+#endif
     npu_wr(NPU_PERF_CLR, 1);   // clear RTL performance counters (HW)
     for (int d = 0; d < 10; d++) {
         print_str("Digit "); print_dec(d); print_str(": ");
@@ -847,7 +1154,14 @@ void usercode7(void)
 #if NPU_PROFILE
         uint32_t _ti = rdcycle32();
 #endif
+#if NPU_HW_DESC
+        if (!deepnet_inference_hw_desc(d, (int32_t *)SCORES)) {
+            print_str("DESC INFER FAIL\n");
+            return;
+        }
+#else
         deepnet_inference(mnist_images[d], (int32_t *)SCORES, d);
+#endif
 #if NPU_PROFILE
         prof_infer += rdcycle32() - _ti;
 #endif
