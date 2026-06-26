@@ -342,6 +342,62 @@ module tb_npu_desc_queue;
             end
         end
 
+        // ---- Test 5: OP_ACTIVATION_CFG latches per-layer activation config ----
+        reg_write(12'h40C, 32'hC); // clear_done + irq_en
+        repeat (5) @(posedge clk);
+
+        // ACTIVATION_CFG: pad=0x07, requant {zp=0x12,shift=0x05,mul=0x1234},
+        // flags silu_exact|silu_requant_en (0x05), clip_max=0x3C.
+        ddr[16] = {32'h1205_1234, 32'h0000_0007, 32'h0, 32'h0000_0125};
+        ddr[17] = {32'h0, 32'h0, 32'h0000_003C, 32'h0000_0005};
+        ddr[18] = 128'h0;
+        ddr[19] = 128'h0;
+        ddr[20] = {32'h0, 32'h0, 32'h0, 32'h0000_0108}; // STOP_IRQ
+        ddr[21] = 128'h0;
+        ddr[22] = 128'h0;
+        ddr[23] = 128'h0;
+
+        reg_write(12'h400, 32'h4000_0100);
+        reg_write(12'h404, 32'h0);
+        reg_write(12'h408, 32'd2);
+        reg_write(12'h40C, 32'h5); // start + irq_en
+
+        wait_i = 0;
+        while (!irq_done && wait_i < 5000) begin
+            @(posedge clk);
+            wait_i = wait_i + 1;
+        end
+        if (!irq_done) begin
+            $display("FAIL timeout waiting ACT_CFG descriptor irq");
+            errors = errors + 1;
+        end
+        if (dut.u_descriptor_engine.o_act_pad_value !== 8'h07) begin
+            $display("FAIL act pad=0x%02h", dut.u_descriptor_engine.o_act_pad_value);
+            errors = errors + 1;
+        end
+        if (dut.u_descriptor_engine.o_act_silu_requant_mul !== 16'h1234 ||
+            dut.u_descriptor_engine.o_act_silu_requant_shift !== 6'h05 ||
+            dut.u_descriptor_engine.o_act_silu_requant_zp !== 8'h12) begin
+            $display("FAIL act requant mul=%0h shift=%0h zp=%0h",
+                     dut.u_descriptor_engine.o_act_silu_requant_mul,
+                     dut.u_descriptor_engine.o_act_silu_requant_shift,
+                     dut.u_descriptor_engine.o_act_silu_requant_zp);
+            errors = errors + 1;
+        end
+        if (dut.u_descriptor_engine.o_act_silu_exact_en !== 1'b1 ||
+            dut.u_descriptor_engine.o_act_silu_requant_en !== 1'b1 ||
+            dut.u_descriptor_engine.o_act_silu_en !== 1'b0) begin
+            $display("FAIL act flags exact=%0b rq_en=%0b silu_en=%0b",
+                     dut.u_descriptor_engine.o_act_silu_exact_en,
+                     dut.u_descriptor_engine.o_act_silu_requant_en,
+                     dut.u_descriptor_engine.o_act_silu_en);
+            errors = errors + 1;
+        end
+        if (dut.u_descriptor_engine.o_act_clip_max !== 8'h3C) begin
+            $display("FAIL act clip=0x%02h", dut.u_descriptor_engine.o_act_clip_max);
+            errors = errors + 1;
+        end
+
         if (errors == 0)
             $display("NPU DESC QUEUE TEST PASS");
         else

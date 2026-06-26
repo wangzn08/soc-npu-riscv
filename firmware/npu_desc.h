@@ -65,6 +65,13 @@ int npu_desc_run_many(const npu_desc_t *list, uint32_t count);
  *   w[2] = LUT DDR base (256 bytes = 16 contiguous 128-bit beats, one INT8
  *          entry per byte; entry index = beat*16 + byte). */
 #define NPU_HW_DESC_OP_LUT_LOAD             0x24u
+/* OP_ACTIVATION_CFG (implemented in descriptor_engine.v): latch per-layer
+ * activation/requant config; persists for the following CONV2D/GEMM ops.
+ *   w[2] = pad_value (input zero-point) [7:0]
+ *   w[3] = silu requant, packed like NPU_SILU_REQUANT_CFG:
+ *          [31:24] zp, [21:16] shift, [15:0] mul
+ *   w[4] = flags: bit0 silu_exact_en, bit1 silu_en, bit2 silu_requant_en
+ *   w[5] = clip_max [7:0] (0 -> default 127, i.e. no ReLU6 clamp) */
 #define NPU_HW_DESC_OP_ACTIVATION_CFG       0x25u
 
 #define NPU_HW_DESC_ERR_NONE                0u

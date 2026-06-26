@@ -89,6 +89,17 @@ module descriptor_engine #(
     ,output reg             o_silu_load_en
     ,output reg [7:0]       o_silu_load_idx
     ,output reg [7:0]       o_silu_load_val
+    // Per-layer activation config (OP_ACTIVATION_CFG): latched, persists for
+    // the following CONV2D/GEMM ops until the next ACTIVATION_CFG. Defaults
+    // (pad 0, no SiLU, clip 127) keep MNIST byte-identical.
+    ,output reg [7:0]       o_act_pad_value
+    ,output reg             o_act_silu_exact_en
+    ,output reg             o_act_silu_en
+    ,output reg             o_act_silu_requant_en
+    ,output reg [15:0]      o_act_silu_requant_mul
+    ,output reg [5:0]       o_act_silu_requant_shift
+    ,output reg [7:0]       o_act_silu_requant_zp
+    ,output reg [7:0]       o_act_clip_max
 );
 
     localparam OP_NOP      = 8'h00;
@@ -101,6 +112,7 @@ module descriptor_engine #(
     localparam OP_GEMM                 = 8'h07;
     localparam OP_STOP_IRQ = 8'h08;
     localparam OP_LUT_LOAD = 8'h24;   // load 256-entry exact-SiLU LUT from DDR
+    localparam OP_ACT_CFG  = 8'h25;   // latch per-layer activation/requant config
     localparam VERSION     = 8'h01;
 
     localparam ERR_NONE          = 8'd0;
@@ -226,6 +238,14 @@ module descriptor_engine #(
         o_silu_load_en = 1'b0;
         o_silu_load_idx = 8'd0;
         o_silu_load_val = 8'd0;
+        o_act_pad_value = 8'd0;
+        o_act_silu_exact_en = 1'b0;
+        o_act_silu_en = 1'b0;
+        o_act_silu_requant_en = 1'b0;
+        o_act_silu_requant_mul = 16'd0;
+        o_act_silu_requant_shift = 6'd0;
+        o_act_silu_requant_zp = 8'd0;
+        o_act_clip_max = 8'd127;
     end
 
     task set_error;
@@ -298,6 +318,14 @@ module descriptor_engine #(
             o_silu_load_en <= 1'b0;
             o_silu_load_idx <= 8'd0;
             o_silu_load_val <= 8'd0;
+            o_act_pad_value <= 8'd0;
+            o_act_silu_exact_en <= 1'b0;
+            o_act_silu_en <= 1'b0;
+            o_act_silu_requant_en <= 1'b0;
+            o_act_silu_requant_mul <= 16'd0;
+            o_act_silu_requant_shift <= 6'd0;
+            o_act_silu_requant_zp <= 8'd0;
+            o_act_clip_max <= 8'd127;
             for (i = 0; i < 16; i = i + 1)
                 desc_w[i] <= 32'd0;
         end else begin
@@ -413,6 +441,19 @@ module descriptor_engine #(
                             lut_sub  <= 4'd0;
                             state    <= S_LUT_AR;
                         end
+                    end else if (desc_op == OP_ACT_CFG) begin
+                        // Latch per-layer activation config; persists for the
+                        // following conv/gemm ops. w[3] mirrors NPU_SILU_REQUANT_CFG.
+                        o_act_pad_value          <= desc_w[2][7:0];
+                        o_act_silu_requant_mul   <= desc_w[3][15:0];
+                        o_act_silu_requant_shift <= desc_w[3][21:16];
+                        o_act_silu_requant_zp    <= desc_w[3][31:24];
+                        o_act_silu_exact_en      <= desc_w[4][0];
+                        o_act_silu_en            <= desc_w[4][1];
+                        o_act_silu_requant_en    <= desc_w[4][2];
+                        o_act_clip_max           <= (desc_w[5][7:0] == 8'd0) ? 8'd127
+                                                                            : desc_w[5][7:0];
+                        state <= S_ADVANCE;
                     end else begin
                         set_error(ERR_BAD_OPCODE);
                     end

@@ -348,6 +348,14 @@ module npu_top #(
     wire                            desc_silu_load_en;
     wire [7:0]                      desc_silu_load_idx;
     wire [7:0]                      desc_silu_load_val;
+    wire [7:0]                      desc_act_pad_value;
+    wire                            desc_act_silu_exact_en;
+    wire                            desc_act_silu_en;
+    wire                            desc_act_silu_requant_en;
+    wire [15:0]                     desc_act_silu_requant_mul;
+    wire [5:0]                      desc_act_silu_requant_shift;
+    wire [7:0]                      desc_act_silu_requant_zp;
+    wire [7:0]                      desc_act_clip_max;
 
     reg [31:0] desc_bias_val [0:63];
     reg [31:0] desc_scale_mul [0:63];
@@ -414,7 +422,7 @@ module npu_top #(
     wire                            run_ic_stream     = desc_busy ? desc_ctrl_flags[23] : cfg_ic_stream;
     wire [7:0]                      run_pad_w         = desc_busy ? desc_pad_w          : cfg_pad_w;
     wire [7:0]                      run_pad_h         = desc_busy ? desc_pad_h          : cfg_pad_h;
-    wire [7:0]                      run_pad_value     = desc_busy ? 8'd0                : cfg_pad_value;
+    wire [7:0]                      run_pad_value     = desc_busy ? desc_act_pad_value  : cfg_pad_value;
     wire [SRAM_ADDR_W-1:0]          run_act_addr      = desc_busy ? desc_act_addr       : cfg_act_addr_ping;
     wire [SRAM_ADDR_W-1:0]          run_wgt_addr      = desc_busy ? desc_wgt_addr       : cfg_wgt_addr_ping;
     wire [SRAM_ADDR_W-1:0]          run_out_addr      = desc_busy ? desc_out_addr       : cfg_out_addr_ping;
@@ -433,6 +441,14 @@ module npu_top #(
     wire                            run_silu_load_en  = desc_busy ? desc_silu_load_en  : cfg_silu_load_en;
     wire [7:0]                      run_silu_load_idx = desc_busy ? desc_silu_load_idx : cfg_silu_load_idx;
     wire [7:0]                      run_silu_load_val = desc_busy ? desc_silu_load_val : cfg_silu_load_val;
+    // Per-layer activation config: descriptor (OP_ACTIVATION_CFG) vs CPU MMIO.
+    wire                            run_silu_exact_en    = desc_busy ? desc_act_silu_exact_en     : cfg_silu_exact_en;
+    wire                            run_silu_en          = desc_busy ? desc_act_silu_en           : cfg_silu_en;
+    wire                            run_silu_requant_en  = desc_busy ? desc_act_silu_requant_en   : cfg_silu_requant_en;
+    wire [15:0]                     run_silu_requant_mul = desc_busy ? desc_act_silu_requant_mul  : cfg_silu_requant_mul;
+    wire [5:0]                      run_silu_requant_shift = desc_busy ? desc_act_silu_requant_shift : cfg_silu_requant_shift;
+    wire [7:0]                      run_silu_requant_zp  = desc_busy ? desc_act_silu_requant_zp   : cfg_silu_requant_zp;
+    wire [7:0]                      run_clip_max         = desc_busy ? desc_act_clip_max          : cfg_clip_max;
 
     // ===================================================================
     // Performance counter event strobes (fed to param_regfile @0x3A4+).
@@ -708,7 +724,15 @@ module npu_top #(
         .i_npu_done         (npu_done_irq),
         .o_silu_load_en     (desc_silu_load_en),
         .o_silu_load_idx    (desc_silu_load_idx),
-        .o_silu_load_val    (desc_silu_load_val)
+        .o_silu_load_val    (desc_silu_load_val),
+        .o_act_pad_value         (desc_act_pad_value),
+        .o_act_silu_exact_en     (desc_act_silu_exact_en),
+        .o_act_silu_en           (desc_act_silu_en),
+        .o_act_silu_requant_en   (desc_act_silu_requant_en),
+        .o_act_silu_requant_mul  (desc_act_silu_requant_mul),
+        .o_act_silu_requant_shift(desc_act_silu_requant_shift),
+        .o_act_silu_requant_zp   (desc_act_silu_requant_zp),
+        .o_act_clip_max          (desc_act_clip_max)
     );
 
     // ===================================================================
@@ -1298,17 +1322,17 @@ module npu_top #(
         .i_pool_en     (run_pool_en),
         .i_pool_avg    (run_pool_avg),
         .i_relu_en     (run_relu_en),
-        .i_silu_en     (cfg_silu_en),
-        .i_silu_requant_en(cfg_silu_requant_en),
-        .i_silu_requant_mul(cfg_silu_requant_mul),
-        .i_silu_requant_shift(cfg_silu_requant_shift),
-        .i_silu_requant_zp(cfg_silu_requant_zp),
-        .i_clip_max    (cfg_clip_max),
+        .i_silu_en     (run_silu_en),
+        .i_silu_requant_en(run_silu_requant_en),
+        .i_silu_requant_mul(run_silu_requant_mul),
+        .i_silu_requant_shift(run_silu_requant_shift),
+        .i_silu_requant_zp(run_silu_requant_zp),
+        .i_clip_max    (run_clip_max),
         .i_sigmoid_en  (cfg_sigmoid_en),
         .i_sigm_load_en(cfg_sigm_load_en),
         .i_sigm_load_idx(cfg_sigm_load_idx),
         .i_sigm_load_val(cfg_sigm_load_val),
-        .i_silu_exact_en(cfg_silu_exact_en),
+        .i_silu_exact_en(run_silu_exact_en),
         .i_silu_load_en(run_silu_load_en),
         .i_silu_load_idx(run_silu_load_idx),
         .i_silu_load_val(run_silu_load_val),
