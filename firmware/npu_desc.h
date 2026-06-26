@@ -60,6 +60,10 @@ int npu_desc_run_many(const npu_desc_t *list, uint32_t count);
 #define NPU_HW_DESC_OP_MAXPOOL5X5           0x21u
 #define NPU_HW_DESC_OP_ELTWISE_ADD          0x22u
 #define NPU_HW_DESC_OP_DFL                  0x23u
+/* OP_LUT_LOAD (implemented in descriptor_engine.v): stream a 256-entry exact-
+ * SiLU LUT into the NPU before the YOLO convs that index it.
+ *   w[2] = LUT DDR base (256 bytes = 16 contiguous 128-bit beats, one INT8
+ *          entry per byte; entry index = beat*16 + byte). */
 #define NPU_HW_DESC_OP_LUT_LOAD             0x24u
 #define NPU_HW_DESC_OP_ACTIVATION_CFG       0x25u
 

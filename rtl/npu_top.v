@@ -345,6 +345,9 @@ module npu_top #(
     wire [SRAM_ADDR_W-1:0]          desc_act_addr;
     wire [SRAM_ADDR_W-1:0]          desc_wgt_addr;
     wire [SRAM_ADDR_W-1:0]          desc_out_addr;
+    wire                            desc_silu_load_en;
+    wire [7:0]                      desc_silu_load_idx;
+    wire [7:0]                      desc_silu_load_val;
 
     reg [31:0] desc_bias_val [0:63];
     reg [31:0] desc_scale_mul [0:63];
@@ -425,6 +428,11 @@ module npu_top #(
     wire [7:0]                      run_sy            = desc_busy ? desc_stride_sy      : cfg_sy;
     wire [2:0]                      run_oc_tiles_total = (run_dim_out_c + 16'd15) >> 4;
     wire [4:0]                      run_ic_groups      = (run_dim_in_c + 16'd15) >> 4;
+    // Exact-SiLU LUT load source: descriptor engine (OP_LUT_LOAD) while it owns
+    // the NPU, else the CPU NPU_SILU_LOAD MMIO path.
+    wire                            run_silu_load_en  = desc_busy ? desc_silu_load_en  : cfg_silu_load_en;
+    wire [7:0]                      run_silu_load_idx = desc_busy ? desc_silu_load_idx : cfg_silu_load_idx;
+    wire [7:0]                      run_silu_load_val = desc_busy ? desc_silu_load_val : cfg_silu_load_val;
 
     // ===================================================================
     // Performance counter event strobes (fed to param_regfile @0x3A4+).
@@ -697,7 +705,10 @@ module npu_top #(
         .o_act_addr         (desc_act_addr),
         .o_wgt_addr         (desc_wgt_addr),
         .o_out_addr         (desc_out_addr),
-        .i_npu_done         (npu_done_irq)
+        .i_npu_done         (npu_done_irq),
+        .o_silu_load_en     (desc_silu_load_en),
+        .o_silu_load_idx    (desc_silu_load_idx),
+        .o_silu_load_val    (desc_silu_load_val)
     );
 
     // ===================================================================
@@ -1298,9 +1309,9 @@ module npu_top #(
         .i_sigm_load_idx(cfg_sigm_load_idx),
         .i_sigm_load_val(cfg_sigm_load_val),
         .i_silu_exact_en(cfg_silu_exact_en),
-        .i_silu_load_en(cfg_silu_load_en),
-        .i_silu_load_idx(cfg_silu_load_idx),
-        .i_silu_load_val(cfg_silu_load_val),
+        .i_silu_load_en(run_silu_load_en),
+        .i_silu_load_idx(run_silu_load_idx),
+        .i_silu_load_val(run_silu_load_val),
         .i_in_drain    (fsm_in_drain),
         .i_in_post     (fsm_in_post),
         .i_row_par_en  (run_row_par_en),

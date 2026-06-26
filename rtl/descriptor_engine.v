@@ -83,6 +83,12 @@ module descriptor_engine #(
     ,output reg [SRAM_ADDR_W-1:0] o_wgt_addr
     ,output reg [SRAM_ADDR_W-1:0] o_out_addr
     ,input  wire            i_npu_done
+    // Exact-SiLU LUT streaming load (OP_LUT_LOAD): one (idx,val) per cycle,
+    // mirrors the CPU NPU_SILU_LOAD MMIO write so YOLO convs can carry their
+    // own per-layer LUT inside the descriptor program.
+    ,output reg             o_silu_load_en
+    ,output reg [7:0]       o_silu_load_idx
+    ,output reg [7:0]       o_silu_load_val
 );
 
     localparam OP_NOP      = 8'h00;
@@ -94,6 +100,7 @@ module descriptor_engine #(
     localparam OP_CONV2D               = 8'h06;
     localparam OP_GEMM                 = 8'h07;
     localparam OP_STOP_IRQ = 8'h08;
+    localparam OP_LUT_LOAD = 8'h24;   // load 256-entry exact-SiLU LUT from DDR
     localparam VERSION     = 8'h01;
 
     localparam ERR_NONE          = 8'd0;
@@ -104,6 +111,7 @@ module descriptor_engine #(
     localparam ERR_BUSY_AT_START = 8'd7;
     localparam ERR_AXI_DESC_READ = 8'd8;
     localparam ERR_AXI_QPARAM_READ = 8'd9;
+    localparam ERR_AXI_LUT_READ  = 8'd11;
 
     localparam S_IDLE     = 4'd0;
     localparam S_FETCH_AR = 4'd1;
@@ -118,6 +126,9 @@ module descriptor_engine #(
     localparam S_ERROR    = 4'd10;
     localparam S_ABORT    = 4'd11;
     localparam S_NPU_START = 4'd12;
+    localparam S_LUT_AR   = 4'd13;
+    localparam S_LUT_R    = 4'd14;
+    localparam S_LUT_WR   = 4'd15;
 
     localparam WAIT_NONE   = 3'd0;
     localparam WAIT_DMA_RD = 3'd1;
@@ -138,12 +149,17 @@ module descriptor_engine #(
                             // this guard is harmless for WAIT_NPU.
     reg       qparam_loaded;
     reg [5:0] qparam_idx;
+    reg [4:0] lut_beat;        // 0..15: which 16-byte beat of the 256-entry LUT
+    reg [3:0] lut_sub;         // 0..15: byte within the current beat
+    reg [127:0] lut_buf;       // latched LUT beat being streamed into the NPU
     integer i;
 
     wire [7:0] desc_op      = desc_w[0][7:0];
     wire [7:0] desc_version = desc_w[0][15:8];
     wire [31:0] desc_addr   = i_desc_base_lo + {14'd0, o_pc, 6'b0};
     wire [6:0] qparam_count = desc_w[12][6:0];
+    // LUT lives at desc_w[2], 16 contiguous 128-bit beats (256 bytes).
+    wire [31:0] lut_addr    = desc_w[2] + {23'd0, lut_beat, 4'b0};
     wire        qparam_needed = (desc_w[11] != 32'd0) && (qparam_count != 7'd0);
     wire [31:0] qparam_addr = desc_w[11] + {22'd0, qparam_idx, 4'b0};
 
@@ -204,6 +220,12 @@ module descriptor_engine #(
         o_out_addr = {SRAM_ADDR_W{1'b0}};
         qparam_loaded = 1'b0;
         qparam_idx = 6'd0;
+        lut_beat = 5'd0;
+        lut_sub = 4'd0;
+        lut_buf = 128'd0;
+        o_silu_load_en = 1'b0;
+        o_silu_load_idx = 8'd0;
+        o_silu_load_val = 8'd0;
     end
 
     task set_error;
@@ -270,6 +292,12 @@ module descriptor_engine #(
             o_out_addr <= {SRAM_ADDR_W{1'b0}};
             qparam_loaded <= 1'b0;
             qparam_idx <= 6'd0;
+            lut_beat <= 5'd0;
+            lut_sub <= 4'd0;
+            lut_buf <= 128'd0;
+            o_silu_load_en <= 1'b0;
+            o_silu_load_idx <= 8'd0;
+            o_silu_load_val <= 8'd0;
             for (i = 0; i < 16; i = i + 1)
                 desc_w[i] <= 32'd0;
         end else begin
@@ -278,6 +306,7 @@ module descriptor_engine #(
             o_copy_trig <= 1'b0;
             o_expand_trig <= 1'b0;
             o_qparam_we <= 1'b0;
+            o_silu_load_en <= 1'b0;
             o_npu_start <= 1'b0;
 
             if (i_desc_clear_done) begin
@@ -376,6 +405,14 @@ module descriptor_engine #(
                             set_error(ERR_BAD_SHAPE);
                         else
                             state <= S_START_OP;
+                    end else if (desc_op == OP_LUT_LOAD) begin
+                        if (desc_w[2] == 32'd0) begin
+                            set_error(ERR_BAD_SHAPE);
+                        end else begin
+                            lut_beat <= 5'd0;
+                            lut_sub  <= 4'd0;
+                            state    <= S_LUT_AR;
+                        end
                     end else begin
                         set_error(ERR_BAD_OPCODE);
                     end
@@ -502,6 +539,49 @@ module descriptor_engine #(
                                 state <= S_QPARAM_AR;
                             end
                         end
+                    end
+                end
+
+                // ---- OP_LUT_LOAD: stream a 256-entry exact-SiLU LUT from DDR ----
+                // 16 single-beat reads (16 bytes each); each beat is then pushed
+                // into the NPU one entry/cycle via the silu_load handshake.
+                S_LUT_AR: begin
+                    m_axi_arvalid <= 1'b1;
+                    m_axi_araddr <= lut_addr[ADDR_W-1:0];
+                    m_axi_arlen <= 8'd0;
+                    if (m_axi_arvalid && m_axi_arready) begin
+                        m_axi_arvalid <= 1'b0;
+                        m_axi_rready <= 1'b1;
+                        state <= S_LUT_R;
+                    end
+                end
+
+                S_LUT_R: begin
+                    if (m_axi_rvalid && m_axi_rready) begin
+                        m_axi_rready <= 1'b0;
+                        if (m_axi_rresp != 2'b00) begin
+                            set_error(ERR_AXI_LUT_READ);
+                        end else begin
+                            lut_buf <= m_axi_rdata;
+                            lut_sub <= 4'd0;
+                            state   <= S_LUT_WR;
+                        end
+                    end
+                end
+
+                S_LUT_WR: begin
+                    o_silu_load_en  <= 1'b1;
+                    o_silu_load_idx <= {lut_beat[3:0], lut_sub};
+                    o_silu_load_val <= lut_buf[lut_sub*8 +: 8];
+                    if (lut_sub == 4'd15) begin
+                        if (lut_beat == 5'd15) begin
+                            state <= S_ADVANCE;
+                        end else begin
+                            lut_beat <= lut_beat + 5'd1;
+                            state    <= S_LUT_AR;
+                        end
+                    end else begin
+                        lut_sub <= lut_sub + 4'd1;
                     end
                 end
 

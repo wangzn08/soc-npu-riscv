@@ -63,8 +63,9 @@ module tb_npu_desc_queue;
     integer errors = 0;
     integer wait_i;
     integer ic, oc;
+    integer kk, bw, bj;
     reg [31:0] rd_data;
-    reg [127:0] actw, wgtw, outw;
+    reg [127:0] actw, wgtw, outw, lutw;
     reg [7:0] got, exp;
 
     always @(posedge clk or negedge rst_n) begin
@@ -288,6 +289,55 @@ module tb_npu_desc_queue;
             exp = 8;
             if (got !== exp) begin
                 $display("FAIL PONG GEMM desc out[%0d]=%0d exp=%0d", oc, got, exp);
+                errors = errors + 1;
+            end
+        end
+
+        // ---- Test 4: OP_LUT_LOAD streams a 256-entry exact-SiLU LUT ----
+        reg_write(12'h40C, 32'hC); // clear_done + irq_en
+        repeat (5) @(posedge clk);
+
+        // LUT data at DDR word 0..15: byte j of beat b carries entry 16*b+j.
+        for (bw = 0; bw < 16; bw = bw + 1) begin
+            lutw = 128'd0;
+            for (bj = 0; bj < 16; bj = bj + 1)
+                lutw[bj*8 +: 8] = (bw * 16 + bj) & 8'hFF;
+            ddr[bw] = lutw;
+        end
+        // Descriptor program at base 0x4000_0100 (words 16..23): LUT_LOAD, STOP.
+        ddr[16] = {32'h0, 32'h4000_0000, 32'h0, 32'h0000_0124}; // OP_LUT_LOAD, lut@0x40000000
+        ddr[17] = 128'h0;
+        ddr[18] = 128'h0;
+        ddr[19] = 128'h0;
+        ddr[20] = {32'h0, 32'h0, 32'h0, 32'h0000_0108}; // STOP_IRQ
+        ddr[21] = 128'h0;
+        ddr[22] = 128'h0;
+        ddr[23] = 128'h0;
+
+        reg_write(12'h400, 32'h4000_0100);
+        reg_write(12'h404, 32'h0);
+        reg_write(12'h408, 32'd2);
+        reg_write(12'h40C, 32'h5); // start + irq_en
+
+        wait_i = 0;
+        while (!irq_done && wait_i < 5000) begin
+            @(posedge clk);
+            wait_i = wait_i + 1;
+        end
+        if (!irq_done) begin
+            $display("FAIL timeout waiting LUT_LOAD descriptor irq");
+            errors = errors + 1;
+        end
+        reg_read(12'h410, rd_data);
+        if ((rd_data & 32'h2) == 0 || (rd_data & 32'h4) != 0) begin
+            $display("FAIL LUT_LOAD desc status=0x%08h", rd_data);
+            errors = errors + 1;
+        end
+        for (kk = 0; kk < 256; kk = kk + 1) begin
+            got = dut.u_post_process.silu_exact_lut[kk];
+            exp = kk & 8'hFF;
+            if (got !== exp) begin
+                $display("FAIL LUT[%0d]=%0d exp=%0d", kk, got, exp);
                 errors = errors + 1;
             end
         end
