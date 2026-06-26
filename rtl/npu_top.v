@@ -323,6 +323,23 @@ module npu_top #(
     wire                            desc_dma_out_ping_sel;
     wire                            desc_copy_trig;
     wire                            desc_expand_trig;
+    wire                            desc_qparam_we;
+    wire [5:0]                      desc_qparam_idx;
+    wire [31:0]                     desc_qparam_bias;
+    wire [31:0]                     desc_qparam_scale;
+    wire [5:0]                      desc_qparam_shift;
+
+    reg [31:0] desc_bias_val [0:63];
+    reg [31:0] desc_scale_mul [0:63];
+    reg [5:0]  desc_scale_shift [0:63];
+
+    always @(posedge clk) begin
+        if (desc_qparam_we) begin
+            desc_bias_val[desc_qparam_idx] <= desc_qparam_bias;
+            desc_scale_mul[desc_qparam_idx] <= desc_qparam_scale;
+            desc_scale_shift[desc_qparam_idx] <= desc_qparam_shift;
+        end
+    end
 
     wire                            run_dma_rd_req       = desc_busy ? desc_dma_rd_req       : cfg_dma_rd_req;
     wire [31:0]                     run_dma_rd_ddr_addr  = desc_busy ? desc_dma_rd_ddr_addr  : cfg_dma_rd_ddr_addr;
@@ -589,7 +606,12 @@ module npu_top #(
         .i_dma_rd_done      (dma_rd_done),
         .i_dma_wr_done      (dma_wr_done),
         .i_copy_done        (copy_done),
-        .i_expand_done      (expand_done)
+        .i_expand_done      (expand_done),
+        .o_qparam_we        (desc_qparam_we),
+        .o_qparam_idx       (desc_qparam_idx),
+        .o_qparam_bias      (desc_qparam_bias),
+        .o_qparam_scale     (desc_qparam_scale),
+        .o_qparam_shift     (desc_qparam_shift)
     );
 
     // ===================================================================

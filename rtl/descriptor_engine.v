@@ -62,6 +62,11 @@ module descriptor_engine #(
     ,input  wire            i_dma_wr_done
     ,input  wire            i_copy_done
     ,input  wire            i_expand_done
+    ,output reg             o_qparam_we
+    ,output reg [5:0]       o_qparam_idx
+    ,output reg [31:0]      o_qparam_bias
+    ,output reg [31:0]      o_qparam_scale
+    ,output reg [5:0]       o_qparam_shift
 );
 
     localparam OP_NOP      = 8'h00;
@@ -80,6 +85,7 @@ module descriptor_engine #(
     localparam ERR_BAD_SHAPE     = 8'd6;
     localparam ERR_BUSY_AT_START = 8'd7;
     localparam ERR_AXI_DESC_READ = 8'd8;
+    localparam ERR_AXI_QPARAM_READ = 8'd9;
 
     localparam S_IDLE     = 4'd0;
     localparam S_FETCH_AR = 4'd1;
@@ -88,9 +94,11 @@ module descriptor_engine #(
     localparam S_ADVANCE  = 4'd4;
     localparam S_START_OP = 4'd5;
     localparam S_WAIT_OP  = 4'd6;
-    localparam S_DONE     = 4'd7;
-    localparam S_ERROR    = 4'd8;
-    localparam S_ABORT    = 4'd9;
+    localparam S_QPARAM_AR = 4'd7;
+    localparam S_QPARAM_R  = 4'd8;
+    localparam S_DONE     = 4'd9;
+    localparam S_ERROR    = 4'd10;
+    localparam S_ABORT    = 4'd11;
 
     localparam WAIT_NONE   = 3'd0;
     localparam WAIT_DMA_RD = 3'd1;
@@ -102,11 +110,15 @@ module descriptor_engine #(
     reg [1:0] beat_idx;
     reg [31:0] desc_w [0:15];
     reg [2:0] wait_kind;
+    reg       qparam_loaded;
+    reg [5:0] qparam_idx;
     integer i;
 
     wire [7:0] desc_op      = desc_w[0][7:0];
     wire [7:0] desc_version = desc_w[0][15:8];
     wire [31:0] desc_addr   = i_desc_base_lo + {14'd0, o_pc, 6'b0};
+    wire        qparam_needed = (desc_w[11] != 32'd0) && (desc_w[12][5:0] != 6'd0);
+    wire [31:0] qparam_addr = desc_w[11] + {22'd0, qparam_idx, 4'b0};
 
     assign m_axi_arsize  = 3'd4; // 16 bytes per beat
     assign m_axi_arburst = 2'b01; // INCR
@@ -153,6 +165,13 @@ module descriptor_engine #(
             o_dma_out_ping_sel <= 1'b0;
             o_copy_trig <= 1'b0;
             o_expand_trig <= 1'b0;
+            o_qparam_we <= 1'b0;
+            o_qparam_idx <= 6'd0;
+            o_qparam_bias <= 32'd0;
+            o_qparam_scale <= 32'd0;
+            o_qparam_shift <= 6'd0;
+            qparam_loaded <= 1'b0;
+            qparam_idx <= 6'd0;
             for (i = 0; i < 16; i = i + 1)
                 desc_w[i] <= 32'd0;
         end else begin
@@ -160,6 +179,7 @@ module descriptor_engine #(
             o_dma_wr_req <= 1'b0;
             o_copy_trig <= 1'b0;
             o_expand_trig <= 1'b0;
+            o_qparam_we <= 1'b0;
 
             if (i_desc_clear_done) begin
                 o_done <= 1'b0;
@@ -222,6 +242,7 @@ module descriptor_engine #(
                             desc_w[{beat_idx, 2'b00} + 3] <= m_axi_rdata[127:96];
                             if (m_axi_rlast) begin
                                 m_axi_rready <= 1'b0;
+                                qparam_loaded <= 1'b0;
                                 state <= S_DECODE;
                             end else begin
                                 beat_idx <= beat_idx + 2'd1;
@@ -233,6 +254,9 @@ module descriptor_engine #(
                 S_DECODE: begin
                     if (desc_version != VERSION) begin
                         set_error(ERR_BAD_VERSION);
+                    end else if (qparam_needed && !qparam_loaded) begin
+                        qparam_idx <= 6'd0;
+                        state <= S_QPARAM_AR;
                     end else if (desc_op == OP_NOP) begin
                         state <= S_ADVANCE;
                     end else if (desc_op == OP_STOP_IRQ) begin
@@ -311,6 +335,40 @@ module descriptor_engine #(
                     end
                     default: set_error(ERR_BAD_OPCODE);
                     endcase
+                end
+
+                S_QPARAM_AR: begin
+                    m_axi_arvalid <= 1'b1;
+                    m_axi_araddr <= qparam_addr[ADDR_W-1:0];
+                    m_axi_arlen <= 8'd0;
+                    if (m_axi_arvalid && m_axi_arready) begin
+                        m_axi_arvalid <= 1'b0;
+                        m_axi_rready <= 1'b1;
+                        state <= S_QPARAM_R;
+                    end
+                end
+
+                S_QPARAM_R: begin
+                    if (m_axi_rvalid && m_axi_rready) begin
+                        if (m_axi_rresp != 2'b00) begin
+                            m_axi_rready <= 1'b0;
+                            set_error(ERR_AXI_QPARAM_READ);
+                        end else begin
+                            o_qparam_we <= 1'b1;
+                            o_qparam_idx <= qparam_idx;
+                            o_qparam_bias <= m_axi_rdata[31:0];
+                            o_qparam_scale <= m_axi_rdata[63:32];
+                            o_qparam_shift <= m_axi_rdata[101:96];
+                            m_axi_rready <= 1'b0;
+                            if (qparam_idx + 6'd1 >= desc_w[12][5:0]) begin
+                                qparam_loaded <= 1'b1;
+                                state <= S_DECODE;
+                            end else begin
+                                qparam_idx <= qparam_idx + 6'd1;
+                                state <= S_QPARAM_AR;
+                            end
+                        end
+                    end
                 end
 
                 S_WAIT_OP: begin

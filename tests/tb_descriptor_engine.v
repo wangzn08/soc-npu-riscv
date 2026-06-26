@@ -23,6 +23,11 @@ module tb_descriptor_engine;
     wire dma_sram_sel, dma_out_rd_sel;
     wire [1:0] dma_rd_sram_sel;
     wire dma_act_ping_sel, dma_wgt_ping_sel, dma_out_ping_sel;
+    wire qparam_we;
+    wire [5:0] qparam_idx;
+    wire [31:0] qparam_bias;
+    wire [31:0] qparam_scale;
+    wire [5:0] qparam_shift;
 
     wire arvalid;
     reg arready = 1'b1;
@@ -84,36 +89,49 @@ module tb_descriptor_engine;
         .i_dma_rd_done(1'b0),
         .i_dma_wr_done(1'b0),
         .i_copy_done(1'b0),
-        .i_expand_done(1'b0)
+        .i_expand_done(1'b0),
+        .o_qparam_we(qparam_we),
+        .o_qparam_idx(qparam_idx),
+        .o_qparam_bias(qparam_bias),
+        .o_qparam_scale(qparam_scale),
+        .o_qparam_shift(qparam_shift)
     );
 
     always #5 clk = ~clk;
 
-    reg [127:0] mem [0:15];
+    reg [127:0] mem [0:63];
     reg [7:0] rd_base;
-    reg [1:0] rd_cnt;
+    reg [7:0] rd_cnt;
+    reg [7:0] rd_last_cnt;
     integer errors = 0;
     integer wait_i;
+    integer qparam_seen = 0;
+    integer init_i;
+    reg [31:0] seen_bias [0:2];
+    reg [31:0] seen_scale [0:2];
+    reg [5:0] seen_shift [0:2];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rvalid <= 1'b0;
             rlast <= 1'b0;
             rd_base <= 8'd0;
-            rd_cnt <= 2'd0;
+            rd_cnt <= 8'd0;
+            rd_last_cnt <= 8'd0;
         end else begin
             if (arvalid && arready) begin
                 rd_base <= araddr[9:4];
-                rd_cnt <= 2'd0;
+                rd_cnt <= 8'd0;
+                rd_last_cnt <= arlen;
                 rvalid <= 1'b1;
-                rlast <= 1'b0;
+                rlast <= (arlen == 8'd0);
             end else if (rvalid && rready) begin
-                if (rd_cnt == 2'd3) begin
+                if (rd_cnt == rd_last_cnt) begin
                     rvalid <= 1'b0;
                     rlast <= 1'b0;
                 end else begin
-                    rd_cnt <= rd_cnt + 2'd1;
-                    rlast <= (rd_cnt == 2'd2);
+                    rd_cnt <= rd_cnt + 8'd1;
+                    rlast <= (rd_cnt + 8'd1 == rd_last_cnt);
                 end
             end
         end
@@ -132,15 +150,30 @@ module tb_descriptor_engine;
         end
     endtask
 
+    always @(posedge clk) begin
+        if (qparam_we) begin
+            if (qparam_seen < 3) begin
+                seen_bias[qparam_seen] <= qparam_bias;
+                seen_scale[qparam_seen] <= qparam_scale;
+                seen_shift[qparam_seen] <= qparam_shift;
+            end
+            qparam_seen <= qparam_seen + 1;
+        end
+    end
+
     initial begin
+        for (init_i = 0; init_i < 64; init_i = init_i + 1)
+            mem[init_i] = 128'h0;
+
         mem[0] = {32'h0, 32'h0, 32'h0, 32'h0000_0100}; // NOP
         mem[1] = 128'h0;
-        mem[2] = 128'h0;
-        mem[3] = 128'h0;
+        mem[2] = {32'h4000_0200, 32'h0, 32'h0, 32'h0}; // qparam base in word11
+        mem[3] = {32'h0, 32'h0, 32'h0, 32'd3};         // qparam count in word12
         mem[4] = {32'h0, 32'h0, 32'h0, 32'h0000_0108}; // STOP_IRQ
-        mem[5] = 128'h0;
-        mem[6] = 128'h0;
-        mem[7] = 128'h0;
+
+        mem[32] = {26'd0, 6'd2, 32'd0, 32'd11, 32'd1};
+        mem[33] = {26'd0, 6'd3, 32'd0, 32'd12, 32'd2};
+        mem[34] = {26'd0, 6'd4, 32'd0, 32'd13, 32'd3};
 
         repeat (5) @(posedge clk);
         rst_n = 1'b1;
@@ -157,6 +190,18 @@ module tb_descriptor_engine;
         if (!done || err || pc != 16'd1 || !irq) begin
             $display("FAIL nop_stop done=%0b err=%0b pc=%0d irq=%0b err_code=%0d",
                      done, err, pc, irq, err_code);
+            errors = errors + 1;
+        end
+
+        if (qparam_seen != 3 ||
+            seen_bias[0] != 32'd1 || seen_scale[0] != 32'd11 || seen_shift[0] != 6'd2 ||
+            seen_bias[1] != 32'd2 || seen_scale[1] != 32'd12 || seen_shift[1] != 6'd3 ||
+            seen_bias[2] != 32'd3 || seen_scale[2] != 32'd13 || seen_shift[2] != 6'd4) begin
+            $display("FAIL qparam seen=%0d b=%0d/%0d/%0d s=%0d/%0d/%0d sh=%0d/%0d/%0d",
+                     qparam_seen,
+                     seen_bias[0], seen_bias[1], seen_bias[2],
+                     seen_scale[0], seen_scale[1], seen_scale[2],
+                     seen_shift[0], seen_shift[1], seen_shift[2]);
             errors = errors + 1;
         end
 
