@@ -1,5 +1,22 @@
 #include "npu_desc.h"
 
+extern int yolo_dma_ddr_to_act(uint32_t ddr_addr,
+                               uint32_t act_base,
+                               uint32_t words) __attribute__((weak));
+extern int yolo_dma_act_to_ddr(uint32_t ddr_addr,
+                               uint32_t act_base,
+                               uint32_t words) __attribute__((weak));
+extern int yolo_run_upsample2x_ddr(uint32_t src_ddr,
+                                   uint32_t dst_ddr,
+                                   uint32_t scratch_act_base,
+                                   uint32_t in_w,
+                                   uint32_t in_h,
+                                   uint32_t ic_groups) __attribute__((weak));
+extern int yolo_copy_ddr_to_ddr_via_act(uint32_t src_ddr,
+                                        uint32_t dst_ddr,
+                                        uint32_t scratch_act_base,
+                                        uint32_t words) __attribute__((weak));
+
 int npu_desc_validate(const npu_desc_t *d)
 {
     if (d == (const npu_desc_t *)0)
@@ -9,10 +26,17 @@ int npu_desc_validate(const npu_desc_t *d)
         return 1;
     case NPU_DESC_OP_DMA_DDR_TO_ACT:
     case NPU_DESC_OP_DMA_ACT_TO_DDR:
-    case NPU_DESC_OP_UPSAMPLE2X_DDR:
     case NPU_DESC_OP_COPY_DDR_TO_DDR:
+        return d->words != 0u;
+    case NPU_DESC_OP_UPSAMPLE2X_DDR:
+        return d->in_w != 0u && d->in_h != 0u && d->in_c != 0u &&
+               (d->in_c & 15u) == 0u;
     case NPU_DESC_OP_CONV2D_TILED:
-        return 1;
+        return d->in_w != 0u && d->in_h != 0u && d->in_c != 0u &&
+               d->out_c != 0u && d->kh != 0u && d->kw != 0u &&
+               d->stride != 0u && d->bias != (const int32_t *)0 &&
+               d->scale_mul != (const uint32_t *)0 &&
+               d->scale_shift != (const uint32_t *)0;
     default:
         return 0;
     }
@@ -22,9 +46,32 @@ int npu_desc_run(const npu_desc_t *d)
 {
     if (!npu_desc_validate(d))
         return 0;
-    if (d->op == NPU_DESC_OP_NOP)
+
+    switch ((npu_desc_op_t)d->op) {
+    case NPU_DESC_OP_NOP:
         return 1;
-    return 0;
+    case NPU_DESC_OP_DMA_DDR_TO_ACT:
+        if (yolo_dma_ddr_to_act == (void *)0)
+            return 0;
+        return yolo_dma_ddr_to_act(d->src0, d->dst, d->words);
+    case NPU_DESC_OP_DMA_ACT_TO_DDR:
+        if (yolo_dma_act_to_ddr == (void *)0)
+            return 0;
+        return yolo_dma_act_to_ddr(d->dst, d->src0, d->words);
+    case NPU_DESC_OP_UPSAMPLE2X_DDR:
+        if (yolo_run_upsample2x_ddr == (void *)0)
+            return 0;
+        return yolo_run_upsample2x_ddr(d->src0, d->dst, d->scratch0,
+                                       d->in_w, d->in_h, d->in_c / 16u);
+    case NPU_DESC_OP_COPY_DDR_TO_DDR:
+        if (yolo_copy_ddr_to_ddr_via_act == (void *)0)
+            return 0;
+        return yolo_copy_ddr_to_ddr_via_act(d->src0, d->dst, d->scratch0, d->words);
+    case NPU_DESC_OP_CONV2D_TILED:
+        return 0;
+    default:
+        return 0;
+    }
 }
 
 int npu_desc_run_many(const npu_desc_t *list, uint32_t count)
