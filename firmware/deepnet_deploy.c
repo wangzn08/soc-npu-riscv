@@ -5,6 +5,7 @@
 #include "deepnet.h"
 #include "deepnet_weights.h"
 #include "mnist_test_images.h"
+#include "npu_desc.h"
 #include <stdint.h>
 
 // ---- OC-pass overlap switch (measurement) ----
@@ -813,6 +814,17 @@ static void print_perf(void)
 void usercode7(void)
 {
     print_str("=== MNIST DeepConvNet Deploy ===\n");
+
+    {
+        const npu_desc_t smoke[] = {
+            { .op = NPU_DESC_OP_NOP },
+            { .op = NPU_DESC_OP_NOP }
+        };
+        if (!npu_desc_run_many(smoke, 2u)) {
+            print_str("DESC SMOKE FAIL\n");
+            return;
+        }
+    }
 
     // Preload all conv weights into Wgt SRAM once; they stay resident for
     // every image instead of being re-packed and re-DMA'd on every pass.
