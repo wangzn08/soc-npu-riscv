@@ -126,6 +126,7 @@ module descriptor_engine #(
     localparam OP_CONV2D               = 8'h06;
     localparam OP_GEMM                 = 8'h07;
     localparam OP_STOP_IRQ = 8'h08;
+    localparam OP_DMA_DDR_TO_WGT       = 8'h09; // load conv weights DDR -> Wgt SRAM
     localparam OP_UPSAMPLE2X = 8'h20; // 2x nearest-neighbour upsample (Act SRAM)
     localparam OP_MAXPOOL5X5 = 8'h21; // 5x5 stride-1 signed maxpool (Act SRAM)
     localparam OP_ELTWISE_ADD = 8'h22; // signed eltwise add (C2f residual)
@@ -460,6 +461,7 @@ module descriptor_engine #(
                         o_done <= 1'b1;
                         state <= S_DONE;
                     end else if (desc_op == OP_DMA_DDR_TO_ACT ||
+                                 desc_op == OP_DMA_DDR_TO_WGT ||
                                  desc_op == OP_DMA_ACT_TO_DDR ||
                                  desc_op == OP_DMA_OUT_TO_DDR ||
                                  desc_op == OP_IMG_EXPAND ||
@@ -521,6 +523,19 @@ module descriptor_engine #(
                         o_dma_out_rd_sel <= 1'b0;
                         o_dma_rd_sram_sel <= 2'd1;
                         o_dma_act_ping_sel <= desc_w[1][0];
+                        o_dma_rd_ddr_addr <= desc_w[2];
+                        o_dma_rd_len <= desc_w[7][15:0] - 16'd1;
+                        o_dma_rd_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];
+                        o_dma_rd_req <= 1'b1;
+                        wait_kind <= WAIT_DMA_RD;
+                        state <= S_WAIT_OP;
+                    end
+                    OP_DMA_DDR_TO_WGT: begin
+                        // Same as DDR->Act but the write target is Wgt SRAM.
+                        o_dma_sram_sel <= 1'b1;
+                        o_dma_out_rd_sel <= 1'b0;
+                        o_dma_rd_sram_sel <= 2'd2;
+                        o_dma_wgt_ping_sel <= desc_w[1][1];
                         o_dma_rd_ddr_addr <= desc_w[2];
                         o_dma_rd_len <= desc_w[7][15:0] - 16'd1;
                         o_dma_rd_sram_base <= desc_w[4][SRAM_ADDR_W-1:0];

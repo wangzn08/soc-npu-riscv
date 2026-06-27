@@ -46,6 +46,22 @@ static void d_dma_in(uint32_t *idx, uint32_t src_ddr, uint32_t act_base, uint32_
     }
 }
 
+static void d_dma_wgt(uint32_t *idx, uint32_t src_ddr, uint32_t wgt_base, uint32_t words)
+{
+    uint32_t off = 0u;
+    while (off < words) {
+        uint32_t ch = words - off;
+        volatile uint32_t *d;
+        if (ch > DMA_RD_MAX) ch = DMA_RD_MAX;
+        d = dword((*idx)++); dclr(d);
+        dop(d, NPU_HW_DESC_OP_DMA_DDR_TO_WGT, 0u);
+        d[2] = src_ddr + off * 16u;
+        d[4] = wgt_base + off;
+        d[7] = ch;
+        off += ch;
+    }
+}
+
 static void d_drain(uint32_t *idx, uint32_t out_base, uint32_t dst_ddr, uint32_t words)
 {
     uint32_t off = 0u;
@@ -123,13 +139,13 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
     // stride-1). silu_exact/pad live in ACTIVATION_CFG, not the conv flags.
     uint32_t conv_flags = NPU_CTRL_OC_SINGLE | NPU_CTRL_HW_PAD;
 
+    // Weights fit Wgt SRAM (16384 words)? If so preload all OCs once (resident,
+    // conv reads chunk c at base done*wgt_words_per_oc). Otherwise reload each
+    // <=64-OC chunk into Wgt SRAM via descriptor right before its conv.
+    uint32_t preload_all = (out_c * wgt_words_per_oc <= 16384u);
+
     if (icg == 0u || in_w == 0u || in_h == 0u || out_c == 0u ||
         kernel_h == 0u || kernel_w == 0u || stride == 0u || strip_out_rows == 0u)
-        return 0;
-    // All OC weights are preloaded resident in Wgt SRAM (16384 words). Layers
-    // whose weights exceed that (e.g. conv20 large-IC) need per-chunk reload or
-    // ic_stream -- not yet supported here.
-    if (out_c * wgt_words_per_oc > 16384u)
         return 0;
 
     if (strip_out_rows >= 16u && stride == 1u)
@@ -147,9 +163,11 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         for (i = 0u; i < in_w * 4u; i++) p[i] = word;
     }
 
-    // Weights resident in Wgt SRAM (single OC chunk, out_c <= 64).
-    if (!yolo_dma_ddr_to_wgt(wgt_all_ddr, wgt_base, out_c * wgt_words_per_oc))
-        return 0;
+    // Weights resident in Wgt SRAM when they fit; else loaded per chunk below.
+    if (preload_all) {
+        if (!yolo_dma_ddr_to_wgt(wgt_all_ddr, wgt_base, out_c * wgt_words_per_oc))
+            return 0;
+    }
 
     // Resident qparam table for the out_c OCs.
     {
@@ -190,11 +208,19 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
             uint32_t done = 0u;
             while (done < out_c) {
                 uint32_t chunk = out_c - done;
-                uint32_t sg, cgroups;
+                uint32_t sg, cgroups, cwgt;
                 if (chunk > 64u) chunk = 64u;
                 cgroups = (chunk + 15u) / 16u;
+                if (preload_all) {
+                    cwgt = wgt_base + done * wgt_words_per_oc;   // resident slice
+                } else {
+                    // Reload this chunk's weights into Wgt SRAM base.
+                    d_dma_wgt(&di, wgt_all_ddr + done * wgt_words_per_oc * 16u,
+                              wgt_base, chunk * wgt_words_per_oc);
+                    cwgt = wgt_base;
+                }
                 // PADDED dims; pad_w horizontal HW pad, pad_h=0 (rows DMA'd).
-                d_conv(&di, 0u, wgt_base + done * wgt_words_per_oc,
+                d_conv(&di, 0u, cwgt,
                        in_w + 2u * pad, strip_in_h, in_c, chunk,
                        kernel_h, kernel_w, stride, pad, 0u, conv_flags,
                        YOLO_QPARAM_DDR + done * 16u, chunk);
