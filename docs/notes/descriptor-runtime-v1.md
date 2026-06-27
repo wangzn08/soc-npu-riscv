@@ -39,9 +39,20 @@ queue, YOLO FULL NET PASS 4/4 at 31.9M cyc:
   via a c2f_impl(cfg,use_desc) split (CPU yolo_run_c2f_block + the 10 standalone
   smokes byte-identical). residual-add + concat glue stay on CPU.
 
-Still on CPU (not conv; descriptor engine has ops for some but kept as glue per
-v1 scope): C2f residual eltwise-add + concat-requant, decode (DFL/sigmoid/NMS).
-Neck upsample/copy run via the npu_desc movement ops.
+Glue migration (2026-06-27, each YOLO FULL NET PASS 4/4):
+- SPPF maxpool -> descriptor engine OP_MAXPOOL5X5 (yolo_run_maxpool5x5_desc);
+  one program chains DMA-in + maxpool + DMA-out. 31.92M cyc (flat: 3 tiny pools).
+- C2f residual eltwise-add -> OP_ELTWISE_ADD (yolo_run_eltwise_add_desc), chunked
+  DMA-in x2 + eltwise + DMA-out; backbone c2f2/4/6/8 shortcut. 31.81M cyc.
+Field encodings mirror tb_npu_desc_queue Test 8/9; eltwise w[6]=NPU_ELT_PACK.
+
+Still on CPU (inherently scalar / out of descriptor scope): decode = DFL
+(HW dfl_unit used) + sigmoid (HW LUT) + box-decode + NMS soft-float. The C2f
+concat is FOLDED into cv2 weights (cv2_folded) so there is no CPU concat loop;
+neck FPN/PAN cats fold into cv1 weights + npu_desc movement copies.
+
+Net result: every conv + maxpool + residual-add in the YOLOv8n full net runs on
+the hardware descriptor queue/engine. Full-net 638M (unopt) -> 31.81M cyc, 4/4.
 - run_head_conv ic_stream branch: large-IC 3x3 head stems 47/48 (icg8), 57/58
   (icg16 — at the ICG_MAX=16 boundary, unproven on desc), cls mids 39/50/60 (icg5).
 - c2f-internal convs (yolo_run_c2f_block) — needs a desc path added to the runner.
