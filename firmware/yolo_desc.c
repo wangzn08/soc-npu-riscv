@@ -148,8 +148,15 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
     // engine (CTRL[14], reads pixels directly, no im2col/halo); 3x3 uses the
     // HW-pad im2col path. row_par only for stride-1 3x3 (not 1x1, not stride2).
     uint32_t is_pw = (kernel_h == 1u && kernel_w == 1u);
-    uint32_t conv_flags = NPU_CTRL_OC_SINGLE |
-                          (is_pw ? NPU_CTRL_PW_EN : NPU_CTRL_HW_PAD);
+    // Large-IC 1x1 PW (icg > ICG_BUF) cannot use oc_single: oc_single forces
+    // pf_all in wgt_reader (pf_all = prefetch_all || oc_single), which holds every
+    // IC group resident, but pf_icg_store is [3:0] (16 groups) so IC tiles 16+
+    // alias 0-15 -> wrong output. Mirror yolo_run_conv2d_tiled: stream IC per
+    // group (oc_single off, FSM reuse_mode=0 since icg>ICG_BUF) and tile OC <=16.
+    uint32_t pw_stream = is_pw && (icg > YOLO_ICG_BUF);
+    uint32_t chunk_cap = pw_stream ? 16u : 64u;
+    uint32_t conv_flags = (is_pw ? NPU_CTRL_PW_EN : NPU_CTRL_HW_PAD);
+    if (!pw_stream) conv_flags |= NPU_CTRL_OC_SINGLE;
 
     // Weights fit Wgt SRAM (16384 words)? If so preload all OCs once (resident,
     // conv reads chunk c at base done*wgt_words_per_oc). Otherwise reload each
@@ -222,7 +229,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
             while (done < out_c) {
                 uint32_t chunk = out_c - done;
                 uint32_t sg, cgroups, cwgt;
-                if (chunk > 64u) chunk = 64u;
+                if (chunk > chunk_cap) chunk = chunk_cap;
                 cgroups = (chunk + 15u) / 16u;
                 if (preload_all) {
                     cwgt = wgt_base + done * wgt_words_per_oc;   // resident slice

@@ -612,33 +612,12 @@ void usercode7(void)
     // preserving); conv26 (1x1 512->256, icg32 PW stream, exact). Reads C2F8_OUT.
     yolo_load_silu_lut(yolo_sppf_e_c25_lut);
     yolo_set_silu_requant(0u, 0u, 0);
-    {
-        const npu_desc_t d = {
-            .op = NPU_DESC_OP_CONV2D_TILED,
-            .src0 = C2F8_OUT,
-            .wgt = WGT_OF(25),
-            .scratch0 = WGT_BASE,
-            .dst = S_CV1,
-            .scratch1 = PAD_ROW,
-            .in_w = SPPFE_IN_W,
-            .in_h = SPPFE_IN_H,
-            .in_c = SPPFE_C25_IC,
-            .out_c = SPPFE_C25_OC,
-            .kh = 1u,
-            .kw = 1u,
-            .stride = 1u,
-            .pad = 0u,
-            .bias = yolo_sppf_e_c25_bias,
-            .scale_mul = yolo_sppf_e_c25_mul,
-            .scale_shift = yolo_sppf_e_c25_shift,
-            .flags = NPU_CTRL_SILU_EXACT_EN,
-            .wgt_words_per_oc = SPPFE_C25_IC/16u,
-            .strip_out_rows = 16u,
-            .pad_value = 0
-        };
-        if (errors == 0u && !npu_desc_run(&d)) {
-            print_str("  conv25 desc fail\n"); errors++;
-        }
+    if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F8_OUT, WGT_OF(25), WGT_BASE, S_CV1, PAD_ROW,
+                               SPPFE_IN_W, SPPFE_IN_H, SPPFE_C25_IC, SPPFE_C25_OC,
+                               1u, 1u, 1u, 0u,
+                               yolo_sppf_e_c25_bias, yolo_sppf_e_c25_mul, yolo_sppf_e_c25_shift,
+                               NPU_CTRL_SILU_EXACT_EN, SPPFE_C25_IC/16u, 16u, 0, 0u, 0u, 0)) {
+        print_str("  conv25 desc fail\n"); errors++;
     }
     prof_mark("s9_sppf_conv25");
     if (errors == 0u) {
@@ -651,33 +630,12 @@ void usercode7(void)
     prof_mark("s9_sppf_maxpool_concat_CPU");
     yolo_load_silu_lut(yolo_sppf_e_c26_lut);
     yolo_set_silu_requant(0u, 0u, 0);
-    {
-        const npu_desc_t d = {
-            .op = NPU_DESC_OP_CONV2D_TILED,
-            .src0 = S_CAT,
-            .wgt = WGT_OF(26),
-            .scratch0 = WGT_BASE,
-            .dst = SPPF_OUT,
-            .scratch1 = PAD_ROW,
-            .in_w = SPPFE_IN_W,
-            .in_h = SPPFE_IN_H,
-            .in_c = SPPFE_C26_IC,
-            .out_c = SPPFE_C26_OC,
-            .kh = 1u,
-            .kw = 1u,
-            .stride = 1u,
-            .pad = 0u,
-            .bias = yolo_sppf_e_c26_bias,
-            .scale_mul = yolo_sppf_e_c26_mul,
-            .scale_shift = yolo_sppf_e_c26_shift,
-            .flags = NPU_CTRL_SILU_EXACT_EN,
-            .wgt_words_per_oc = SPPFE_C26_IC/16u,
-            .strip_out_rows = 16u,
-            .pad_value = 0
-        };
-        if (errors == 0u && !npu_desc_run(&d)) {
-            print_str("  conv26 desc fail\n"); errors++;
-        }
+    if (errors == 0u && !yolo_run_conv2d_tiled_desc(S_CAT, WGT_OF(26), WGT_BASE, SPPF_OUT, PAD_ROW,
+                               SPPFE_IN_W, SPPFE_IN_H, SPPFE_C26_IC, SPPFE_C26_OC,
+                               1u, 1u, 1u, 0u,
+                               yolo_sppf_e_c26_bias, yolo_sppf_e_c26_mul, yolo_sppf_e_c26_shift,
+                               NPU_CTRL_SILU_EXACT_EN, SPPFE_C26_IC/16u, 16u, 0, 0u, 0u, 0)) {
+        print_str("  conv26 desc fail\n"); errors++;
     }
     prof_mark("s9_sppf_conv26");
     print_str("  [stage9 SPPF done]\n");
