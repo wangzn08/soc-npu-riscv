@@ -26,6 +26,13 @@ icg<=5 1x1 PW). Still on non-desc-queue paths (need runtime capability validatio
 before migrating, NOT just a rename):
 
 - conv25/conv26: large-IC 1x1 PW (IC=256/512); desc PW only proven at icg2.
+  ATTEMPTED 2026-06-27 and REVERTED: routing conv25/26 through
+  yolo_run_conv2d_tiled_desc (1x1) regressed to 3/4 boxes AND blew cyc up to
+  141.9M (3.5x). The desc-queue 1x1 PW path does not yet handle large IC
+  (icg16/icg32) correctly or efficiently -- needs an RTL/runtime fix + a
+  standalone large-IC-PW desc smoke before migrating. conv25/26 stay on the
+  npu_desc struct wrapper (CPU-helper backend) for now. Same blocker applies to
+  the c2f cv1/cv2 1x1 PW convs.
 - run_head_conv ic_stream branch: large-IC 3x3 head stems 47/48 (icg8), 57/58
   (icg16 — at the ICG_MAX=16 boundary, unproven on desc), cls mids 39/50/60 (icg5).
 - c2f-internal convs (yolo_run_c2f_block) — needs a desc path added to the runner.
