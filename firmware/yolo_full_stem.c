@@ -314,7 +314,7 @@ static void ck_stage(const char *nm, uint32_t base, uint32_t SP, uint32_t OC,
     cfg.cv2_ic=P##_CV2_IC; cfg.cv2_oc=P##_CV2_OC; cfg.cv2_wgt_words=P##_CV2_OC*(P##_CV2_IC/16u); \
     cfg.cv2_bias=p##_cv2_bias; cfg.cv2_mul=p##_cv2_mul; cfg.cv2_shift=p##_cv2_shift; \
     cfg.cv2_silu_lut=p##_cv2_lut; cfg.cv2_rq_zp=P##_CV2_ZP; cfg.cv2_folded=P##_CV2_FOLDED; \
-    if (errors==0u && !yolo_run_c2f_block(&cfg)) { print_str("  neck c2f fail\n"); errors++; } \
+    if (errors==0u && !yolo_run_c2f_block_desc(&cfg)) { print_str("  neck c2f fail\n"); errors++; } \
 } while(0)
 
 /* One head conv (exact): 3x3 large-IC -> ic_stream; else conv2d_tiled resident /
@@ -445,7 +445,7 @@ void usercode7(void)
     cfg.cv2_rq_mul=YOLO_C2F2_CV2_RQ_MUL; cfg.cv2_rq_shift=YOLO_C2F2_CV2_RQ_SHIFT; cfg.cv2_rq_zp=YOLO_C2F2_CV2_RQ_ZP;
     cfg.cv2_folded=YOLO_C2F2_CV2_FOLDED;   // concat folded into cv2 weights (blob has folded conv5)
     cfg.cv2_silu_lut=yolo_c2f2_cv2_silu_lut;
-    if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f2 fail\n"); errors++; }
+    if (errors == 0u && !yolo_run_c2f_block_desc(&cfg)) { print_str("  c2f2 fail\n"); errors++; }
     print_str("  [stage2 c2f_2 done]\n");
     prof_mark("s2_c2f2");
 
@@ -499,7 +499,7 @@ void usercode7(void)
     cfg.cv2_bias=yolo_c2f4_cv2_bias; cfg.cv2_mul=yolo_c2f4_cv2_mul; cfg.cv2_shift=yolo_c2f4_cv2_shift;
     cfg.cv2_silu_lut=yolo_c2f4_cv2_lut; cfg.cv2_rq_zp=YOLO_C2F4_CV2_RQ_ZP;
     cfg.cv2_folded=YOLO_C2F4_CV2_FOLDED;   // concat requant folded into cv2 weights (blob has w2f)
-    if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f4 fail\n"); errors++; }
+    if (errors == 0u && !yolo_run_c2f_block_desc(&cfg)) { print_str("  c2f4 fail\n"); errors++; }
     print_str("  [stage4 c2f_4 done]\n");
     prof_mark("s4_c2f4");
 
@@ -554,7 +554,7 @@ void usercode7(void)
     cfg.cv2_bias=yolo_c2f6_cv2_bias; cfg.cv2_mul=yolo_c2f6_cv2_mul; cfg.cv2_shift=yolo_c2f6_cv2_shift;
     cfg.cv2_silu_lut=yolo_c2f6_cv2_lut; cfg.cv2_rq_zp=YOLO_C2F6_CV2_RQ_ZP;
     cfg.cv2_folded=YOLO_C2F6_CV2_FOLDED;
-    if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f6 fail\n"); errors++; }
+    if (errors == 0u && !yolo_run_c2f_block_desc(&cfg)) { print_str("  c2f6 fail\n"); errors++; }
     print_str("  [stage6 c2f_6 done]\n");
     prof_mark("s6_c2f6");
 
@@ -603,7 +603,7 @@ void usercode7(void)
     cfg.cv2_bias=yolo_c2f8_cv2_bias; cfg.cv2_mul=yolo_c2f8_cv2_mul; cfg.cv2_shift=yolo_c2f8_cv2_shift;
     cfg.cv2_silu_lut=yolo_c2f8_cv2_lut; cfg.cv2_rq_zp=YOLO_C2F8_CV2_RQ_ZP;
     cfg.cv2_folded=YOLO_C2F8_CV2_FOLDED;
-    if (errors == 0u && !yolo_run_c2f_block(&cfg)) { print_str("  c2f8 fail\n"); errors++; }
+    if (errors == 0u && !yolo_run_c2f_block_desc(&cfg)) { print_str("  c2f8 fail\n"); errors++; }
     print_str("  [stage8 c2f_8 done]\n");
     prof_mark("s8_c2f8");
 

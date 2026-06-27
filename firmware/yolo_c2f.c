@@ -3,10 +3,32 @@
 
 #include "firmware.h"
 #include "yolo_ops.h"
+#include "yolo_desc.h"
 #include "yolo_c2f.h"
 
 #define WGT_BASE 0u
 #define C2F_ELTWISE_ACT 0u
+
+// Route a tiled conv either through the CPU MMIO helper (use_desc=0) or the
+// hardware descriptor queue (use_desc=1). For exact-SiLU the LUT is preloaded by
+// silu_setup and the desc requant triple is (0,0,0); legacy requant passes its
+// mul/shift/zp through. Keeps the C2f conv compute migratable without changing
+// the CPU fallback used by the standalone c2f smokes.
+static int c2f_tiled(int use_desc, uint32_t in, uint32_t wd, uint32_t out,
+                     uint32_t pad_row, uint32_t inw, uint32_t inh,
+                     uint32_t ic, uint32_t oc, uint32_t kh, uint32_t kw,
+                     uint32_t stride, uint32_t pad, const int32_t *bias,
+                     const uint32_t *mul, const uint32_t *shift, uint32_t f,
+                     uint32_t wpo, uint32_t strip, int32_t padv,
+                     uint32_t rq_mul, uint32_t rq_shift, int32_t rq_zp)
+{
+    if (use_desc)
+        return yolo_run_conv2d_tiled_desc(in, wd, WGT_BASE, out, pad_row, inw, inh,
+                   ic, oc, kh, kw, stride, pad, bias, mul, shift, f, wpo, strip,
+                   padv, rq_mul, rq_shift, rq_zp);
+    return yolo_run_conv2d_tiled(in, wd, WGT_BASE, out, pad_row, inw, inh, ic, oc,
+               kh, kw, stride, pad, bias, mul, shift, f, wpo, strip, padv);
+}
 
 static void wr_word(uint32_t a, uint32_t w, const uint32_t l[4])
 {
@@ -100,7 +122,7 @@ static uint32_t add_slot(const yolo_c2f_cfg_t *cfg, uint32_t i,
     return cfg->add_ddr[i];
 }
 
-int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
+static int c2f_impl(const yolo_c2f_cfg_t *cfg, int use_desc)
 {
     uint32_t half_groups = (cfg->full_c / 2u) / 16u;
     uint32_t full_groups = cfg->full_c / 16u;
@@ -123,11 +145,14 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
         uint32_t wd = wgt_src(cfg, cfg->cv1_wgt_ddr, cfg->cv1_wgt, cfg->cv1_wgt_words);
         uint32_t f = silu_setup(cfg, cfg->cv1_silu_lut, cfg->cv1_rq_mul,
                                 cfg->cv1_rq_shift, cfg->cv1_rq_zp);
-        if (!yolo_run_conv2d_tiled(cfg->in_ddr, wd, WGT_BASE, cv1_out,
-                                   cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
-                                   1u, 1u, 1u, 0u,
-                                   cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
-                                   f, cfg->cv1_wgt_words / cfg->full_c, strip, 0))
+        if (!c2f_tiled(use_desc, cfg->in_ddr, wd, cv1_out,
+                       cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv1_ic, cfg->full_c,
+                       1u, 1u, 1u, 0u,
+                       cfg->cv1_bias, cfg->cv1_mul, cfg->cv1_shift,
+                       f, cfg->cv1_wgt_words / cfg->full_c, strip, 0,
+                       cfg->silu_exact ? 0u : cfg->cv1_rq_mul,
+                       cfg->silu_exact ? 0u : cfg->cv1_rq_shift,
+                       cfg->silu_exact ? 0  : cfg->cv1_rq_zp))
             return 0;
     }
     (void)full_groups;
@@ -161,13 +186,16 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
             } else {
                 uint32_t f = silu_setup(cfg, cfg->mcv1_silu_lut[i], cfg->mcv1_rq_mul[i],
                                         cfg->mcv1_rq_shift[i], cfg->mcv1_rq_zp[i]);
-                if (!yolo_run_conv2d_tiled(prev_ddr, wd, WGT_BASE, cfg->bn_out_ddr,
-                                           cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
-                                           cfg->full_c/2u, cfg->full_c/2u,
-                                           3u, 3u, 1u, 1u,
-                                           cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
-                                           f, cfg->mcv1_wgt_words / (cfg->full_c/2u), strip,
-                                           cfg->mcv1_pad_value[i]))
+                if (!c2f_tiled(use_desc, prev_ddr, wd, cfg->bn_out_ddr,
+                               cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                               cfg->full_c/2u, cfg->full_c/2u,
+                               3u, 3u, 1u, 1u,
+                               cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
+                               f, cfg->mcv1_wgt_words / (cfg->full_c/2u), strip,
+                               cfg->mcv1_pad_value[i],
+                               cfg->silu_exact ? 0u : cfg->mcv1_rq_mul[i],
+                               cfg->silu_exact ? 0u : cfg->mcv1_rq_shift[i],
+                               cfg->silu_exact ? 0  : cfg->mcv1_rq_zp[i]))
                     return 0;
             }
         }
@@ -186,13 +214,16 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
             } else {
                 uint32_t f = silu_setup(cfg, cfg->mcv2_silu_lut[i], cfg->glue_rq_mul[i],
                                         cfg->glue_rq_shift[i], cfg->glue_zp[i]);
-                if (!yolo_run_conv2d_tiled(cfg->bn_out_ddr, wd, WGT_BASE, cfg->mcv2_ddr,
-                                           cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
-                                           cfg->full_c/2u, cfg->full_c/2u,
-                                           3u, 3u, 1u, 1u,
-                                           cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
-                                           f, cfg->mcv2_wgt_words / (cfg->full_c/2u), strip,
-                                           cfg->mcv2_pad_value[i]))
+                if (!c2f_tiled(use_desc, cfg->bn_out_ddr, wd, cfg->mcv2_ddr,
+                               cfg->pad_row_ddr, cfg->in_w, cfg->in_h,
+                               cfg->full_c/2u, cfg->full_c/2u,
+                               3u, 3u, 1u, 1u,
+                               cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
+                               f, cfg->mcv2_wgt_words / (cfg->full_c/2u), strip,
+                               cfg->mcv2_pad_value[i],
+                               cfg->silu_exact ? 0u : cfg->glue_rq_mul[i],
+                               cfg->silu_exact ? 0u : cfg->glue_rq_shift[i],
+                               cfg->silu_exact ? 0  : cfg->glue_zp[i]))
                     return 0;
             }
         }
@@ -239,13 +270,25 @@ int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
         uint32_t wd = wgt_src(cfg, cfg->cv2_wgt_ddr, cfg->cv2_wgt, cfg->cv2_wgt_words);
         uint32_t f = silu_setup(cfg, cfg->cv2_silu_lut, cfg->cv2_rq_mul,
                                 cfg->cv2_rq_shift, cfg->cv2_rq_zp);
-        if (!yolo_run_conv2d_tiled(cfg->concat_ddr, wd, WGT_BASE, cfg->out_ddr,
-                                   cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
-                                   1u, 1u, 1u, 0u,
-                                   cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,
-                                   f, cfg->cv2_wgt_words / cfg->cv2_oc, strip, 0))
+        if (!c2f_tiled(use_desc, cfg->concat_ddr, wd, cfg->out_ddr,
+                       cfg->pad_row_ddr, cfg->in_w, cfg->in_h, cfg->cv2_ic, cfg->cv2_oc,
+                       1u, 1u, 1u, 0u,
+                       cfg->cv2_bias, cfg->cv2_mul, cfg->cv2_shift,
+                       f, cfg->cv2_wgt_words / cfg->cv2_oc, strip, 0,
+                       cfg->silu_exact ? 0u : cfg->cv2_rq_mul,
+                       cfg->silu_exact ? 0u : cfg->cv2_rq_shift,
+                       cfg->silu_exact ? 0  : cfg->cv2_rq_zp))
             return 0;
     }
 
     return 1;
 }
+
+// CPU-helper path (default; used by the standalone c2f smokes).
+int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
+{ return c2f_impl(cfg, 0); }
+
+// Descriptor-queue path for the convs (cv1/mcv/cv2); residual/concat glue stays
+// on the CPU. Used by the full-net deploy (yolo_full_stem.c).
+int yolo_run_c2f_block_desc(const yolo_c2f_cfg_t *cfg)
+{ return c2f_impl(cfg, 1); }
