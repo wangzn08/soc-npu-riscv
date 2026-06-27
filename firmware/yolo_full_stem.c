@@ -10,6 +10,7 @@
 #include "firmware.h"
 #include "npu_desc.h"
 #include "yolo_ops.h"
+#include "yolo_desc.h"
 #include "yolo_c2f.h"
 #include "yolo_conv0_320_noact_data.h"
 #include "yolo_conv1_320_exact_data.h"
@@ -383,12 +384,12 @@ void usercode7(void)
     yolo_set_pad_value(C0E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv0_320e_silu_lut);
     yolo_set_silu_requant(0u, 0u, 0);
-    if (!yolo_run_conv2d_tiled(IMG, WGT_OF(0), WGT_BASE, C0_OUT, PAD_ROW,
+    if (!yolo_run_conv2d_tiled_desc(IMG, WGT_OF(0), WGT_BASE, C0_OUT, PAD_ROW,
                                C0E_IN_W, C0E_IN_H, C0E_IC, C0E_OC,
                                3u, 3u, 2u, 1u,
                                yolo_conv0_320e_bias_q, yolo_conv0_320e_scale_mul,
                                yolo_conv0_320e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C0E_WGT_PER_OC, 16u, C0E_PAD_VALUE)) {
+                               NPU_CTRL_SILU_EXACT_EN, C0E_WGT_PER_OC, 16u, C0E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv0 fail\n"); errors++;
     }
     prof_mark("s0_conv0");
@@ -397,12 +398,12 @@ void usercode7(void)
     yolo_set_pad_value(C1E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv1_320e_silu_lut);
     yolo_set_silu_requant(0u, 0u, 0);
-    if (errors == 0u && !yolo_run_conv2d_tiled(C0_OUT, WGT_OF(1), WGT_BASE, C1_OUT, PAD_ROW,
+    if (errors == 0u && !yolo_run_conv2d_tiled_desc(C0_OUT, WGT_OF(1), WGT_BASE, C1_OUT, PAD_ROW,
                                C1E_IN_W, C1E_IN_H, C1E_IC, C1E_OC,
                                3u, 3u, 2u, 1u,
                                yolo_conv1_320e_bias_q, yolo_conv1_320e_scale_mul,
                                yolo_conv1_320e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C1E_WGT_PER_OC, 16u, C1E_PAD_VALUE)) {
+                               NPU_CTRL_SILU_EXACT_EN, C1E_WGT_PER_OC, 16u, C1E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv1 fail\n"); errors++;
     }
     prof_mark("s1_conv1");
@@ -452,10 +453,10 @@ void usercode7(void)
     yolo_set_pad_value(C6E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv6e_silu_lut);
     yolo_set_silu_requant(0u, 0u, 0);
-    if (errors == 0u && !yolo_run_conv2d_tiled(C2F_OUT, WGT_OF(6), WGT_BASE, C6_OUT, PAD_ROW,
+    if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F_OUT, WGT_OF(6), WGT_BASE, C6_OUT, PAD_ROW,
                                C6E_IN_W, C6E_IN_H, C6E_IC, C6E_OC, 3u, 3u, C6E_STRIDE, 1u,
                                yolo_conv6e_bias_q, yolo_conv6e_scale_mul, yolo_conv6e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C6E_WGT_PER_OC, 16u, C6E_PAD_VALUE)) {
+                               NPU_CTRL_SILU_EXACT_EN, C6E_WGT_PER_OC, 16u, C6E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv6 fail\n"); errors++;
     }
     print_str("  [stage3 conv6 done]\n");
@@ -506,10 +507,10 @@ void usercode7(void)
     yolo_set_pad_value(C13E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv13e_silu_lut);
     yolo_set_silu_requant(0u, 0u, 0);
-    if (errors == 0u && !yolo_run_conv2d_tiled(C2F4_OUT, WGT_OF(13), WGT_BASE, C13_OUT, PAD_ROW,
+    if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F4_OUT, WGT_OF(13), WGT_BASE, C13_OUT, PAD_ROW,
                                C13E_IN_W, C13E_IN_H, C13E_IC, C13E_OC, 3u, 3u, C13E_STRIDE, 1u,
                                yolo_conv13e_bias_q, yolo_conv13e_scale_mul, yolo_conv13e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C13E_WGT_PER_OC, 16u, C13E_PAD_VALUE)) {
+                               NPU_CTRL_SILU_EXACT_EN, C13E_WGT_PER_OC, 16u, C13E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv13 fail\n"); errors++;
     }
     print_str("  [stage5 conv13 done]\n");
@@ -563,10 +564,10 @@ void usercode7(void)
     (void)C20_PSUM;
     yolo_set_pad_value(C20E_PAD_VALUE);
     yolo_load_silu_lut(yolo_conv20e_silu_lut); yolo_set_silu_requant(0u, 0u, 0);
-    if (errors == 0u && !yolo_run_conv2d_tiled(C2F6_OUT, WGT_OF(20), WGT_BASE, C20_OUT, PAD_ROW,
+    if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F6_OUT, WGT_OF(20), WGT_BASE, C20_OUT, PAD_ROW,
                                C20E_IN_W, C20E_IN_H, C20E_IC, C20E_OC, 3u, 3u, C20E_STRIDE, 1u,
                                yolo_conv20e_bias_q, yolo_conv20e_scale_mul, yolo_conv20e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, (C20E_IC/16u)*9u, 16u, C20E_PAD_VALUE)) {
+                               NPU_CTRL_SILU_EXACT_EN, (C20E_IC/16u)*9u, 16u, C20E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv20 fail\n"); errors++;
     }
     print_str("  [stage7 conv20 done]\n");

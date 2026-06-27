@@ -32,6 +32,9 @@ module tb_vector_alu_signed;
         .i_eltwise_en(i_eltwise_en),
         .i_signed_mode(i_signed_mode),
         .i_elt_zp(i_elt_zp),
+        .i_elt_ratio_en(1'b0),       // ratio disabled -> legacy signed (skip - zp)
+        .i_elt_ratio_mul(17'd1),
+        .i_elt_ratio_shift(6'd0),
         .i_vld(i_vld),
         .o_res(o_res),
         .o_vld(o_vld)

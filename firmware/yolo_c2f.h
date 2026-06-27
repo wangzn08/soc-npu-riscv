@@ -35,6 +35,12 @@ typedef struct {
                                     // (exact mode, half_c/16 > YOLO_ICG_BUF); needs
                                     // (half_c/16)*in_w*in_h*4*2 128-bit words
 
+    // When cv2_folded != 0, the concat per-source requant is pre-folded into the
+    // cv2 int8 weights+bias (generator), so the CPU cat_req loop is dropped: cv1
+    // writes s0|s1 straight into concat_ddr, each residual add_i is written into the
+    // concat_ddr add slot, and cv2 reads the contiguous concat_ddr at native scales.
+    uint32_t cv2_folded;
+
     // ----- exact per-layer SiLU LUT (0 = legacy Q4.4 SiLU + requant) -----
     // When silu_exact != 0, each conv loads its 256-entry out-grid SiLU LUT,
     // runs with NPU_CTRL_SILU_EXACT_EN, and the *_mul/*_shift/*_bias arrays are

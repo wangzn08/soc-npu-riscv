@@ -212,6 +212,24 @@ def compute_c2f2():
     bq5, m5, sh5 = make_qparams(conv0, w5, fw("conv5_b.bin"), fw("conv5_s.bin"), CAT[0], CAT[1], AQ[5][2])
     golden = conv_rtl(conv0, concat_chw, w5, bq5, m5, lut5, 1, 1, 1, 0, CAT[1], AQ[5][3])
 
+    # ---- CONCAT FOLDED: fold the per-source requant (alpha=src/CAT, zp) into cv2's
+    # int8 weights+bias so cv2 reads the RAW contiguous concat [s0|s1|add0] at native
+    # scales (no CPU cat_requant). Same bias convention as make_qparams (no half-round). ----
+    chan_sc = np.array([AQ[2][2]]*32 + [GLUE[0]]*16, dtype=np.float64)   # s0,s1 @conv2-out; add0 @glue
+    chan_zp = np.array([AQ[2][3]]*32 + [GLUE[1]]*16, dtype=np.int64)
+    alpha = chan_sc / CAT[0]
+    w5_2d = w5[:, :, 0, 0].astype(np.float64)
+    w5f = np.clip(np.round(w5_2d * alpha[None, :]), -128, 127).astype(np.int8)
+    b5real = fw("conv5_b.bin"); s5 = fw("conv5_s.bin")
+    bias_fold = [int(round(float(b5real[o]) / (CAT[0] * float(s5[o])))
+                     - int(np.sum(w5f[o].astype(np.int64) * chan_zp))) for o in range(32)]
+    w5f_4d = w5f[:, :, None, None]
+    raw_concat = np.concatenate([s0_flat, s1_flat, add0], axis=1)        # [SP,48] raw, native scales
+    raw_concat_chw = raw_concat.reshape(IN_H, IN_W, 48).transpose(2, 0, 1)
+    golden_fold = conv_rtl(conv0, raw_concat_chw, w5f_4d, bias_fold, m5, lut5, 1, 1, 1, 0, 0, AQ[5][3])
+    (WEIGHT_DIR / "conv5_w_folded.bin").write_bytes(w5f.astype(np.int8).tobytes())
+    print(f"c2f2 FOLD vs concat-path: max={int(np.abs(golden_fold.astype(int)-golden.astype(int)).max())}")
+
     # self-check vs the C engine's model.2 output dump (conv5.bin)
     c5, _, _, _, c5_scale, c5_zp = load_dump(5)
     c5_flat = c5.transpose(1, 2, 0).reshape(SP, 32)
@@ -287,18 +305,20 @@ def compute_c2f2():
 #define YOLO_C2F2_CAT_MUL_ADD0 {cm_a0}u
 #define YOLO_C2F2_CAT_INZP_ADD0 {GLUE[1]}
 
-/* cv2 = conv5 (1x1, 48->32) */
+/* cv2 = conv5 (1x1, 48->32) -- CONCAT FOLDED: per-source requant baked into the
+   int8 weights (w5f) + bias (bias_fold); cv2 reads the raw contiguous concat. */
 #define YOLO_C2F2_CV2_WGT_WORDS {32 * 3}u
+#define YOLO_C2F2_CV2_FOLDED 1
 #define YOLO_C2F2_CV2_RQ_MUL 0u
 #define YOLO_C2F2_CV2_RQ_SHIFT {REQ_SHIFT}u
 #define YOLO_C2F2_CV2_RQ_ZP {AQ[5][3]}
-{fmt_u32_arr("yolo_c2f2_cv2_wgt", pack1x1(conv0, w5))}
-{fmt_i32("yolo_c2f2_cv2_bias", bq5)}
+{fmt_u32_arr("yolo_c2f2_cv2_wgt", pack1x1(conv0, w5f_4d))}
+{fmt_i32("yolo_c2f2_cv2_bias", bias_fold)}
 {fmt_u32("yolo_c2f2_cv2_mul", m5)}
 {fmt_u32("yolo_c2f2_cv2_shift", sh5)}
 {fmt_u8_1d("yolo_c2f2_cv2_silu_lut", lut5)}
 
-{fmt_u8("yolo_c2f2_expected_rtl", golden.astype(np.uint8))}
+{fmt_u8("yolo_c2f2_expected_rtl", golden_fold.astype(np.uint8))}
 
 #endif
 """

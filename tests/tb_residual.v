@@ -23,7 +23,11 @@ module tb_residual;
     vector_alu dut (
         .clk(clk), .rst_n(rst_n),
         .i_conv_res(i_conv_res), .i_skip_res(i_skip_res),
-        .i_eltwise_en(i_eltwise_en), .i_vld(i_vld),
+        .i_eltwise_en(i_eltwise_en),
+        .i_signed_mode(1'b0),        // legacy unsigned [0,127] residual (this TB's scope)
+        .i_elt_zp(8'd0),
+        .i_elt_ratio_en(1'b0), .i_elt_ratio_mul(17'd1), .i_elt_ratio_shift(6'd0),
+        .i_vld(i_vld),
         .o_res(o_res), .o_vld(o_vld)
     );
 

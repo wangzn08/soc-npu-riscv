@@ -68,6 +68,7 @@ void usercode7(void)
     cfg.cv2_ic=YOLO_C2F4_CV2_IC; cfg.cv2_oc=YOLO_C2F4_CV2_OC; cfg.cv2_wgt_words=YOLO_C2F4_CV2_WGT_WORDS;
     cfg.cv2_wgt=yolo_c2f4_cv2_wgt; cfg.cv2_bias=yolo_c2f4_cv2_bias; cfg.cv2_mul=yolo_c2f4_cv2_mul; cfg.cv2_shift=yolo_c2f4_cv2_shift;
     cfg.cv2_silu_lut=yolo_c2f4_cv2_lut; cfg.cv2_rq_zp=YOLO_C2F4_CV2_RQ_ZP;
+    cfg.cv2_folded=YOLO_C2F4_CV2_FOLDED;   // concat requant folded into cv2 weights
 
     if (!yolo_run_c2f_block(&cfg)) { print_str("  c2f4 runner failed\n"); errors++; }
 

@@ -4,6 +4,80 @@ Branch: `codex/yolov8n-rtl-m0`. Last commit before this doc: `08b78fd`.
 Read also: `CLAUDE.md`, `docs/notes/yolov8n-320-golden.md` (full detail/history),
 memory `soc-silu-lut-range-gap.md`.
 
+## OPTIMIZED (2026-06-24): 638.2M -> 162.9M cyc (-74.5%), still 4/4 boxes
+Latency @200MHz: **3.19s -> 0.815s/img** (sub-second). NPU busy ~16.7M (~10%). Wins:
+0. conv20/46 (icg8 stride2) switched from CPU ic_stream to resident conv2d_tiled (-4M).
+5. **decode conf-gate without my_exp** (-16.6M): sigmoid monotonic -> compare raw logit
+   `lg0 < ln(1/3)` instead of computing sigmoid(lg0)<0.25, skipping ~2100 soft-float exp.
+6. **ICG_MAX/ICG_BUF 4->8** (267.8->167.0M): the im2col line buffer (ICG_MAX) + weight
+   reuse buffer (ICG_BUF, in wgt_reader + top_controller_fsm) + firmware YOLO_ICG_BUF all
+   4->8, so icg<=8 3x3 convs run the RESIDENT path instead of CPU INT32-psum ic_stream.
+   This fixes the historical icg>4 3x3 breakpoint at its root (im2col window held only 4
+   IC tiles). head cl_mid (conv39, icg5 @40x40) 41.8M -> 0.57M; whole head ic_stream gone.
+   MNIST 941,155 byte-identical (icg<=4 unchanged). NPU busy 21.1->16.7M (resident runs
+   fewer passes than ic_stream). conv20/46 still hardcode ic_stream (can switch to resident).
+Earlier wins (1-4):
+1. C2f concat -> cv2 weights; 2. SPPF separable maxpool; 3. ck gated; 4. neck cat -> cv1 weights.
+Remaining buckets: c2f2/4/6 ~65M (CPU residual-add + conv orchestration), decode ~26.8M
+(HW dfl_unit+sigmoid exist), SPPF maxpool 22.6M, conv20/46 ic_stream 11M (-> resident).
+Architecture floor ~20-40M (~0.1-0.2s); NPU-busy floor ~16.7M.
+
+## (older -55% milestone) 638.2M -> 284.4M, 1.42s/img. Adds to wins 1-3 below:
+4. **neck FPN/PAN cat folded into c2f cv1 weights** (382.8->284.4M): same trick as #1
+   but for the neck input concats (cat1-4 = upsample+tap). The cat per-source requant
+   folds into the consuming c2f cv1's int8 weights+bias (conv27/31/40/51); cv1 reads the
+   RAW [up|tap] native concat. Firmware replaces the 4 (upsample2+concat2_rq) with
+   (upsample2 -> NK_CAT slot0 + copy_groups tap -> slot1); concat2_rq deleted. The neck
+   cat stages collapsed 101M -> 3.7M (-96%; concat2_rq's per-lane requant was the cost).
+   gen_yolo_neck.py: c2f_neck(fold_in=...), build_cat_raw, conv{cv1}_w_folded.bin, CV1_FOLDED.
+(NOTE the old "680M ~= 3.4ms" further below is a typo — it's 3.4 SECONDS; YOLO is CPU-bound.) (NOTE: the old "680M ~= 3.4ms" line below is a
+typo — 680M/200MHz = 3.4 SECONDS, not ms; YOLO is CPU-bound so it's seconds, while MNIST
+941K = 4.7ms is correct). Wins, all bit-exact, 4 boxes preserved, ZERO new RTL, MNIST
+untouched:
+1. **C2f concat folded into cv2 weights** (638.2->470.7M): the concat per-source requant
+   is a linear op before the 1x1 cv2, so it folds exactly into cv2's int8 weights+bias
+   (w2f=round(w2*alpha_c), zp into bias). All 8 C2f (backbone c2f2/4/6/8 + neck
+   c2f12/15/18/21). cv2 reads the raw contiguous concat; the CPU cat_req loop is deleted.
+   Generators emit conv{cv2}_w_folded.bin (blob prefers it) + bias_fold + CV2_FOLDED; fw
+   `yolo_c2f.c` cv2_folded mode (cv1 writes concat_ddr, residual->concat slot via add_slot,
+   no cat_req). c2f4 standalone smoke maxdiff=0.
+2. **SPPF maxpool separable** (470.7->416.9M): SPPF was CPU-arithmetic-bound; 5x5 -> 1x5
+   then 5x1 (25->10 taps) + local int8 staging. SPPF stage 76.4M->22.6M (-70%).
+3. **ck_stage gated** (416.9->382.8M): validation checksums moved behind YOLO_DEBUG_CK
+   (off by default); the final 4-box check is the real gate.
+Remaining big CPU buckets (next levers): neck upsample+concat ~100M (DDR-bound; fold the
+FPN/PAN cat into the c2f cv1 weights, like #1 — needs a neck-gen refactor since cat-build
+is decoupled from c2f_neck), head conv CPU orchestration ~88M (per-conv DMA/strip; batch or
+descriptor-DMA), decode DFL/sigmoid/NMS ~44M (HW dfl_unit + sigmoid LUT exist, NMS stays CPU).
+See spec `docs/superpowers/specs/2026-06-24-yolo-c2f-glue-to-npu-design.md`, memory
+`soc-yolo-c2f-glue-npu.md`.
+
+## PROFILE (2026-06-24): per-stage cycle attribution — NPU is only 3.3%!
+Added Phase-0 `prof_mark` probes to `yolo_full_stem.c` (reads free-running RTL perf
+counters NPU_PERF_CYC_TOTAL/BUSY/RD/WR_BEATS; dcyc=wall, dnpu=NPU-busy, dcyc-dnpu=
+CPU/DMA glue). Probes are pure additive prints (git diff: 0 deletions, computation
+== HEAD). Full-net RTL run = **638.2M cyc total**. Attribution:
+- **NPU array actually busy: 21.1M = 3.3%** (the whole conv/GEMM compute)
+- CPU pure data-movement (concat/upsample/maxpool, dnpu=0): 177.8M = **27.9%**
+- CPU per-element post-proc glue inside conv/C2f (requant+SiLU LUT+residual+concat-
+  requant, on exact-SiLU & ic_stream paths): **~378M = ~59%**
+- CPU decode (DFL/sigmoid/NMS soft-float): 26.6M = 4.2%
+- debug ck_stage (removable, not real inference): 34.1M = 5.3%
+TOP single offenders: SPPF maxpool5x3+concat=**76.4M** (only 10x10x256! naive volatile
+byte loop ~40cyc/op — easiest win); c2f2 glue=**81.1M** (80x80, biggest spatial);
+c2f4=62.6M; neck up2+cat2=54.3M (40x40); head_P3=43.2M.
+**Conclusion: YOLO bottleneck is NOT the array and NOT MMIO scheduling — it is that ALL
+per-element post-processing + data-movement runs on the scalar PicoRV32.** Real next
+levers (re-ranked by MEASUREMENT, overriding the old qualitative guesses):
+(1) HW concat/upsample/maxpool engines (like sram_copy/img_expand) -> kills ~28%;
+(2) move C2f/conv exact-SiLU+residual+concat-requant post-proc back onto NPU
+post_process_top -> attacks the ~59% bucket. NOTE: ic_stream CPU psum-accumulate
+(conv20/conv46) was *guessed* to be tier-1 but measured only 9M/4.8M glue — NOT heavy.
+CAVEAT: this run scored 0/4 (not 4/4) because the working tree's `yolo_img_ddr.hex` +
+`gen_yolo_img_hex.py` were pre-modified (image swapped off bus320 + generator takes
+argv[1]); cycle attribution is unaffected (dims unchanged). To re-confirm 4/4, regen
+bus320 image hex. Probe code lives in `yolo_full_stem.c` (`prof_reset`/`prof_mark`).
+
 ## DONE (2026-06-23): FULL YOLOv8n on-SoC -> 4 boxes match C oracle
 `yolo_full_stem.c` runs the WHOLE net (conv0..head, model.0-22 + DFL/sigmoid/decode/
 NMS on CPU) end-to-end on RTL with the DDR-preloaded bus320 image: `head dets=32,

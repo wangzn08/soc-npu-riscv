@@ -52,18 +52,38 @@ def conv3x3(act, ci, stride):  # act [C,H,W] -> [SP,OC] int8 (exact SiLU)
     return out, (b, m, o_z, C.build_lut(o_s, o_z), i_z)
 
 
-def c2f_neck(act, cv1, bns, cv2):
-    """shortcut=0 C2f. act [C,H,W]. Returns (out[SP,OC], emit_dict, out_scale,zp)."""
+def c2f_neck(act, cv1, bns, cv2, fold_in=None):
+    """shortcut=0 C2f. act [C,H,W]. Returns (out[SP,OC], emit_dict, out_scale,zp).
+    fold_in=(up_ch, up_sc, up_z, tap_sc, tap_z): the input is the RAW [up|tap] concat
+    at native scales; the FPN/PAN cat requant is folded into cv1's weights+bias (like
+    the cv2 concat fold), so the firmware skips the per-lane concat2_rq."""
     n = len(bns); full_c = C.CONVS[cv1]["oc"]; half = full_c // 2
     H, W = act.shape[1], act.shape[2]; SP = H * W
     # cv1 1x1 -> split
     i_s, i_z, o_s, o_z = aq(cv1)
     w1, b1, m1 = C.qp(cv1, i_s, i_z, o_s, 1, 1)
-    cv1o = C.conv_exact(act, w1, b1, m1, C.build_lut(o_s, o_z), 1, 1, 1, 0, i_z, o_z)
+    cv1_folded = 0
+    if fold_in is not None:
+        # fold the FPN/PAN cat requant into cv1 weights (cv1 reads raw [up|tap]).
+        up_ch, up_sc, up_z, tap_sc, tap_z = fold_in
+        cic = w1.shape[1]
+        chan_sc = np.array([up_sc]*up_ch + [tap_sc]*(cic-up_ch), dtype=np.float64)
+        chan_zp = np.array([up_z]*up_ch + [tap_z]*(cic-up_ch), dtype=np.int64)
+        alpha = chan_sc / i_s          # i_s = cv1 in (cat) scale
+        w1f = np.clip(np.round(w1[:, :, 0, 0].astype(np.float64) * alpha[None, :]), -128, 127).astype(np.int8)
+        b1real = C.fwf(cv1, "b")[:full_c]; s1v = C.fwf(cv1, "s")[:full_c]
+        b1 = [int(round(float(b1real[o]) / (i_s * float(s1v[o])))
+                  - int(np.sum(w1f[o].astype(np.int64) * chan_zp))
+                  + (round((1 << (C.Q_SHIFT - 1)) / m1[o]) if m1[o] else 0)) for o in range(full_c)]
+        w1 = w1f[:, :, None, None]
+        (C.WDIR / f"conv{cv1}_w_folded.bin").write_bytes(w1f.astype(np.int8).tobytes())
+        cv1_folded = 1
+    cv1o = C.conv_exact(act, w1, b1, m1, C.build_lut(o_s, o_z), 1, 1, 1, 0,
+                        0 if cv1_folded else i_z, o_z)
     cv1c = cv1o.reshape(H, W, full_c).transpose(2, 0, 1)
     s0, s1 = cv1c[:half], cv1c[half:]
     cv1_s, cv1_z = o_s, o_z
-    E = {"cv1": (b1, m1, o_z, C.build_lut(o_s, o_z))}
+    E = {"cv1": (b1, m1, o_z, C.build_lut(o_s, o_z)), "cv1_folded": cv1_folded}
     adds = []; prev = s1; pieces_scz = []
     for bi, (mc1, mc2) in enumerate(bns):
         a_s, a_z, ao_s, ao_z = aq(mc1)
@@ -93,8 +113,23 @@ def c2f_neck(act, cv1, bns, cv2):
     concat_c = concat.reshape(H, W, cv2_ic).transpose(2, 0, 1)
     _, _, c2o_s, c2o_z = aq(cv2)
     w2, b2, m2 = C.qp(cv2, cat_s, cat_z, c2o_s, 1, 1)
-    out = C.conv_exact(concat_c, w2, b2, m2, C.build_lut(c2o_s, c2o_z), 1, 1, 1, 0, cat_z, c2o_z)
-    E["cv2"] = (b2, m2, c2o_z, C.build_lut(c2o_s, c2o_z))
+    # ---- CONCAT FOLDED: fold per-source requant (alpha=src/cat, zp) into cv2 int8
+    # weights+bias so cv2 reads the RAW contiguous concat [s0|s1|add0..] at native
+    # scales (no CPU cat_req). Same qp() bias convention (incl. the +half rounding). ----
+    oc = w2.shape[0]
+    b2real = C.fwf(cv2, "b")[:oc]; s2v = C.fwf(cv2, "s")[:oc]
+    chan_sc = np.array([cv1_s]*full_c + sum([[gs]*half for (_a, gs, _gz) in adds], []), dtype=np.float64)
+    chan_zp = np.array([cv1_z]*full_c + sum([[gz]*half for (_a, _gs, gz) in adds], []), dtype=np.int64)
+    alpha = chan_sc / cat_s
+    w2f = np.clip(np.round(w2[:, :, 0, 0].astype(np.float64) * alpha[None, :]), -128, 127).astype(np.int8)
+    bias_fold = [int(round(float(b2real[o]) / (cat_s * float(s2v[o])))
+                     - int(np.sum(w2f[o].astype(np.int64) * chan_zp))
+                     + (round((1 << (C.Q_SHIFT - 1)) / m2[o]) if m2[o] else 0)) for o in range(oc)]
+    raw_concat = np.concatenate([s0f, s1f] + [a.transpose(1, 2, 0).reshape(SP, half) for (a, _gs, _gz) in adds], axis=1)
+    raw_concat_c = raw_concat.reshape(H, W, cv2_ic).transpose(2, 0, 1)
+    out = C.conv_exact(raw_concat_c, w2f[:, :, None, None], bias_fold, m2, C.build_lut(c2o_s, c2o_z), 1, 1, 1, 0, 0, c2o_z)
+    (C.WDIR / f"conv{cv2}_w_folded.bin").write_bytes(w2f.astype(np.int8).tobytes())
+    E["cv2"] = (bias_fold, m2, c2o_z, C.build_lut(c2o_s, c2o_z))
     E["cat"] = (cm_s, cv1_z, cat_z, cat_add)   # cat_mul_s0s1, inzp_s0s1, cat_zp, [(mul,zp)..]
     E["dims"] = (W, H, SP, full_c, cv2_ic, C.CONVS[cv2]["oc"], n, C.CONVS[cv1]["ic"])
     return out, E, c2o_s, c2o_z
@@ -116,6 +151,8 @@ def emit_c2f(pfx, E):
     L.append(f"#define {P}_CV2_IC {cv2_ic}u")
     L.append(f"#define {P}_CV2_OC {cv2_oc}u")
     L.append(f"#define {P}_N {n}u")
+    L.append(f"#define {P}_CV2_FOLDED 1")   # concat requant folded into cv2 weights (blob has w2f)
+    L.append(f"#define {P}_CV1_FOLDED {E.get('cv1_folded', 0)}")  # FPN/PAN cat folded into cv1 weights
     def conv(name, t):
         b, m, z, lut = t[0], t[1], t[2], t[3]
         L.append(i32(f"{pfx}_{name}_bias", b)); L.append(u32(f"{pfx}_{name}_mul", m))
@@ -172,6 +209,12 @@ def build_cat(up, up_sc, up_z, tap, tap_sc, tap_z, cat_ci):
     return cat.reshape(H, W, C0 + tap.shape[0]).transpose(2, 0, 1)
 
 
+def build_cat_raw(up, tap):
+    """Raw [up|tap] concat at NATIVE scales (no requant) -> cv1 reads this with the
+    cat requant folded into its weights. Channel order [up..|tap..] matches cv1 fold."""
+    return np.concatenate([up, tap], axis=0)   # [up_C+tap_C, H, W]
+
+
 def emit_conv(pfx, t, kh):  # t=(b,m,oz,lut,izp); kh for doc only
     P = pfx.upper(); b, m, oz, lut, izp = t
     L.append(i32(f"{pfx}_bias", b)); L.append(u32(f"{pfx}_mul", m))
@@ -194,16 +237,18 @@ def main():
 
     # ---- FPN top-down ----
     up1 = ups2x(sppf)                                   # [256,20,20]
-    cat1 = build_cat(up1, sp_s, sp_z, p4tap, p4_s, p4_z, 27)
+    cat1 = build_cat_raw(up1, p4tap)
     concat2_defs("yolo_nk_cat1", sp_z, sp_s, p4_z, p4_s, 27)
-    fm_sp, E12, fm_s, fm_z = c2f_neck(cat1, 27, [(28, 29)], 30)
+    fm_sp, E12, fm_s, fm_z = c2f_neck(cat1, 27, [(28, 29)], 30,
+                                      fold_in=(up1.shape[0], sp_s, sp_z, p4_s, p4_z))
     emit_c2f("yolo_nk_c12", E12)
     fpn_mid = to_chw(fm_sp, 20, 20)                     # [128,20,20]
 
     up2 = ups2x(fpn_mid)                                # [128,40,40]
-    cat2 = build_cat(up2, fm_s, fm_z, p3tap, p3_s, p3_z, 31)
+    cat2 = build_cat_raw(up2, p3tap)
     concat2_defs("yolo_nk_cat2", fm_z, fm_s, p3_z, p3_s, 31)
-    p3_sp, E15, p3o_s, p3o_z = c2f_neck(cat2, 31, [(32, 33)], 34)
+    p3_sp, E15, p3o_s, p3o_z = c2f_neck(cat2, 31, [(32, 33)], 34,
+                                        fold_in=(up2.shape[0], fm_s, fm_z, p3_s, p3_z))
     emit_c2f("yolo_nk_c15", E15)
     pan_p3 = to_chw(p3_sp, 40, 40)                      # [64,40,40] HEAD P3
 
@@ -211,18 +256,20 @@ def main():
     c35_sp, t35 = conv3x3(pan_p3, 35, 2)               # [400,64] -> 20x20
     emit_conv("yolo_nk_c35", t35, 3)
     c35 = to_chw(c35_sp, 20, 20)
-    cat3 = build_cat(c35, aq(35)[2], aq(35)[3], fpn_mid, fm_s, fm_z, 40)
+    cat3 = build_cat_raw(c35, fpn_mid)
     concat2_defs("yolo_nk_cat3", aq(35)[3], aq(35)[2], fm_z, fm_s, 40)
-    p4_sp, E18, p4o_s, p4o_z = c2f_neck(cat3, 40, [(43, 44)], 45)
+    p4_sp, E18, p4o_s, p4o_z = c2f_neck(cat3, 40, [(43, 44)], 45,
+                                        fold_in=(c35.shape[0], aq(35)[2], aq(35)[3], fm_s, fm_z))
     emit_c2f("yolo_nk_c18", E18)
     pan_p4 = to_chw(p4_sp, 20, 20)                      # [128,20,20] HEAD P4
 
     c46_sp, t46 = conv3x3(pan_p4, 46, 2)               # [100,128] -> 10x10
     emit_conv("yolo_nk_c46", t46, 3)
     c46 = to_chw(c46_sp, 10, 10)
-    cat4 = build_cat(c46, aq(46)[2], aq(46)[3], p5tap, p5_s, p5_z, 51)
+    cat4 = build_cat_raw(c46, p5tap)
     concat2_defs("yolo_nk_cat4", aq(46)[3], aq(46)[2], p5_z, p5_s, 51)
-    p5_sp, E21, p5o_s, p5o_z = c2f_neck(cat4, 51, [(54, 55)], 56)
+    p5_sp, E21, p5o_s, p5o_z = c2f_neck(cat4, 51, [(54, 55)], 56,
+                                        fold_in=(c46.shape[0], aq(46)[2], aq(46)[3], p5_s, p5_z))
     emit_c2f("yolo_nk_c21", E21)
     pan_p5 = p5_sp                                      # [100,256] HEAD P5
 

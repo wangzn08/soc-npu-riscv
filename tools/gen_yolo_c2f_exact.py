@@ -143,6 +143,32 @@ def main():
     df = np.abs(golden.astype(int) - cflat.astype(int))
     print(f"{blk} exact vs dump{cv2}: mism={int((df>0).sum())}/{golden.size} max={int(df.max())}")
 
+    # ---- DIAGNOSTIC (option A viability): fold the concat per-source requant into
+    # cv2's int8 weights (w2f = round(w2*alpha_c), zp folded into bias) so cv2 reads
+    # the RAW sources (s0,s1,add at their own scales) with NO concat-requant. Measure
+    # the extra INT8 rounding drift vs the current concat->cv2 path and vs the dump. ----
+    oc2 = CONVS[cv2]["oc"]
+    w2raw = np.fromfile(WDIR / f"conv{cv2}_w.bin", dtype=np.int8).reshape(oc2, cv2_ic, 1, 1)[:, :, 0, 0]
+    s2 = fwf(cv2, "s")[:oc2]; b2real = fwf(cv2, "b")[:oc2]
+    # per concat-channel source scale / zero-point
+    chan_sc = np.array([cv1_scale]*half + [cv1_scale]*half +
+                       sum([[gsc]*half for (_a, gsc, _gz) in adds], []), dtype=np.float64)
+    chan_zp = np.array([cv1_zp]*half + [cv1_zp]*half +
+                       sum([[gzp]*half for (_a, _gs, gzp) in adds], []), dtype=np.int64)
+    alpha = chan_sc / cat_s
+    w2f = np.clip(np.round(w2raw.astype(np.float64) * alpha[None, :]), -128, 127).astype(np.int8)
+    bias_fold = [int(round(float(b2real[o]) / (cat_s * float(s2[o])))
+                     - int(np.sum(w2f[o].astype(np.int64) * chan_zp))
+                     + (round((1 << (Q_SHIFT - 1)) / m2[o]) if m2[o] else 0)) for o in range(oc2)]
+    raw_concat = np.concatenate([s0f, s1f] + [a for (a, _gs, _gz) in adds], axis=1)  # (SP, cv2_ic) raw int8
+    raw_concat_c = raw_concat.reshape(H, W, cv2_ic).transpose(2, 0, 1)
+    golden_fold = conv_exact(raw_concat_c, w2f[:, :, None, None], bias_fold, m2,
+                             lut(c2o_s, c2o_z), 1, 1, 1, 0, 0, c2o_z)
+    dff_dump = np.abs(golden_fold.astype(int) - cflat.astype(int))
+    dff_cat = np.abs(golden_fold.astype(int) - golden.astype(int))
+    print(f"{blk} FOLD-A cv2 vs dump: mism={int((dff_dump>0).sum())}/{golden_fold.size} "
+          f"max={int(dff_dump.max())} | vs concat-path: mism={int((dff_cat>0).sum())} max={int(dff_cat.max())}")
+
     # ---- per-stage checksums (logical [channel][pos], matches firmware tile-major
     # read: word=tile*SP+pos, lane=ch&15, channel=tile*16+lane). Pure unsigned-byte
     # arithmetic so C (uint32 wrap) and python agree bit-for-bit. ----
@@ -199,18 +225,24 @@ def main():
               f"#define {P}_GLUE{bi}_ZP {gzp}", f"#define {P}_ADD{bi}_RATIO_MUL {rmul}u",
               f"#define {P}_ADD{bi}_PREV_ZP {pzp}",
               f"#define {P}_CAT_MUL_ADD{bi} {cat_muls[bi][0]}u", f"#define {P}_CAT_INZP_ADD{bi} {cat_muls[bi][1]}", ""]
-    # cv2
+    # cv2 — CONCAT FOLDED: per-source requant (alpha,zp) folded into cv2 int8 weights
+    # (w2f) + bias (bias_fold), so cv2 reads the RAW contiguous concat [s0|s1|add0..]
+    # at the sources' own scales -- the CPU cat_req loop is removed in the firmware.
     L += [f"#define {P}_CV2_WGT_WORDS {CONVS[cv2]['oc']*(cv2_ic//16)}u",
-          u32a(f"yolo_{blk}_cv2_wgt", pack1(w2)), i32(f"yolo_{blk}_cv2_bias", b2),
+          f"#define {P}_CV2_FOLDED 1",
+          u32a(f"yolo_{blk}_cv2_wgt", pack1(w2f[:, :, None, None])),
+          i32(f"yolo_{blk}_cv2_bias", bias_fold),
           u32(f"yolo_{blk}_cv2_mul", m2), u32(f"yolo_{blk}_cv2_shift", [Q_SHIFT]*len(m2)),
           u8(f"yolo_{blk}_cv2_lut", build_lut(c2o_s, c2o_z)), f"#define {P}_CV2_RQ_ZP {c2o_z}", ""]
+    # folded weights also written as a side .bin so the DDR weight blob can pick them up
+    (WDIR / f"conv{cv2}_w_folded.bin").write_bytes(w2f.astype(np.int8).tobytes())
     # per-stage checksums (for the intermediate-dump debug harness)
     for nm, (sv, hv) in cks:
         L += [f"#define {P}_CK_{nm}_SUM {sv}u", f"#define {P}_CK_{nm}_HASH {hv}u"]
     L += [""]
-    # golden
+    # golden — folded path (what the folded-cv2 firmware produces; bit-exact gate)
     L += [f"static const uint8_t yolo_{blk}_golden[{SP}][{CONVS[cv2]['oc']}] = {{"]
-    L += ["    {"+", ".join(f"0x{int(x)&0xFF:02X}u" for x in golden[p])+"}," for p in range(SP)]
+    L += ["    {"+", ".join(f"0x{int(x)&0xFF:02X}u" for x in golden_fold[p])+"}," for p in range(SP)]
     L += ["};", "#endif"]
     out = ROOT / "firmware" / f"yolo_{blk}_exact_data.h"
     out.write_text("\n".join(L) + "\n", encoding="ascii")

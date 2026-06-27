@@ -34,7 +34,11 @@ def main():
     for i, c in enumerate(convs):
         oc, ic, kh, kw = c["oc"], c["ic"], c["kh"], c["kw"]
         pic = ((ic + 15) // 16) * 16
-        w = np.fromfile(WDIR / f"conv{i}_w.bin", dtype=np.int8).reshape(oc, ic, kh, kw)
+        # Prefer a folded weight override if a C2f generator emitted one (concat
+        # per-source requant folded into this cv2's int8 weights). Same shape/order.
+        wfold = WDIR / f"conv{i}_w_folded.bin"
+        wsrc = wfold if wfold.exists() else (WDIR / f"conv{i}_w.bin")
+        w = np.fromfile(wsrc, dtype=np.int8).reshape(oc, ic, kh, kw)
         wp = np.zeros((oc, pic, kh, kw), dtype=np.int8)
         wp[:, 0:ic] = w
         off = len(words)
