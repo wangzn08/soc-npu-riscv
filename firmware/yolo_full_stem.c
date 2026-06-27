@@ -752,10 +752,10 @@ void usercode7(void)
     // ---- PAN: conv35(pan_p3 3x3 s2) + concat(fpn_mid) -> c2f_18 -> pan_p4 (20x20x128) ----
     yolo_set_pad_value(YOLO_NK_C35_PAD);
     yolo_load_silu_lut(yolo_nk_c35_lut); yolo_set_silu_requant(0u,0u,0);
-    if (errors==0u && !yolo_run_conv2d_tiled(NK_PANP3, WGT_OF(35), WGT_BASE, NK_C35, PAD_ROW,
+    if (errors==0u && !yolo_run_conv2d_tiled_desc(NK_PANP3, WGT_OF(35), WGT_BASE, NK_C35, PAD_ROW,
                                40u,40u, 64u,64u, 3u,3u, 2u,1u,
                                yolo_nk_c35_bias, yolo_nk_c35_mul, yolo_nk_c35_shift,
-                               NPU_CTRL_SILU_EXACT_EN, 4u*9u, 16u, YOLO_NK_C35_PAD)) { print_str("  conv35 fail\n"); errors++; }
+                               NPU_CTRL_SILU_EXACT_EN, 4u*9u, 16u, YOLO_NK_C35_PAD, 0u, 0u, 0)) { print_str("  conv35 fail\n"); errors++; }
     prof_mark("neck_conv35_s2");
     {
         const npu_desc_t descs[] = {
@@ -791,10 +791,10 @@ void usercode7(void)
     (void)NK_PSUM;
     yolo_set_pad_value(YOLO_NK_C46_PAD);
     yolo_load_silu_lut(yolo_nk_c46_lut); yolo_set_silu_requant(0u, 0u, 0);
-    if (errors==0u && !yolo_run_conv2d_tiled(NK_PANP4, WGT_OF(46), WGT_BASE, NK_C46, PAD_ROW,
+    if (errors==0u && !yolo_run_conv2d_tiled_desc(NK_PANP4, WGT_OF(46), WGT_BASE, NK_C46, PAD_ROW,
                                20u,20u, 128u,128u, 3u,3u, 2u,1u,
                                yolo_nk_c46_bias, yolo_nk_c46_mul, yolo_nk_c46_shift,
-                               NPU_CTRL_SILU_EXACT_EN, (128u/16u)*9u, 16u, YOLO_NK_C46_PAD)) { print_str("  conv46 fail\n"); errors++; }
+                               NPU_CTRL_SILU_EXACT_EN, (128u/16u)*9u, 16u, YOLO_NK_C46_PAD, 0u, 0u, 0)) { print_str("  conv46 fail\n"); errors++; }
     prof_mark("neck_conv46_s2_icstream");
     {
         const npu_desc_t descs[] = {
