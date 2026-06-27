@@ -123,8 +123,13 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
     // stride-1). silu_exact/pad live in ACTIVATION_CFG, not the conv flags.
     uint32_t conv_flags = NPU_CTRL_OC_SINGLE | NPU_CTRL_HW_PAD;
 
-    if (icg == 0u || in_w == 0u || in_h == 0u || out_c == 0u || out_c > 64u ||
+    if (icg == 0u || in_w == 0u || in_h == 0u || out_c == 0u ||
         kernel_h == 0u || kernel_w == 0u || stride == 0u || strip_out_rows == 0u)
+        return 0;
+    // All OC weights are preloaded resident in Wgt SRAM (16384 words). Layers
+    // whose weights exceed that (e.g. conv20 large-IC) need per-chunk reload or
+    // ic_stream -- not yet supported here.
+    if (out_c * wgt_words_per_oc > 16384u)
         return 0;
 
     if (strip_out_rows >= 16u && stride == 1u)
@@ -179,19 +184,27 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
             }
         }
 
-        // PADDED dims; pad_w horizontal HW pad, pad_h=0 (vertical rows DMA'd).
-        d_conv(&di, 0u, wgt_base, in_w + 2u * pad, strip_in_h, in_c, out_c,
-               kernel_h, kernel_w, stride, pad, 0u, conv_flags,
-               YOLO_QPARAM_DDR, out_c);
-
-        // Drain each 16-OC group of the strip into its slice of the full-height
-        // output tensor: OC group sg lives at Out base sg*so*out_w and lands at
-        // out_ddr + (sg*out_h + oy0)*out_w (tile-major over OC groups).
+        // OC chunks: one CONV2D start computes up to 64 OCs (4 groups), then the
+        // chunk's OC groups are drained before the next chunk overwrites Out SRAM.
         {
-            uint32_t sg, oc_groups = (out_c + 15u) / 16u;
-            for (sg = 0u; sg < oc_groups; sg++)
-                d_drain(&di, sg * so * out_w,
-                        out_ddr + (sg * out_h + oy0) * out_w * 16u, so * out_w);
+            uint32_t done = 0u;
+            while (done < out_c) {
+                uint32_t chunk = out_c - done;
+                uint32_t sg, cgroups;
+                if (chunk > 64u) chunk = 64u;
+                cgroups = (chunk + 15u) / 16u;
+                // PADDED dims; pad_w horizontal HW pad, pad_h=0 (rows DMA'd).
+                d_conv(&di, 0u, wgt_base + done * wgt_words_per_oc,
+                       in_w + 2u * pad, strip_in_h, in_c, chunk,
+                       kernel_h, kernel_w, stride, pad, 0u, conv_flags,
+                       YOLO_QPARAM_DDR + done * 16u, chunk);
+                for (sg = 0u; sg < cgroups; sg++) {
+                    uint32_t oc_grp = done / 16u + sg;
+                    d_drain(&di, sg * so * out_w,
+                            out_ddr + (oc_grp * out_h + oy0) * out_w * 16u, so * out_w);
+                }
+                done += chunk;
+            }
         }
         d_stop(&di);
 
