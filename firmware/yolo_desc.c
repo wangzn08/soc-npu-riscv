@@ -184,7 +184,15 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                kernel_h, kernel_w, stride, pad, 0u, conv_flags,
                YOLO_QPARAM_DDR, out_c);
 
-        d_drain(&di, 0u, out_ddr + oy0 * out_w * 16u, so * out_w);
+        // Drain each 16-OC group of the strip into its slice of the full-height
+        // output tensor: OC group sg lives at Out base sg*so*out_w and lands at
+        // out_ddr + (sg*out_h + oy0)*out_w (tile-major over OC groups).
+        {
+            uint32_t sg, oc_groups = (out_c + 15u) / 16u;
+            for (sg = 0u; sg < oc_groups; sg++)
+                d_drain(&di, sg * so * out_w,
+                        out_ddr + (sg * out_h + oy0) * out_w * 16u, so * out_w);
+        }
         d_stop(&di);
 
         if (!d_submit(di))
