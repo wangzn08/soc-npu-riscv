@@ -328,9 +328,9 @@ static int run_head_conv(uint32_t in, uint32_t wgt, uint32_t out, uint32_t inw, 
         return yolo_run_conv2d_ic_stream(in, wgt, WGT_BASE, out, HD_PSUM, PAD_ROW,
                    inw, inh, ic, oc, 3u, 3u, stride, pad, bias, mul, shift, lut, inzp);
     yolo_set_pad_value(inzp); yolo_load_silu_lut(lut); yolo_set_silu_requant(0u,0u,0);
-    return yolo_run_conv2d_tiled(in, wgt, WGT_BASE, out, PAD_ROW, inw, inh, ic, oc,
+    return yolo_run_conv2d_tiled_desc(in, wgt, WGT_BASE, out, PAD_ROW, inw, inh, ic, oc,
                kh, kh, stride, pad, bias, mul, shift, NPU_CTRL_SILU_EXACT_EN,
-               (ic/16u)*kh*kh, 16u, inzp);
+               (ic/16u)*kh*kh, 16u, inzp, 0u, 0u, 0);
 }
 /* expf approx (bare-metal, no libm): exp(x)=2^(x*log2e), poly for frac + float exp. */
 static float my_exp(float x)
