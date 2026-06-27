@@ -112,6 +112,21 @@ static void d_maxpool(uint32_t *idx, uint32_t src_act, uint32_t dst_act,
     d[9] = in_c & 0xFFFFu;
 }
 
+// Signed eltwise add over Act SRAM: dst = src0 + rescaled(src1). w[6] packs the
+// zp/ratio exactly like NPU_ELTWISE_ZP (NPU_ELT_PACK). len is raw words.
+static void d_eltwise(uint32_t *idx, uint32_t src0_act, uint32_t dst_act,
+                      uint32_t src1_act, uint32_t packed_zp, uint32_t words)
+{
+    volatile uint32_t *d = dword((*idx)++);
+    dclr(d);
+    dop(d, NPU_HW_DESC_OP_ELTWISE_ADD, 0u);
+    d[2] = src0_act;
+    d[4] = dst_act;
+    d[5] = src1_act;
+    d[6] = packed_zp;
+    d[7] = words;
+}
+
 static void d_conv(uint32_t *idx, uint32_t act, uint32_t wgt_base,
                    uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
                    uint32_t kh, uint32_t kw, uint32_t stride,
@@ -308,6 +323,37 @@ int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
     d_dma_in(&di, src_ddr, scratch_act_base, words);
     d_maxpool(&di, scratch_act_base, dst_act, in_w, in_h, ic_groups * 16u);
     d_dma_out_act(&di, dst_act, dst_ddr, words);
+    d_stop(&di);
+    return d_submit(di);
+}
+
+// Signed eltwise residual add (DDR->DDR) as one descriptor program. Mirrors
+// yolo_run_eltwise_add_ddr (yolo_ops.c): chunk so src0/src1/dst all fit Act SRAM,
+// and for each chunk chain DMA-in(src0) + DMA-in(src1) + ELTWISE + DMA-out.
+int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
+                              uint32_t dst_ddr, uint32_t scratch_act_base,
+                              uint32_t words, int32_t zp, uint32_t ratio_en,
+                              uint32_t ratio_mul, uint32_t ratio_shift)
+{
+    uint32_t done = 0u, di = 0u;
+    const uint32_t max_chunk = 4096u;
+    uint32_t packed = NPU_ELT_PACK((uint32_t)zp, ratio_en, ratio_shift, ratio_mul);
+
+    if (words == 0u)
+        return 1;
+
+    while (done < words) {
+        uint32_t chunk = words - done;
+        uint32_t src1_act, dst_act;
+        if (chunk > max_chunk) chunk = max_chunk;
+        src1_act = scratch_act_base + chunk;
+        dst_act  = src1_act + chunk;
+        d_dma_in(&di, src0_ddr + done * 16u, scratch_act_base, chunk);
+        d_dma_in(&di, src1_ddr + done * 16u, src1_act, chunk);
+        d_eltwise(&di, scratch_act_base, dst_act, src1_act, packed, chunk);
+        d_dma_out_act(&di, dst_act, dst_ddr + done * 16u, chunk);
+        done += chunk;
+    }
     d_stop(&di);
     return d_submit(di);
 }

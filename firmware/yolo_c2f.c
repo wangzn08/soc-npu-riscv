@@ -232,10 +232,16 @@ static int c2f_impl(const yolo_c2f_cfg_t *cfg, int use_desc)
         // engine in chunks so large early C2f tensors do not require more SRAM.
         uint32_t add_dst = add_slot(cfg, i, full_groups, half_groups, sp);
         if (cfg->shortcut) {
-            if (!yolo_run_eltwise_add_ddr(prev_ddr, cfg->mcv2_ddr, add_dst,
-                                          C2F_ELTWISE_ACT, half_groups * sp,
-                                          cfg->add_prev_zp[i], 1u,
-                                          cfg->add_ratio_mul[i], cfg->add_ratio_shift))
+            int ok = use_desc
+                ? yolo_run_eltwise_add_desc(prev_ddr, cfg->mcv2_ddr, add_dst,
+                                            C2F_ELTWISE_ACT, half_groups * sp,
+                                            cfg->add_prev_zp[i], 1u,
+                                            cfg->add_ratio_mul[i], cfg->add_ratio_shift)
+                : yolo_run_eltwise_add_ddr(prev_ddr, cfg->mcv2_ddr, add_dst,
+                                           C2F_ELTWISE_ACT, half_groups * sp,
+                                           cfg->add_prev_zp[i], 1u,
+                                           cfg->add_ratio_mul[i], cfg->add_ratio_shift);
+            if (!ok)
                 return 0;
         } else {
             for (g = 0u; g < half_groups; g++)

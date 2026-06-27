@@ -40,4 +40,11 @@ int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
                              uint32_t scratch_act_base, uint32_t in_w,
                              uint32_t in_h, uint32_t ic_groups);
 
+// Signed eltwise residual add (DDR->DDR) via one descriptor program. Same args
+// and result as yolo_run_eltwise_add_ddr (yolo_ops.c).
+int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
+                              uint32_t dst_ddr, uint32_t scratch_act_base,
+                              uint32_t words, int32_t zp, uint32_t ratio_en,
+                              uint32_t ratio_mul, uint32_t ratio_shift);
+
 #endif
