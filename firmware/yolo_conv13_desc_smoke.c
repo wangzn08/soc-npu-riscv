@@ -39,7 +39,7 @@ void usercode7(void)
                                     yolo_conv13e_bias_q, yolo_conv13e_scale_mul,
                                     yolo_conv13e_scale_shift,
                                     NPU_CTRL_SILU_EXACT_EN, C13E_WGT_PER_OC, 16u,
-                                    C13E_PAD_VALUE)) {
+                                    C13E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  desc tiled run failed\n"); errors++;
     }
 

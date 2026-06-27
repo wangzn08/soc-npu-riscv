@@ -12,11 +12,13 @@
 #define YOLO_DESC_DDR    0x40000000u
 #define YOLO_QPARAM_DDR  0x40080000u
 
-// Strip-tiled exact-SiLU conv driven entirely by the descriptor queue. Same
-// arguments as yolo_run_conv2d_tiled (yolo_ops.c). The exact-SiLU LUT must be
-// CPU-preloaded (yolo_load_silu_lut) before the call; it persists in the NPU.
-// out_c must be <= 64 (single OC chunk); weights are DMA'd to Wgt SRAM once.
-// Returns 1 on success, 0 on a descriptor error/timeout.
+// Strip-tiled conv driven entirely by the descriptor queue. Same arguments as
+// yolo_run_conv2d_tiled (yolo_ops.c) plus the SiLU requant config. The SiLU
+// mode is taken from ctrl_flags (SILU_EXACT_EN, or SILU_EN + SILU_REQUANT_EN);
+// for exact-SiLU the LUT must be CPU-preloaded (yolo_load_silu_lut) and the
+// requant args are 0. Handles 3x3 (HW pad + DMA'd vertical halo) and 1x1 PW
+// (kh=kw=1, pad=0), OC chunking, and per-chunk weight reload when the layer's
+// weights exceed Wgt SRAM. Returns 1 on success, 0 on descriptor error/timeout.
 int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                                uint32_t wgt_base, uint32_t out_ddr,
                                uint32_t pad_row_ddr,
@@ -27,6 +29,9 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                                const int32_t *bias, const uint32_t *scale_mul,
                                const uint32_t *scale_shift, uint32_t ctrl_flags,
                                uint32_t wgt_words_per_oc, uint32_t strip_out_rows,
-                               int32_t pad_value);
+                               int32_t pad_value,
+                               uint32_t silu_requant_mul,
+                               uint32_t silu_requant_shift,
+                               int32_t silu_requant_zp);
 
 #endif

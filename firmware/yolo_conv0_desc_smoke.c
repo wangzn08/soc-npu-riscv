@@ -41,7 +41,8 @@ void usercode7(void)
                                     yolo_conv0_320e_bias_q, yolo_conv0_320e_scale_mul,
                                     yolo_conv0_320e_scale_shift,
                                     NPU_CTRL_SILU_EXACT_EN,
-                                    C0E_WGT_PER_OC, STRIP_OUT_ROWS, C0E_PAD_VALUE)) {
+                                    C0E_WGT_PER_OC, STRIP_OUT_ROWS, C0E_PAD_VALUE,
+                                    0u, 0u, 0)) {
         print_str("  desc tiled run failed\n"); errors++;
     }
 

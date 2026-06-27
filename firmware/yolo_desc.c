@@ -19,14 +19,17 @@ static void dclr(volatile uint32_t *d)
 static void dop(volatile uint32_t *d, uint32_t op, uint32_t flags)
 { d[0]=(op&0xFFu)|((NPU_HW_DESC_VERSION&0xFFu)<<8)|((flags&0xFFFFu)<<16); d[1]=flags>>16; }
 
-static void d_act_cfg(uint32_t *idx, int32_t pad_value, uint32_t silu_exact)
+// flags: bit0 silu_exact_en, bit1 silu_en, bit2 silu_requant_en.
+static void d_act_cfg(uint32_t *idx, int32_t pad_value, uint32_t flags,
+                      uint32_t rq_mul, uint32_t rq_shift, int32_t rq_zp)
 {
     volatile uint32_t *d = dword((*idx)++);
     dclr(d);
     dop(d, NPU_HW_DESC_OP_ACTIVATION_CFG, 0u);
     d[2] = (uint32_t)pad_value & 0xFFu;
-    d[3] = 0u;                          // requant 0 (exact mode bakes it into LUT)
-    d[4] = silu_exact ? 0x1u : 0u;      // flags: silu_exact_en
+    d[3] = (rq_mul & 0xFFFFu) | ((rq_shift & 0x3Fu) << 8) |
+           (((uint32_t)rq_zp & 0xFFu) << 24);   // packed like NPU_SILU_REQUANT_CFG
+    d[4] = flags & 0x7u;
     d[5] = 0u;                          // clip_max -> default 127
 }
 
@@ -130,14 +133,23 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                                const int32_t *bias, const uint32_t *scale_mul,
                                const uint32_t *scale_shift, uint32_t ctrl_flags,
                                uint32_t wgt_words_per_oc, uint32_t strip_out_rows,
-                               int32_t pad_value)
+                               int32_t pad_value,
+                               uint32_t silu_requant_mul,
+                               uint32_t silu_requant_shift,
+                               int32_t silu_requant_zp)
 {
     uint32_t icg = in_c / 16u;
     uint32_t out_w, out_h, oy0;
-    uint32_t silu_exact = (ctrl_flags & NPU_CTRL_SILU_EXACT_EN) ? 1u : 0u;
-    // CONV2D descriptor flags: HW pad + single-start OC loop (+ row_par for
-    // stride-1). silu_exact/pad live in ACTIVATION_CFG, not the conv flags.
-    uint32_t conv_flags = NPU_CTRL_OC_SINGLE | NPU_CTRL_HW_PAD;
+    // Activation flags forwarded to ACTIVATION_CFG (silu_exact / silu_en+requant).
+    uint32_t act_flags = ((ctrl_flags & NPU_CTRL_SILU_EXACT_EN) ? 0x1u : 0u) |
+                         ((ctrl_flags & NPU_CTRL_SILU_EN) ? 0x2u : 0u) |
+                         ((ctrl_flags & NPU_CTRL_SILU_REQUANT_EN) ? 0x4u : 0u);
+    // CONV2D descriptor flags: single-start OC loop. 1x1 uses the pointwise
+    // engine (CTRL[14], reads pixels directly, no im2col/halo); 3x3 uses the
+    // HW-pad im2col path. row_par only for stride-1 3x3 (not 1x1, not stride2).
+    uint32_t is_pw = (kernel_h == 1u && kernel_w == 1u);
+    uint32_t conv_flags = NPU_CTRL_OC_SINGLE |
+                          (is_pw ? NPU_CTRL_PW_EN : NPU_CTRL_HW_PAD);
 
     // Weights fit Wgt SRAM (16384 words)? If so preload all OCs once (resident,
     // conv reads chunk c at base done*wgt_words_per_oc). Otherwise reload each
@@ -148,7 +160,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         kernel_h == 0u || kernel_w == 0u || stride == 0u || strip_out_rows == 0u)
         return 0;
 
-    if (strip_out_rows >= 16u && stride == 1u)
+    if (strip_out_rows >= 16u && stride == 1u && kernel_h > 1u)
         conv_flags |= NPU_CTRL_ROW_PAR;
 
     out_w = (in_w + 2u * pad - kernel_w) / stride + 1u;
@@ -189,7 +201,8 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         strip_in_h = (so - 1u) * stride + kernel_h;  /* pad_h=0 */
         ir0 = (int32_t)(oy0 * stride) - (int32_t)pad;
 
-        d_act_cfg(&di, pad_value, silu_exact);
+        d_act_cfg(&di, pad_value, act_flags, silu_requant_mul,
+                  silu_requant_shift, silu_requant_zp);
 
         for (g = 0u; g < icg; g++) {
             for (ri = 0u; ri < strip_in_h; ri++) {
