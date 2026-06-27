@@ -622,9 +622,9 @@ void usercode7(void)
     prof_mark("s9_sppf_conv25");
     if (errors == 0u) {
         uint32_t g25 = SPPFE_C25_OC / 16u;
-        if (!yolo_run_maxpool5x5(S_CV1, S_M0, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool0 fail\n"); errors++; }
-        if (errors == 0u && !yolo_run_maxpool5x5(S_M0, S_M1, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool1 fail\n"); errors++; }
-        if (errors == 0u && !yolo_run_maxpool5x5(S_M1, S_M2, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool2 fail\n"); errors++; }
+        if (!yolo_run_maxpool5x5_desc(S_CV1, S_M0, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool0 fail\n"); errors++; }
+        if (errors == 0u && !yolo_run_maxpool5x5_desc(S_M0, S_M1, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool1 fail\n"); errors++; }
+        if (errors == 0u && !yolo_run_maxpool5x5_desc(S_M1, S_M2, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool2 fail\n"); errors++; }
         concat4(S_CV1, S_M0, S_M1, S_M2, S_CAT, g25, SPPFE_SPATIAL);
     }
     prof_mark("s9_sppf_maxpool_concat_CPU");

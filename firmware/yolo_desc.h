@@ -34,4 +34,10 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                                uint32_t silu_requant_shift,
                                int32_t silu_requant_zp);
 
+// 5x5 stride-1 signed maxpool (DDR->DDR) via one descriptor program (DMA-in +
+// HW maxpool + DMA-out). Same args/result as yolo_run_maxpool5x5 (yolo_ops.c).
+int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
+                             uint32_t scratch_act_base, uint32_t in_w,
+                             uint32_t in_h, uint32_t ic_groups);
+
 #endif

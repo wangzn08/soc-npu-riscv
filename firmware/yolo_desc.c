@@ -81,6 +81,37 @@ static void d_drain(uint32_t *idx, uint32_t out_base, uint32_t dst_ddr, uint32_t
     }
 }
 
+// Act SRAM -> DDR drain (OP_DMA_ACT_TO_DDR), used by the maxpool/eltwise programs
+// whose result lands in Act SRAM (not Out SRAM).
+static void d_dma_out_act(uint32_t *idx, uint32_t act_base, uint32_t dst_ddr, uint32_t words)
+{
+    uint32_t off = 0u;
+    while (off < words) {
+        uint32_t ch = words - off;
+        volatile uint32_t *d;
+        if (ch > DMA_WR_MAX) ch = DMA_WR_MAX;
+        d = dword((*idx)++); dclr(d);
+        dop(d, NPU_HW_DESC_OP_DMA_ACT_TO_DDR, 0u);
+        d[2] = act_base + off;
+        d[4] = dst_ddr + off * 16u;
+        d[7] = ch;
+        off += ch;
+    }
+}
+
+// 5x5 stride-1 signed maxpool over Act SRAM (in_c = channels = ic_groups*16).
+static void d_maxpool(uint32_t *idx, uint32_t src_act, uint32_t dst_act,
+                      uint32_t in_w, uint32_t in_h, uint32_t in_c)
+{
+    volatile uint32_t *d = dword((*idx)++);
+    dclr(d);
+    dop(d, NPU_HW_DESC_OP_MAXPOOL5X5, 0u);
+    d[2] = src_act;
+    d[4] = dst_act;
+    d[8] = (in_h << 16) | in_w;
+    d[9] = in_c & 0xFFFFu;
+}
+
 static void d_conv(uint32_t *idx, uint32_t act, uint32_t wgt_base,
                    uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
                    uint32_t kh, uint32_t kw, uint32_t stride,
@@ -258,4 +289,25 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
             return 0;
     }
     return 1;
+}
+
+// 5x5 maxpool (DDR->DDR) as a single descriptor program: DMA src into Act SRAM,
+// run the HW 5x5 maxpool (Act->Act), drain the result back to DDR. Mirrors
+// yolo_run_maxpool5x5 (yolo_ops.c) but chains the three ops in one submit.
+int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
+                             uint32_t scratch_act_base, uint32_t in_w,
+                             uint32_t in_h, uint32_t ic_groups)
+{
+    uint32_t words = in_w * in_h * ic_groups;
+    uint32_t dst_act = scratch_act_base + words;
+    uint32_t di = 0u;
+
+    if (in_w == 0u || in_h == 0u || ic_groups == 0u)
+        return 1;
+
+    d_dma_in(&di, src_ddr, scratch_act_base, words);
+    d_maxpool(&di, scratch_act_base, dst_act, in_w, in_h, ic_groups * 16u);
+    d_dma_out_act(&di, dst_act, dst_ddr, words);
+    d_stop(&di);
+    return d_submit(di);
 }
