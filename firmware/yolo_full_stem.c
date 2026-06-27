@@ -897,6 +897,7 @@ void usercode7(void)
         }
         print_str("  head dets="); print_dec(nd); print_str(" golden-matched="); print_dec(matched); print_str("/4\n");
         prof_mark("decode_dfl_sigmoid_nms_CPU");
+        yolo_desc_prof_print();
         if (errors==0u && matched>=4u) { print_str("YOLO FULL NET PASS (4 boxes match C oracle)\n"); return; }
         print_str("YOLO FULL NET: only "); print_dec(matched); print_str("/4 boxes matched\n");
     }

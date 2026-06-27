@@ -11,6 +11,27 @@
 static inline void d_npu_wr(uint32_t a, uint32_t d){ *(volatile uint32_t*)a = d; }
 static inline uint32_t d_npu_rd(uint32_t a){ return *(volatile uint32_t*)a; }
 
+// ---- Phase-0 probe: split conv-desc time into CPU descriptor BUILD vs engine
+// RUN (submit+DMA+wait). Free-running NPU_PERF_CYC_TOTAL; diffs only. ----
+static uint32_t g_desc_build = 0u;   // CPU building records + qparam + pad row
+static uint32_t g_desc_run   = 0u;   // d_submit (engine: submit + DMA + wait)
+static uint32_t g_desc_wgt   = 0u;   // preload weight DMA (real transfer)
+static uint32_t g_desc_recs  = 0u;   // total descriptor records summed over all submits
+static uint32_t g_desc_calls = 0u;   // number of layer submits (for resident region sizing)
+static uint32_t g_desc_maxrec = 0u;  // largest single program (records) -> peak region
+static inline uint32_t d_cyc(void){ return *(volatile uint32_t *)NPU_PERF_CYC_TOTAL; }
+void yolo_desc_prof_print(void)
+{
+    print_str("[DESCPROF] build="); print_dec(g_desc_build);
+    print_str(" run(submit+dma+wait)="); print_dec(g_desc_run);
+    print_str(" wgt_preload="); print_dec(g_desc_wgt); print_str("\n");
+    print_str("[DESCSIZE] total_records="); print_dec(g_desc_recs);
+    print_str(" submits="); print_dec(g_desc_calls);
+    print_str(" max_prog_records="); print_dec(g_desc_maxrec);
+    print_str(" total_words="); print_dec(g_desc_recs * NPU_HW_DESC_WORDS);
+    print_str(" (bytes="); print_dec(g_desc_recs * NPU_HW_DESC_WORDS * 4u); print_str(")\n");
+}
+
 // ---- descriptor record builders (write 16-word records into YOLO_DESC_DDR) ----
 static volatile uint32_t *dword(uint32_t idx)
 { return (volatile uint32_t *)(YOLO_DESC_DDR + idx * NPU_HW_DESC_WORDS * 4u); }
@@ -221,21 +242,27 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
 
     // One pad row in DDR (in_w words, every lane = pad_value) for vertical halo.
     {
+        uint32_t _t = d_cyc();
         uint32_t lane = (uint32_t)pad_value & 0xFFu;
         uint32_t word = lane | (lane << 8) | (lane << 16) | (lane << 24);
         volatile uint32_t *p = (volatile uint32_t *)pad_row_ddr;
         uint32_t i;
         for (i = 0u; i < in_w * 4u; i++) p[i] = word;
+        g_desc_build += d_cyc() - _t;
     }
 
     // Weights resident in Wgt SRAM when they fit; else loaded per chunk below.
     if (preload_all) {
-        if (!yolo_dma_ddr_to_wgt(wgt_all_ddr, wgt_base, out_c * wgt_words_per_oc))
+        uint32_t _t = d_cyc();
+        int ok = yolo_dma_ddr_to_wgt(wgt_all_ddr, wgt_base, out_c * wgt_words_per_oc);
+        g_desc_wgt += d_cyc() - _t;
+        if (!ok)
             return 0;
     }
 
     // Resident qparam table for the out_c OCs.
     {
+        uint32_t _t = d_cyc();
         volatile uint32_t *q = (volatile uint32_t *)YOLO_QPARAM_DDR;
         uint32_t oc;
         for (oc = 0u; oc < out_c; oc++) {
@@ -244,6 +271,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
             q[oc*4+2] = 0u;
             q[oc*4+3] = scale_shift[oc];
         }
+        g_desc_build += d_cyc() - _t;
     }
 
     for (oy0 = 0u; oy0 < out_h; oy0 += strip_out_rows) {
@@ -251,6 +279,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         uint32_t strip_in_h, g, ri, di = 0u;
         int32_t ir0;
         if (so > strip_out_rows) so = strip_out_rows;
+        uint32_t _tb = d_cyc();
         strip_in_h = (so - 1u) * stride + kernel_h;  /* pad_h=0 */
         ir0 = (int32_t)(oy0 * stride) - (int32_t)pad;
 
@@ -299,9 +328,18 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
             }
         }
         d_stop(&di);
+        g_desc_build += d_cyc() - _tb;
 
-        if (!d_submit(di))
-            return 0;
+        g_desc_recs += di;
+        g_desc_calls += 1u;
+        if (di > g_desc_maxrec) g_desc_maxrec = di;
+        {
+            uint32_t _tr = d_cyc();
+            int ok = d_submit(di);
+            g_desc_run += d_cyc() - _tr;
+            if (!ok)
+                return 0;
+        }
     }
     return 1;
 }

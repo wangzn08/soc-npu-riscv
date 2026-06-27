@@ -47,4 +47,7 @@ int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
                               uint32_t words, int32_t zp, uint32_t ratio_en,
                               uint32_t ratio_mul, uint32_t ratio_shift);
 
+// Phase-0 probe: print accumulated conv-desc CPU-build vs engine-run cycles.
+void yolo_desc_prof_print(void);
+
 #endif
