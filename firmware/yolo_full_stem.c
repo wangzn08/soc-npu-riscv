@@ -324,9 +324,9 @@ static int run_head_conv(uint32_t in, uint32_t wgt, uint32_t out, uint32_t inw, 
                          const int32_t *bias, const uint32_t *mul, const uint32_t *shift,
                          const uint8_t *lut, int32_t inzp)
 {
-    if (kh == 3u && (ic/16u) > YOLO_ICG_BUF)
-        return yolo_run_conv2d_ic_stream(in, wgt, WGT_BASE, out, HD_PSUM, PAD_ROW,
-                   inw, inh, ic, oc, 3u, 3u, stride, pad, bias, mul, shift, lut, inzp);
+    /* All head ICs are <=256 (icg16), within im2col ICG_MAX=16, so the desc-tiled
+     * path covers what previously needed CPU INT32-psum ic_stream (icg>8 3x3). */
+    (void)HD_PSUM;
     yolo_set_pad_value(inzp); yolo_load_silu_lut(lut); yolo_set_silu_requant(0u,0u,0);
     return yolo_run_conv2d_tiled_desc(in, wgt, WGT_BASE, out, PAD_ROW, inw, inh, ic, oc,
                kh, kh, stride, pad, bias, mul, shift, NPU_CTRL_SILU_EXACT_EN,
