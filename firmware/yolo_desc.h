@@ -50,4 +50,14 @@ int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
 // Phase-0 probe: print accumulated conv-desc CPU-build vs engine-run cycles.
 void yolo_desc_prof_print(void);
 
+// ---- Pre-compiled descriptor image (A2 record/replay). Word idx =
+// (cpu_addr - 0x40000000) / 16. Regions audited collision-free (see plan). ----
+#define DESC_IMAGE_BASE    0x40000000u   // descriptor records blob (cap 1MB)
+#define DESC_QPARAM_BASE   0x40200000u   // per-layer qparam blob   (cap 256KB)
+#define DESC_CATALOG_BASE  0x40280000u   // catalog: N x {off,count}
+#define DESC_CATALOG_MAX   256u
+
+// Reset the record/replay program cursor + bump allocators at net start.
+void yolo_desc_reset(void);
+
 #endif

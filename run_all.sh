@@ -121,6 +121,11 @@ compile_fw() {
         # shellcheck disable=SC2206
         CFLAGS+=(${EXTRA_CFLAGS})
     fi
+    # DESC_RECORD builds the generator firmware (records into resident DDR slots).
+    # Replay (descriptor image preloaded) is the default firmware path.
+    if [ -n "${DESC_RECORD:-}" ]; then
+        CFLAGS+=(-DDESC_RECORD)
+    fi
     ASFLAGS=(-mabi=ilp32 -march="$ISA")
     # Windows 原生 GCC 链接器需要 Windows 路径格式
     FW_LINKSCRIPT_WIN=$(cygpath -w "$FW_LINKSCRIPT" 2>/dev/null || echo "$FW_LINKSCRIPT")
@@ -200,6 +205,15 @@ compile_rtl() {
     if [ -n "${YOLO_DDR:-}" ] || [ -f "$ROOT_DIR/.yolo_ddr" ]; then
         VLOG_DEFS="+define+YOLO_DDR"
         info "YOLO_DDR 预载启用 (+define+YOLO_DDR)"
+    fi
+    # Pre-compiled descriptor image: DESC_RECORD dumps the image, DESC_REPLAY loads it.
+    if [ -n "${DESC_RECORD:-}" ]; then
+        VLOG_DEFS="$VLOG_DEFS +define+DESC_RECORD"
+        info "描述符录制启用 (+define+DESC_RECORD)"
+    fi
+    if [ -n "${DESC_REPLAY:-}" ]; then
+        VLOG_DEFS="$VLOG_DEFS +define+DESC_REPLAY"
+        info "描述符回放启用 (+define+DESC_REPLAY)"
     fi
     vlog -sv -timescale 1ns/1ps $VLOG_DEFS -f "$FILELIST" -work "$SIM_DIR/work"
 

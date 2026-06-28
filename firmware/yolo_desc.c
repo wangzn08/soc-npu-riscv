@@ -32,9 +32,69 @@ void yolo_desc_prof_print(void)
     print_str(" (bytes="); print_dec(g_desc_recs * NPU_HW_DESC_WORDS * 4u); print_str(")\n");
 }
 
-// ---- descriptor record builders (write 16-word records into YOLO_DESC_DDR) ----
+// ---- Pre-compiled descriptor image: record (build into resident slots + catalog)
+// vs replay (submit pre-loaded programs by call order). ----
+typedef struct { uint32_t off_words; uint32_t count; } desc_cat_t;
+static volatile desc_cat_t *const g_catalog =
+    (volatile desc_cat_t *)DESC_CATALOG_BASE;
+static uint32_t g_prog_idx  = 0u;            // call-order cursor
+static uint32_t g_img_top   = 0u;            // descriptor-image bump (words), record
+static uint32_t g_qp_top    = 0u;            // qparam bump (words), record
+static uint32_t g_prog_base = YOLO_DESC_DDR; // current program's DDR byte base
+
+void yolo_desc_reset(void)
+{ g_prog_idx = 0u; g_img_top = 0u; g_qp_top = 0u; g_prog_base = YOLO_DESC_DDR; }
+
+// Point the record builders at this program's slot (record) or the throwaway
+// scratch (replay rebuilds nothing the engine uses).
+static void desc_prog_begin(void)
+{
+#ifdef DESC_RECORD
+    g_prog_base = DESC_IMAGE_BASE + g_img_top * NPU_HW_DESC_WORDS * 4u;
+#else
+    g_prog_base = YOLO_DESC_DDR;
+#endif
+}
+
+// Record: append {slot offset, di} to the catalog, submit, bump. Replay: ignore
+// the just-built records, submit the pre-loaded program at catalog[g_prog_idx].
+static int desc_submit_cataloged(uint32_t di)
+{
+    g_desc_recs += di; g_desc_calls += 1u;
+    if (di > g_desc_maxrec) g_desc_maxrec = di;
+#ifdef DESC_RECORD
+    g_catalog[g_prog_idx].off_words = (g_prog_base - DESC_IMAGE_BASE) / 4u;
+    g_catalog[g_prog_idx].count = di;
+    g_prog_idx++; g_img_top += di * NPU_HW_DESC_WORDS;
+    { int ok = d_submit(di); g_prog_base += di * NPU_HW_DESC_WORDS * 4u; return ok; }
+#else
+    {
+        desc_cat_t c;
+        int t;
+        c.off_words = g_catalog[g_prog_idx].off_words;
+        c.count     = g_catalog[g_prog_idx].count;
+        g_prog_idx++; (void)di;
+        d_npu_wr(NPU_DESC_BASE_LO, DESC_IMAGE_BASE + c.off_words * 4u);
+        d_npu_wr(NPU_DESC_BASE_HI, 0u);
+        d_npu_wr(NPU_DESC_COUNT, c.count);
+        d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
+        d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_START);
+        t = 8000000;
+        while (t-- > 0) {
+            uint32_t st = d_npu_rd(NPU_DESC_STATUS);
+            if (st & NPU_DESC_STATUS_ERR) return 0;
+            if (st & NPU_DESC_STATUS_DONE) break;
+        }
+        if (t <= 0) return 0;
+        d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
+        return 1;
+    }
+#endif
+}
+
+// ---- descriptor record builders (write 16-word records into g_prog_base) ----
 static volatile uint32_t *dword(uint32_t idx)
-{ return (volatile uint32_t *)(YOLO_DESC_DDR + idx * NPU_HW_DESC_WORDS * 4u); }
+{ return (volatile uint32_t *)(g_prog_base + idx * NPU_HW_DESC_WORDS * 4u); }
 static void dclr(volatile uint32_t *d)
 { uint32_t i; for (i=0u;i<NPU_HW_DESC_WORDS;i++) d[i]=0u; }
 static void dop(volatile uint32_t *d, uint32_t op, uint32_t flags)
@@ -171,6 +231,7 @@ static void d_conv(uint32_t *idx, uint32_t act, uint32_t wgt_base,
 static void d_stop(uint32_t *idx)
 { volatile uint32_t *d = dword((*idx)++); dclr(d); dop(d, NPU_HW_DESC_OP_STOP_IRQ, 0u); }
 
+static int d_submit(uint32_t count) __attribute__((unused));
 static int d_submit(uint32_t count)
 {
     int t;
@@ -260,10 +321,16 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
             return 0;
     }
 
-    // Resident qparam table for the out_c OCs.
+    // Resident qparam table for the out_c OCs. Record: per-layer slot in the
+    // qparam image (replay reads it pre-loaded, so no CPU write). Replay: the
+    // pre-loaded records already point at the baked qparam addresses.
+    uint32_t qbase_ddr = YOLO_QPARAM_DDR;
+#ifdef DESC_RECORD
+    qbase_ddr = DESC_QPARAM_BASE + g_qp_top * 4u;
+    g_qp_top += out_c * 4u;
     {
         uint32_t _t = d_cyc();
-        volatile uint32_t *q = (volatile uint32_t *)YOLO_QPARAM_DDR;
+        volatile uint32_t *q = (volatile uint32_t *)qbase_ddr;
         uint32_t oc;
         for (oc = 0u; oc < out_c; oc++) {
             q[oc*4+0] = (uint32_t)(bias ? bias[oc] : 0);
@@ -273,6 +340,9 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         }
         g_desc_build += d_cyc() - _t;
     }
+#else
+    (void)bias; (void)scale_mul; (void)scale_shift;  /* qparams pre-loaded in DDR */
+#endif
 
     for (oy0 = 0u; oy0 < out_h; oy0 += strip_out_rows) {
         uint32_t so = out_h - oy0;
@@ -283,6 +353,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         strip_in_h = (so - 1u) * stride + kernel_h;  /* pad_h=0 */
         ir0 = (int32_t)(oy0 * stride) - (int32_t)pad;
 
+        desc_prog_begin();
         d_act_cfg(&di, pad_value, act_flags, silu_requant_mul,
                   silu_requant_shift, silu_requant_zp);
 
@@ -318,7 +389,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                 d_conv(&di, 0u, cwgt,
                        in_w + 2u * pad, strip_in_h, in_c, chunk,
                        kernel_h, kernel_w, stride, pad, 0u, conv_flags,
-                       YOLO_QPARAM_DDR + done * 16u, chunk);
+                       qbase_ddr + done * 16u, chunk);
                 for (sg = 0u; sg < cgroups; sg++) {
                     uint32_t oc_grp = done / 16u + sg;
                     d_drain(&di, sg * so * out_w,
@@ -330,12 +401,9 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         d_stop(&di);
         g_desc_build += d_cyc() - _tb;
 
-        g_desc_recs += di;
-        g_desc_calls += 1u;
-        if (di > g_desc_maxrec) g_desc_maxrec = di;
         {
             uint32_t _tr = d_cyc();
-            int ok = d_submit(di);
+            int ok = desc_submit_cataloged(di);
             g_desc_run += d_cyc() - _tr;
             if (!ok)
                 return 0;
@@ -358,11 +426,12 @@ int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
     if (in_w == 0u || in_h == 0u || ic_groups == 0u)
         return 1;
 
+    desc_prog_begin();
     d_dma_in(&di, src_ddr, scratch_act_base, words);
     d_maxpool(&di, scratch_act_base, dst_act, in_w, in_h, ic_groups * 16u);
     d_dma_out_act(&di, dst_act, dst_ddr, words);
     d_stop(&di);
-    return d_submit(di);
+    return desc_submit_cataloged(di);
 }
 
 // Signed eltwise residual add (DDR->DDR) as one descriptor program. Mirrors
@@ -380,6 +449,7 @@ int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
     if (words == 0u)
         return 1;
 
+    desc_prog_begin();
     while (done < words) {
         uint32_t chunk = words - done;
         uint32_t src1_act, dst_act;
@@ -393,5 +463,5 @@ int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
         done += chunk;
     }
     d_stop(&di);
-    return d_submit(di);
+    return desc_submit_cataloged(di);
 }

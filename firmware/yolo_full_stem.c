@@ -379,6 +379,7 @@ void usercode7(void)
     (void)yolo_sppf_e_golden; (void)yolo_nk_pan_p3_golden;
     (void)yolo_nk_pan_p4_golden; (void)yolo_nk_pan_p5_golden;
     prof_reset();
+    yolo_desc_reset();
 
     // ---------- Stage 0: conv0 (preloaded image, weights from DDR blob) -> C0_OUT ----------
     yolo_set_pad_value(C0E_PAD_VALUE);
