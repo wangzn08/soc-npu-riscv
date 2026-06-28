@@ -8,8 +8,9 @@ firmware region. One 128-bit word per line, MSB-first (lane15..lane0)."""
 from pathlib import Path
 import numpy as np
 
+import sys
 ROOT = Path(__file__).resolve().parents[1]
-PPM = ROOT / "yolov8n_int8" / "bus320.ppm"
+PPM = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "yolov8n_int8" / "bus320.ppm"
 OUT = ROOT / "firmware" / "yolo_img_ddr.hex"
 IN_SCALE, IN_ZP = 0.0039215689, -128
 
