@@ -4,6 +4,23 @@ Branch: `codex/yolov8n-rtl-m0`. Last commit before this doc: `08b78fd`.
 Read also: `CLAUDE.md`, `docs/notes/yolov8n-320-golden.md` (full detail/history),
 memory `soc-silu-lut-range-gap.md`.
 
+## LATEST (2026-06-28): all convs on descriptor queue + pre-compiled image
+Two milestones after the 162.9M optimization above:
+1. **Whole net (conv+maxpool+residual-add) migrated to the hardware descriptor
+   queue/engine** (memory `project_yolo_desc_migration`): 4/4, ~31.8M cyc. Fixed
+   large-IC 1x1 PW (oc_single alias root cause).
+2. **Pre-compiled descriptor image** (memory `soc-descriptor-precompile`, spec/plan
+   `docs/superpowers/{specs,plans}/2026-06-28-descriptor-precompile*`): CPU
+   descriptor-build was 9.66M = 30.6% of the net; record/replay (`.desc_record` /
+   `.desc_replay` file flags, like `.yolo_ddr`) pre-builds all 157 programs into a
+   ~0.95MB DDR image (testbench `$writememh` self-dump) and replays them, skipping
+   the build. **YOLO 31.9M -> 22.2M (-30%), 4/4. MNIST 10/10.** Zero compute-RTL
+   change. To regen the image: `touch .yolo_ddr .desc_record; bash run_all.sh clean;
+   bash run_all.sh sim yolo_full_stem.c yolo_c2f.c yolo_ops.c npu_desc.c yolo_desc.c`.
+   To deploy: `.desc_replay` instead of `.desc_record`.
+   NOTE: env vars do NOT survive the harness Bash tool -- always use `.desc_*` /
+   `.yolo_ddr` FILE flags, never `DESC_RECORD=1 bash ...`.
+
 ## OPTIMIZED (2026-06-24): 638.2M -> 162.9M cyc (-74.5%), still 4/4 boxes
 Latency @200MHz: **3.19s -> 0.815s/img** (sub-second). NPU busy ~16.7M (~10%). Wins:
 0. conv20/46 (icg8 stride2) switched from CPU ic_stream to resident conv2d_tiled (-4M).
