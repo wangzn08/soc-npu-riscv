@@ -121,9 +121,11 @@ compile_fw() {
         # shellcheck disable=SC2206
         CFLAGS+=(${EXTRA_CFLAGS})
     fi
-    # DESC_RECORD builds the generator firmware (records into resident DDR slots).
-    # Replay (descriptor image preloaded) is the default firmware path.
-    if [ -n "${DESC_RECORD:-}" ]; then
+    # .desc_record builds the generator firmware (records into resident DDR slots).
+    # Replay (descriptor image preloaded) is the default firmware path. A file flag
+    # is used (not an env var) because env vars do not survive the harness shell,
+    # mirroring the .yolo_ddr convention.
+    if [ -n "${DESC_RECORD:-}" ] || [ -f "$ROOT_DIR/.desc_record" ]; then
         CFLAGS+=(-DDESC_RECORD)
     fi
     ASFLAGS=(-mabi=ilp32 -march="$ISA")
@@ -206,12 +208,13 @@ compile_rtl() {
         VLOG_DEFS="+define+YOLO_DDR"
         info "YOLO_DDR 预载启用 (+define+YOLO_DDR)"
     fi
-    # Pre-compiled descriptor image: DESC_RECORD dumps the image, DESC_REPLAY loads it.
-    if [ -n "${DESC_RECORD:-}" ]; then
+    # Pre-compiled descriptor image: .desc_record dumps the image, .desc_replay
+    # loads it. File flags (not env vars) — env vars do not survive the harness shell.
+    if [ -n "${DESC_RECORD:-}" ] || [ -f "$ROOT_DIR/.desc_record" ]; then
         VLOG_DEFS="$VLOG_DEFS +define+DESC_RECORD"
         info "描述符录制启用 (+define+DESC_RECORD)"
     fi
-    if [ -n "${DESC_REPLAY:-}" ]; then
+    if [ -n "${DESC_REPLAY:-}" ] || [ -f "$ROOT_DIR/.desc_replay" ]; then
         VLOG_DEFS="$VLOG_DEFS +define+DESC_REPLAY"
         info "描述符回放启用 (+define+DESC_REPLAY)"
     fi

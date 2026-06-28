@@ -540,6 +540,14 @@
         reg [127:0] ywgt_pre [0:196752];
         integer ywi;
 `endif
+`ifdef DESC_REPLAY
+        // Pre-compiled descriptor image. Word bases: image 0, qparam 0x20000
+        // (131072), catalog 0x28000 (163840). See yolo_desc.h.
+        reg [127:0] dimg_pre [0:131071];
+        reg [127:0] dqp_pre  [0:65535];
+        reg [127:0] dcat_pre [0:511];
+        integer dii, dqi, dci;
+`endif
         initial begin
             for (bram_init_i = 0; bram_init_i <= (1<<(OPT_MEM_ADDR_BITS+1))-1; bram_init_i = bram_init_i + 1)
                 byte_ram[bram_init_i] = 8'h0;
@@ -556,6 +564,17 @@
             $readmemh("firmware/yolo_weights_ddr.hex", ywgt_pre);
             for (ywi = 0; ywi < 196753; ywi = ywi + 1)
                 byte_ram[524288 + ywi] = ywgt_pre[ywi][mem_byte_index*8 +: 8];
+`endif
+`ifdef DESC_REPLAY
+            $readmemh("firmware/desc_image.hex", dimg_pre);
+            for (dii = 0; dii < 131072; dii = dii + 1)
+                byte_ram[0 + dii] = dimg_pre[dii][mem_byte_index*8 +: 8];
+            $readmemh("firmware/desc_qparam.hex", dqp_pre);
+            for (dqi = 0; dqi < 65536; dqi = dqi + 1)
+                byte_ram[131072 + dqi] = dqp_pre[dqi][mem_byte_index*8 +: 8];
+            $readmemh("firmware/desc_catalog.hex", dcat_pre);
+            for (dci = 0; dci < 512; dci = dci + 1)
+                byte_ram[196608 + dci] = dcat_pre[dci][mem_byte_index*8 +: 8];
 `endif
         end
 	     

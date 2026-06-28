@@ -11,6 +11,12 @@
 static inline void d_npu_wr(uint32_t a, uint32_t d){ *(volatile uint32_t*)a = d; }
 static inline uint32_t d_npu_rd(uint32_t a){ return *(volatile uint32_t*)a; }
 
+// Record/replay cursors (declared early so the probe print can read them).
+static uint32_t g_prog_idx  = 0u;            // call-order cursor
+static uint32_t g_img_top   = 0u;            // descriptor-image bump (words), record
+static uint32_t g_qp_top    = 0u;            // qparam bump (words), record
+static uint32_t g_prog_base = YOLO_DESC_DDR; // current program's DDR byte base
+
 // ---- Phase-0 probe: split conv-desc time into CPU descriptor BUILD vs engine
 // RUN (submit+DMA+wait). Free-running NPU_PERF_CYC_TOTAL; diffs only. ----
 static uint32_t g_desc_build = 0u;   // CPU building records + qparam + pad row
@@ -22,6 +28,13 @@ static uint32_t g_desc_maxrec = 0u;  // largest single program (records) -> peak
 static inline uint32_t d_cyc(void){ return *(volatile uint32_t *)NPU_PERF_CYC_TOTAL; }
 void yolo_desc_prof_print(void)
 {
+#ifdef DESC_RECORD
+    print_str("[DESCMODE] RECORD img_top="); print_dec(g_img_top);
+    print_str(" qp_top="); print_dec(g_qp_top);
+#else
+    print_str("[DESCMODE] REPLAY");
+#endif
+    print_str(" prog_idx="); print_dec(g_prog_idx); print_str("\n");
     print_str("[DESCPROF] build="); print_dec(g_desc_build);
     print_str(" run(submit+dma+wait)="); print_dec(g_desc_run);
     print_str(" wgt_preload="); print_dec(g_desc_wgt); print_str("\n");
@@ -37,10 +50,6 @@ void yolo_desc_prof_print(void)
 typedef struct { uint32_t off_words; uint32_t count; } desc_cat_t;
 static volatile desc_cat_t *const g_catalog =
     (volatile desc_cat_t *)DESC_CATALOG_BASE;
-static uint32_t g_prog_idx  = 0u;            // call-order cursor
-static uint32_t g_img_top   = 0u;            // descriptor-image bump (words), record
-static uint32_t g_qp_top    = 0u;            // qparam bump (words), record
-static uint32_t g_prog_base = YOLO_DESC_DDR; // current program's DDR byte base
 
 void yolo_desc_reset(void)
 { g_prog_idx = 0u; g_img_top = 0u; g_qp_top = 0u; g_prog_base = YOLO_DESC_DDR; }
@@ -50,11 +59,14 @@ void yolo_desc_reset(void)
 static void desc_prog_begin(void)
 {
 #ifdef DESC_RECORD
-    g_prog_base = DESC_IMAGE_BASE + g_img_top * NPU_HW_DESC_WORDS * 4u;
+    g_prog_base = DESC_IMAGE_BASE + g_img_top * 4u;  /* g_img_top is a 32-bit-word count */
 #else
     g_prog_base = YOLO_DESC_DDR;
 #endif
 }
+
+/* defined below; called by the record path, unused in replay builds */
+static int d_submit(uint32_t count) __attribute__((unused));
 
 // Record: append {slot offset, di} to the catalog, submit, bump. Replay: ignore
 // the just-built records, submit the pre-loaded program at catalog[g_prog_idx].
@@ -101,7 +113,7 @@ static void dop(volatile uint32_t *d, uint32_t op, uint32_t flags)
 { d[0]=(op&0xFFu)|((NPU_HW_DESC_VERSION&0xFFu)<<8)|((flags&0xFFFFu)<<16); d[1]=flags>>16; }
 
 // flags: bit0 silu_exact_en, bit1 silu_en, bit2 silu_requant_en.
-static void d_act_cfg(uint32_t *idx, int32_t pad_value, uint32_t flags,
+static void __attribute__((unused)) d_act_cfg(uint32_t *idx, int32_t pad_value, uint32_t flags,
                       uint32_t rq_mul, uint32_t rq_shift, int32_t rq_zp)
 {
     volatile uint32_t *d = dword((*idx)++);
@@ -130,7 +142,7 @@ static void d_dma_in(uint32_t *idx, uint32_t src_ddr, uint32_t act_base, uint32_
     }
 }
 
-static void d_dma_wgt(uint32_t *idx, uint32_t src_ddr, uint32_t wgt_base, uint32_t words)
+static void __attribute__((unused)) d_dma_wgt(uint32_t *idx, uint32_t src_ddr, uint32_t wgt_base, uint32_t words)
 {
     uint32_t off = 0u;
     while (off < words) {
@@ -146,7 +158,7 @@ static void d_dma_wgt(uint32_t *idx, uint32_t src_ddr, uint32_t wgt_base, uint32
     }
 }
 
-static void d_drain(uint32_t *idx, uint32_t out_base, uint32_t dst_ddr, uint32_t words)
+static void __attribute__((unused)) d_drain(uint32_t *idx, uint32_t out_base, uint32_t dst_ddr, uint32_t words)
 {
     uint32_t off = 0u;
     while (off < words) {
@@ -208,7 +220,7 @@ static void d_eltwise(uint32_t *idx, uint32_t src0_act, uint32_t dst_act,
     d[7] = words;
 }
 
-static void d_conv(uint32_t *idx, uint32_t act, uint32_t wgt_base,
+static void __attribute__((unused)) d_conv(uint32_t *idx, uint32_t act, uint32_t wgt_base,
                    uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
                    uint32_t kh, uint32_t kw, uint32_t stride,
                    uint32_t pad_w, uint32_t pad_h, uint32_t ctrl_flags,
@@ -231,11 +243,10 @@ static void d_conv(uint32_t *idx, uint32_t act, uint32_t wgt_base,
 static void d_stop(uint32_t *idx)
 { volatile uint32_t *d = dword((*idx)++); dclr(d); dop(d, NPU_HW_DESC_OP_STOP_IRQ, 0u); }
 
-static int d_submit(uint32_t count) __attribute__((unused));
 static int d_submit(uint32_t count)
 {
     int t;
-    d_npu_wr(NPU_DESC_BASE_LO, YOLO_DESC_DDR);
+    d_npu_wr(NPU_DESC_BASE_LO, g_prog_base);   /* current program's resident slot */
     d_npu_wr(NPU_DESC_BASE_HI, 0u);
     d_npu_wr(NPU_DESC_COUNT, count);
     d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
@@ -344,11 +355,21 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
     (void)bias; (void)scale_mul; (void)scale_shift;  /* qparams pre-loaded in DDR */
 #endif
 
+#ifndef DESC_RECORD
+    /* Replay: building is skipped (programs are pre-loaded); these are only used
+       by the record build path below. */
+    (void)in_ddr; (void)in_c; (void)ctrl_flags; (void)out_ddr; (void)conv_flags;
+    (void)act_flags; (void)qbase_ddr; (void)chunk_cap; (void)out_w;
+    (void)silu_requant_mul; (void)silu_requant_shift; (void)silu_requant_zp;
+#endif
+
     for (oy0 = 0u; oy0 < out_h; oy0 += strip_out_rows) {
         uint32_t so = out_h - oy0;
-        uint32_t strip_in_h, g, ri, di = 0u;
-        int32_t ir0;
+        uint32_t di = 0u;
         if (so > strip_out_rows) so = strip_out_rows;
+#ifdef DESC_RECORD
+        uint32_t strip_in_h, g, ri;
+        int32_t ir0;
         uint32_t _tb = d_cyc();
         strip_in_h = (so - 1u) * stride + kernel_h;  /* pad_h=0 */
         ir0 = (int32_t)(oy0 * stride) - (int32_t)pad;
@@ -400,6 +421,9 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         }
         d_stop(&di);
         g_desc_build += d_cyc() - _tb;
+#else
+        (void)so;   /* replay: submit the pre-built program for this strip */
+#endif
 
         {
             uint32_t _tr = d_cyc();
