@@ -12,13 +12,13 @@
 #define YOLO_DESC_DDR    0x40000000u
 #define YOLO_QPARAM_DDR  0x40080000u
 
-// Strip-tiled conv driven entirely by the descriptor queue. Same arguments as
-// yolo_run_conv2d_tiled (yolo_ops.c) plus the SiLU requant config. The SiLU
-// mode is taken from ctrl_flags (SILU_EXACT_EN, or SILU_EN + SILU_REQUANT_EN);
-// for exact-SiLU the LUT must be CPU-preloaded (yolo_load_silu_lut) and the
-// requant args are 0. Handles 3x3 (HW pad + DMA'd vertical halo) and 1x1 PW
-// (kh=kw=1, pad=0), OC chunking, and per-chunk weight reload when the layer's
-// weights exceed Wgt SRAM. Returns 1 on success, 0 on descriptor error/timeout.
+// Strip-tiled conv driven by the descriptor queue. Same arguments as
+// yolo_run_conv2d_tiled (yolo_ops.c) plus the SiLU requant config. In normal
+// mode each helper submits immediately; in graph mode helpers append to one
+// full-inference stream and yolo_desc_graph_end_and_submit() performs the
+// single hardware submit. Handles 3x3 (HW pad + DMA'd vertical halo), 1x1 PW,
+// OC chunking, and graph-time weight/LUT loads. Returns 1 on success, 0 on
+// descriptor error/timeout.
 int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                                uint32_t wgt_base, uint32_t out_ddr,
                                uint32_t pad_row_ddr,
@@ -46,13 +46,20 @@ int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
                               uint32_t dst_ddr, uint32_t scratch_act_base,
                               uint32_t words, int32_t zp, uint32_t ratio_en,
                               uint32_t ratio_mul, uint32_t ratio_shift);
+void yolo_desc_load_silu_lut(const uint8_t lut[256]);
+int yolo_desc_copy_ddr_to_ddr(uint32_t src_ddr, uint32_t dst_ddr,
+                              uint32_t scratch_act_base, uint32_t words);
+int yolo_desc_upsample2x_ddr(uint32_t src_ddr, uint32_t dst_ddr,
+                             uint32_t scratch_act_base, uint32_t in_w,
+                             uint32_t in_h, uint32_t ic_groups);
 
 // Phase-0 probe: print accumulated conv-desc CPU-build vs engine-run cycles.
 void yolo_desc_prof_print(void);
 
 // ---- Pre-compiled descriptor image (A2 record/replay). Word idx =
-// (cpu_addr - 0x40000000) / 16. Regions audited collision-free (see plan). ----
-#define DESC_IMAGE_BASE    0x40000000u   // descriptor records blob (cap 60692 128b words, <1MB)
+// (cpu_addr - 0x40000000) / 16. Regions audited collision-free (see plan).
+// Full YOLO graph is ~68.5K 128-bit records (~1.1MB), below the 2MB qparam base.
+#define DESC_IMAGE_BASE    0x40000000u   // descriptor records blob
 #define DESC_QPARAM_BASE   0x40200000u   // per-layer qparam blob   (cap 65536 words = 1MB)
 #define DESC_CATALOG_BASE  0x40300000u   // catalog: N x {off,count}
 #define DESC_CATALOG_MAX   256u

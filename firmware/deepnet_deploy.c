@@ -29,7 +29,7 @@
 //     (descriptors + qparams resident in DDR, NPU executes them autonomously).
 // 0 = legacy per-layer CPU MMIO scheduling.
 #ifndef NPU_HW_DESC
-#define NPU_HW_DESC 0
+#define NPU_HW_DESC 1
 #endif
 
 #define WGT_DDR_BASE 0x40100000   // DDR resident weight image (8768 128-bit words)

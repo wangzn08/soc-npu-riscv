@@ -104,13 +104,12 @@ int yolo_desc_graph_end_and_submit(void)
     if (g_graph_active == 0u)
         return 0;
 
+#ifdef DESC_RECORD
     d_stop(&g_graph_di);
     g_desc_recs += g_graph_di;
     g_desc_calls += 1u;
     if (g_graph_di > g_desc_maxrec)
         g_desc_maxrec = g_graph_di;
-
-#ifdef DESC_RECORD
     g_catalog[g_prog_idx].off_words = (g_prog_base - DESC_IMAGE_BASE) / 4u;
     g_catalog[g_prog_idx].count = g_graph_di;
     g_prog_idx++;
@@ -149,6 +148,10 @@ int yolo_desc_graph_end_and_submit(void)
             g_desc_run += d_cyc() - _tr;
         }
     }
+    g_desc_recs += g_graph_di;
+    g_desc_calls += 1u;
+    if (g_graph_di > g_desc_maxrec)
+        g_desc_maxrec = g_graph_di;
 #endif
 
     g_graph_active = 0u;
@@ -208,7 +211,7 @@ static void __attribute__((unused)) d_act_cfg(uint32_t *idx, int32_t pad_value, 
     dclr(d);
     dop(d, NPU_HW_DESC_OP_ACTIVATION_CFG, 0u);
     d[2] = (uint32_t)pad_value & 0xFFu;
-    d[3] = (rq_mul & 0xFFFFu) | ((rq_shift & 0x3Fu) << 8) |
+    d[3] = (rq_mul & 0xFFFFu) | ((rq_shift & 0x3Fu) << 16) |
            (((uint32_t)rq_zp & 0xFFu) << 24);   // packed like NPU_SILU_REQUANT_CFG
     d[4] = flags & 0x7u;
     d[5] = 0u;                          // clip_max -> default 127
@@ -291,6 +294,26 @@ static void d_maxpool(uint32_t *idx, uint32_t src_act, uint32_t dst_act,
     d[4] = dst_act;
     d[8] = (in_h << 16) | in_w;
     d[9] = in_c & 0xFFFFu;
+}
+
+static void d_upsample(uint32_t *idx, uint32_t src_act, uint32_t dst_act,
+                       uint32_t in_w, uint32_t in_h, uint32_t ic_groups)
+{
+    volatile uint32_t *d = dword((*idx)++);
+    dclr(d);
+    dop(d, NPU_HW_DESC_OP_UPSAMPLE2X, 0u);
+    d[2] = src_act;
+    d[4] = dst_act;
+    d[8] = (in_h << 16) | in_w;
+    d[9] = (ic_groups * 16u) & 0xFFFFu;
+}
+
+static void __attribute__((unused)) d_lut_load(uint32_t *idx, uint32_t lut_ddr)
+{
+    volatile uint32_t *d = dword((*idx)++);
+    dclr(d);
+    dop(d, NPU_HW_DESC_OP_LUT_LOAD, 0u);
+    d[2] = lut_ddr;
 }
 
 // Signed eltwise add over Act SRAM: dst = src0 + rescaled(src1). w[6] packs the
@@ -412,13 +435,21 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         g_desc_build += d_cyc() - _t;
     }
 
-    // Weights resident in Wgt SRAM when they fit; else loaded per chunk below.
+    // Weights resident in Wgt SRAM when they fit. Immediate mode can preload now
+    // because the descriptor is submitted right away; graph mode must record the
+    // preload so later convs do not overwrite this layer's Wgt SRAM image first.
     if (preload_all) {
-        uint32_t _t = d_cyc();
-        int ok = yolo_dma_ddr_to_wgt(wgt_all_ddr, wgt_base, out_c * wgt_words_per_oc);
-        g_desc_wgt += d_cyc() - _t;
-        if (!ok)
-            return 0;
+        if (g_graph_active) {
+#ifdef DESC_RECORD
+            d_dma_wgt(&g_graph_di, wgt_all_ddr, wgt_base, out_c * wgt_words_per_oc);
+#endif
+        } else {
+            uint32_t _t = d_cyc();
+            int ok = yolo_dma_ddr_to_wgt(wgt_all_ddr, wgt_base, out_c * wgt_words_per_oc);
+            g_desc_wgt += d_cyc() - _t;
+            if (!ok)
+                return 0;
+        }
     }
 
     // Resident qparam table for the out_c OCs. Record: per-layer slot in the
@@ -543,12 +574,101 @@ int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
 
     if (in_w == 0u || in_h == 0u || ic_groups == 0u)
         return 1;
+#ifndef DESC_RECORD
+    if (g_graph_active)
+        return 1;
+    return desc_submit_cataloged(0u);
+#endif
 
     if (!g_graph_active)
         desc_prog_begin();
     d_dma_in(pdi, src_ddr, scratch_act_base, words);
     d_maxpool(pdi, scratch_act_base, dst_act, in_w, in_h, ic_groups * 16u);
     d_dma_out_act(pdi, dst_act, dst_ddr, words);
+    if (g_graph_active)
+        return 1;
+    d_stop(pdi);
+    return desc_submit_cataloged(di);
+}
+
+void yolo_desc_load_silu_lut(const uint8_t lut[256])
+{
+    if (g_graph_active == 0u) {
+        yolo_load_silu_lut(lut);
+        return;
+    }
+#ifdef DESC_RECORD
+    {
+        uint32_t lut_ddr = DESC_QPARAM_BASE + g_qp_top * 4u;
+        volatile uint32_t *p = (volatile uint32_t *)lut_ddr;
+        uint32_t i;
+        for (i = 0u; i < 64u; i++) {
+            p[i] = ((uint32_t)lut[i * 4u + 0u]) |
+                   ((uint32_t)lut[i * 4u + 1u] << 8) |
+                   ((uint32_t)lut[i * 4u + 2u] << 16) |
+                   ((uint32_t)lut[i * 4u + 3u] << 24);
+        }
+        g_qp_top += 64u;
+        d_lut_load(&g_graph_di, lut_ddr);
+    }
+#else
+    (void)lut;
+#endif
+}
+
+int yolo_desc_copy_ddr_to_ddr(uint32_t src_ddr, uint32_t dst_ddr,
+                              uint32_t scratch_act_base, uint32_t words)
+{
+    uint32_t done = 0u, di = 0u;
+    uint32_t *pdi = g_graph_active ? &g_graph_di : &di;
+    const uint32_t max_chunk = 4096u;
+
+    if (words == 0u)
+        return 1;
+#ifndef DESC_RECORD
+    if (g_graph_active)
+        return 1;
+    return desc_submit_cataloged(0u);
+#endif
+    if (!g_graph_active)
+        desc_prog_begin();
+    while (done < words) {
+        uint32_t chunk = words - done;
+        if (chunk > max_chunk) chunk = max_chunk;
+        d_dma_in(pdi, src_ddr + done * 16u, scratch_act_base, chunk);
+        d_dma_out_act(pdi, scratch_act_base, dst_ddr + done * 16u, chunk);
+        done += chunk;
+    }
+    if (g_graph_active)
+        return 1;
+    d_stop(pdi);
+    return desc_submit_cataloged(di);
+}
+
+int yolo_desc_upsample2x_ddr(uint32_t src_ddr, uint32_t dst_ddr,
+                             uint32_t scratch_act_base, uint32_t in_w,
+                             uint32_t in_h, uint32_t ic_groups)
+{
+    uint32_t in_words = in_w * in_h * ic_groups;
+    uint32_t out_w = in_w * 2u;
+    uint32_t out_h = in_h * 2u;
+    uint32_t out_words = out_w * out_h * ic_groups;
+    uint32_t src_act = scratch_act_base + out_words;
+    uint32_t di = 0u;
+    uint32_t *pdi = g_graph_active ? &g_graph_di : &di;
+
+    if (in_w == 0u || in_h == 0u || ic_groups == 0u)
+        return 0;
+#ifndef DESC_RECORD
+    if (g_graph_active)
+        return 1;
+    return desc_submit_cataloged(0u);
+#endif
+    if (!g_graph_active)
+        desc_prog_begin();
+    d_dma_in(pdi, src_ddr, src_act, in_words);
+    d_upsample(pdi, src_act, scratch_act_base, in_w, in_h, ic_groups);
+    d_dma_out_act(pdi, scratch_act_base, dst_ddr, out_words);
     if (g_graph_active)
         return 1;
     d_stop(pdi);
@@ -570,6 +690,11 @@ int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
 
     if (words == 0u)
         return 1;
+#ifndef DESC_RECORD
+    if (g_graph_active)
+        return 1;
+    return desc_submit_cataloged(0u);
+#endif
 
     if (!g_graph_active)
         desc_prog_begin();

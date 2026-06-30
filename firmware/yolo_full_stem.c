@@ -127,7 +127,7 @@ static uint32_t ad(int32_t a,int32_t b){ int32_t d=a-b; return (uint32_t)(d<0?-d
 
 // ---- Phase-0 per-stage profiler (reads free-running RTL perf counters) ----
 // dcyc = wall cycles for the stage; dnpu = NPU-FSM-busy cycles in the stage;
-// (dcyc - dnpu) ~= CPU/DMA software-glue cost. drd/dwr = AXI DDR beats.
+// (dcyc - dnpu) ~= firmware descriptor-build / decode cost. drd/dwr = AXI DDR beats.
 // YOLO-only file (not compiled for MNIST), so this never perturbs the baseline.
 static uint32_t pf_tot, pf_busy, pf_rd, pf_wr;
 static void prof_reset(void)
@@ -204,6 +204,8 @@ static void maxpool5(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, ui
     }
 }
 // concat 4 same-scale tile-major parts -> [4*groups] tensor.
+static void concat4(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t dst,
+                    uint32_t groups, uint32_t SP) __attribute__((unused));
 static void concat4(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t dst,
                     uint32_t groups, uint32_t SP)
 {
@@ -327,7 +329,7 @@ static int run_head_conv(uint32_t in, uint32_t wgt, uint32_t out, uint32_t inw, 
     /* All head ICs are <=256 (icg16), within im2col ICG_MAX=16, so the desc-tiled
      * path covers what previously needed CPU INT32-psum ic_stream (icg>8 3x3). */
     (void)HD_PSUM;
-    yolo_set_pad_value(inzp); yolo_load_silu_lut(lut); yolo_set_silu_requant(0u,0u,0);
+    yolo_set_pad_value(inzp); yolo_desc_load_silu_lut(lut); yolo_set_silu_requant(0u,0u,0);
     return yolo_run_conv2d_tiled_desc(in, wgt, WGT_BASE, out, PAD_ROW, inw, inh, ic, oc,
                kh, kh, stride, pad, bias, mul, shift, NPU_CTRL_SILU_EXACT_EN,
                (ic/16u)*kh*kh, 16u, inzp, 0u, 0u, 0);
@@ -380,10 +382,11 @@ void usercode7(void)
     (void)yolo_nk_pan_p4_golden; (void)yolo_nk_pan_p5_golden;
     prof_reset();
     yolo_desc_reset();
+    yolo_desc_graph_begin();
 
     // ---------- Stage 0: conv0 (preloaded image, weights from DDR blob) -> C0_OUT ----------
     yolo_set_pad_value(C0E_PAD_VALUE);
-    yolo_load_silu_lut(yolo_conv0_320e_silu_lut);
+    yolo_desc_load_silu_lut(yolo_conv0_320e_silu_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (!yolo_run_conv2d_tiled_desc(IMG, WGT_OF(0), WGT_BASE, C0_OUT, PAD_ROW,
                                C0E_IN_W, C0E_IN_H, C0E_IC, C0E_OC,
@@ -397,7 +400,7 @@ void usercode7(void)
 
     // ---------- Stage 1: conv1 reads C0_OUT, weights from DDR blob -> C1_OUT ----------
     yolo_set_pad_value(C1E_PAD_VALUE);
-    yolo_load_silu_lut(yolo_conv1_320e_silu_lut);
+    yolo_desc_load_silu_lut(yolo_conv1_320e_silu_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C0_OUT, WGT_OF(1), WGT_BASE, C1_OUT, PAD_ROW,
                                C1E_IN_W, C1E_IN_H, C1E_IC, C1E_OC,
@@ -452,7 +455,7 @@ void usercode7(void)
 
     // ---------- Stage 3: conv6 (downsample 80x80x32 -> 40x40x64) reads C2F_OUT ----------
     yolo_set_pad_value(C6E_PAD_VALUE);
-    yolo_load_silu_lut(yolo_conv6e_silu_lut);
+    yolo_desc_load_silu_lut(yolo_conv6e_silu_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F_OUT, WGT_OF(6), WGT_BASE, C6_OUT, PAD_ROW,
                                C6E_IN_W, C6E_IN_H, C6E_IC, C6E_OC, 3u, 3u, C6E_STRIDE, 1u,
@@ -506,7 +509,7 @@ void usercode7(void)
 
     // ---------- Stage 5: conv13 (downsample 40x40x64 -> 20x20x128) reads C2F4_OUT ----------
     yolo_set_pad_value(C13E_PAD_VALUE);
-    yolo_load_silu_lut(yolo_conv13e_silu_lut);
+    yolo_desc_load_silu_lut(yolo_conv13e_silu_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F4_OUT, WGT_OF(13), WGT_BASE, C13_OUT, PAD_ROW,
                                C13E_IN_W, C13E_IN_H, C13E_IC, C13E_OC, 3u, 3u, C13E_STRIDE, 1u,
@@ -564,7 +567,7 @@ void usercode7(void)
     // no CPU INT32 psum. (void)C20_PSUM.
     (void)C20_PSUM;
     yolo_set_pad_value(C20E_PAD_VALUE);
-    yolo_load_silu_lut(yolo_conv20e_silu_lut); yolo_set_silu_requant(0u, 0u, 0);
+    yolo_desc_load_silu_lut(yolo_conv20e_silu_lut); yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F6_OUT, WGT_OF(20), WGT_BASE, C20_OUT, PAD_ROW,
                                C20E_IN_W, C20E_IN_H, C20E_IC, C20E_OC, 3u, 3u, C20E_STRIDE, 1u,
                                yolo_conv20e_bias_q, yolo_conv20e_scale_mul, yolo_conv20e_scale_shift,
@@ -572,7 +575,7 @@ void usercode7(void)
         print_str("  conv20 fail\n"); errors++;
     }
     print_str("  [stage7 conv20 done]\n");
-    prof_mark("s7_conv20_icstream");
+    prof_mark("s7_conv20_desc");
 
     // ---------- Stage 8: c2f_8 (model.8, n=1, 256ch) reads C20_OUT, blob weights ----------
     cfg.in_w=YOLO_C2F8_IN_W; cfg.in_h=YOLO_C2F8_IN_H; cfg.spatial=YOLO_C2F8_SPATIAL;
@@ -609,9 +612,9 @@ void usercode7(void)
     prof_mark("s8_c2f8");
 
     // ---------- Stage 9: SPPF (model.9) conv25 -> 3x maxpool5 -> concat -> conv26 ----------
-    // conv25 (1x1 256->128, icg16 PW stream, exact); maxpool/concat on CPU (scale-
-    // preserving); conv26 (1x1 512->256, icg32 PW stream, exact). Reads C2F8_OUT.
-    yolo_load_silu_lut(yolo_sppf_e_c25_lut);
+    // conv25 (1x1 256->128, icg16 PW stream, exact); maxpool/concat as graph
+    // descriptors (scale-preserving); conv26 (1x1 512->256, icg32 PW stream, exact).
+    yolo_desc_load_silu_lut(yolo_sppf_e_c25_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F8_OUT, WGT_OF(25), WGT_BASE, S_CV1, PAD_ROW,
                                SPPFE_IN_W, SPPFE_IN_H, SPPFE_C25_IC, SPPFE_C25_OC,
@@ -626,10 +629,13 @@ void usercode7(void)
         if (!yolo_run_maxpool5x5_desc(S_CV1, S_M0, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool0 fail\n"); errors++; }
         if (errors == 0u && !yolo_run_maxpool5x5_desc(S_M0, S_M1, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool1 fail\n"); errors++; }
         if (errors == 0u && !yolo_run_maxpool5x5_desc(S_M1, S_M2, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool2 fail\n"); errors++; }
-        concat4(S_CV1, S_M0, S_M1, S_M2, S_CAT, g25, SPPFE_SPATIAL);
+        if (!yolo_desc_copy_ddr_to_ddr(S_CV1, S_CAT, 0u, g25 * SPPFE_SPATIAL)) { print_str("  sppf cat0 fail\n"); errors++; }
+        if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(S_M0, S_CAT + g25 * SPPFE_SPATIAL * 16u, 0u, g25 * SPPFE_SPATIAL)) { print_str("  sppf cat1 fail\n"); errors++; }
+        if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(S_M1, S_CAT + 2u * g25 * SPPFE_SPATIAL * 16u, 0u, g25 * SPPFE_SPATIAL)) { print_str("  sppf cat2 fail\n"); errors++; }
+        if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(S_M2, S_CAT + 3u * g25 * SPPFE_SPATIAL * 16u, 0u, g25 * SPPFE_SPATIAL)) { print_str("  sppf cat3 fail\n"); errors++; }
     }
-    prof_mark("s9_sppf_maxpool_concat_CPU");
-    yolo_load_silu_lut(yolo_sppf_e_c26_lut);
+    prof_mark("s9_sppf_maxpool_concat_desc");
+    yolo_desc_load_silu_lut(yolo_sppf_e_c26_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(S_CAT, WGT_OF(26), WGT_BASE, SPPF_OUT, PAD_ROW,
                                SPPFE_IN_W, SPPFE_IN_H, SPPFE_C26_IC, SPPFE_C26_OC,
@@ -648,59 +654,27 @@ void usercode7(void)
     // ================= NECK (FPN/PAN, model.10-21) =================
     // ---- FPN: P5 up + concat(P4=c2f6) -> c2f_12 -> fpn_mid (20x20x128) ----
     // cat folded into c2f_12 cv1 weights: build raw [up|tap] native (no requant).
-    {
-        const npu_desc_t descs[] = {
-            {
-                .op = NPU_DESC_OP_UPSAMPLE2X_DDR,
-                .src0 = SPPF_OUT,
-                .dst = NK_CAT1,
-                .scratch0 = 0u,
-                .in_w = 10u,
-                .in_h = 10u,
-                .in_c = 256u
-            },
-            {
-                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
-                .src0 = C2F6_OUT,
-                .dst = NK_CAT1 + (256u/16u)*(20u*20u)*16u,
-                .scratch0 = 0u,
-                .words = (128u/16u)*(20u*20u)
-            }
-        };
-        if (errors == 0u && !npu_desc_run_many(descs, 2u)) {
-            print_str("  neck cat1 desc fail\n"); errors++;
-        }
+    if (errors == 0u && !yolo_desc_upsample2x_ddr(SPPF_OUT, NK_CAT1, 0u, 10u, 10u, 256u/16u)) {
+        print_str("  neck up1 desc fail\n"); errors++;
     }
-    prof_mark("neck_up1_cat1_DMA");
+    if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(C2F6_OUT,
+            NK_CAT1 + (256u/16u)*(20u*20u)*16u, 0u, (128u/16u)*(20u*20u))) {
+        print_str("  neck cat1 desc fail\n"); errors++;
+    }
+    prof_mark("neck_up1_cat1_desc");
     NECK_C2F(YOLO_NK_C12, yolo_nk_c12, NK_CAT1, NK_FMID, WGT_OF(27),WGT_OF(28),WGT_OF(29),WGT_OF(30));
     print_str("  [neck c2f_12 done]\n");
     prof_mark("neck_c2f12");
 
     // ---- FPN: fpn_mid up + concat(P3=c2f4) -> c2f_15 -> pan_p3 (40x40x64) ----
-    {
-        const npu_desc_t descs[] = {
-            {
-                .op = NPU_DESC_OP_UPSAMPLE2X_DDR,
-                .src0 = NK_FMID,
-                .dst = NK_CAT2,
-                .scratch0 = 0u,
-                .in_w = 20u,
-                .in_h = 20u,
-                .in_c = 128u
-            },
-            {
-                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
-                .src0 = C2F4_OUT,
-                .dst = NK_CAT2 + (128u/16u)*(40u*40u)*16u,
-                .scratch0 = 0u,
-                .words = (64u/16u)*(40u*40u)
-            }
-        };
-        if (errors == 0u && !npu_desc_run_many(descs, 2u)) {
-            print_str("  neck cat2 desc fail\n"); errors++;
-        }
+    if (errors == 0u && !yolo_desc_upsample2x_ddr(NK_FMID, NK_CAT2, 0u, 20u, 20u, 128u/16u)) {
+        print_str("  neck up2 desc fail\n"); errors++;
     }
-    prof_mark("neck_up2_cat2_DMA");
+    if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(C2F4_OUT,
+            NK_CAT2 + (128u/16u)*(40u*40u)*16u, 0u, (64u/16u)*(40u*40u))) {
+        print_str("  neck cat2 desc fail\n"); errors++;
+    }
+    prof_mark("neck_up2_cat2_desc");
     NECK_C2F(YOLO_NK_C15, yolo_nk_c15, NK_CAT2, NK_PANP3, WGT_OF(31),WGT_OF(32),WGT_OF(33),WGT_OF(34));
     prof_mark("neck_c2f15");
 #ifdef YOLO_DEBUG_CK
@@ -710,34 +684,20 @@ void usercode7(void)
 
     // ---- PAN: conv35(pan_p3 3x3 s2) + concat(fpn_mid) -> c2f_18 -> pan_p4 (20x20x128) ----
     yolo_set_pad_value(YOLO_NK_C35_PAD);
-    yolo_load_silu_lut(yolo_nk_c35_lut); yolo_set_silu_requant(0u,0u,0);
+    yolo_desc_load_silu_lut(yolo_nk_c35_lut); yolo_set_silu_requant(0u,0u,0);
     if (errors==0u && !yolo_run_conv2d_tiled_desc(NK_PANP3, WGT_OF(35), WGT_BASE, NK_C35, PAD_ROW,
                                40u,40u, 64u,64u, 3u,3u, 2u,1u,
                                yolo_nk_c35_bias, yolo_nk_c35_mul, yolo_nk_c35_shift,
                                NPU_CTRL_SILU_EXACT_EN, 4u*9u, 16u, YOLO_NK_C35_PAD, 0u, 0u, 0)) { print_str("  conv35 fail\n"); errors++; }
     prof_mark("neck_conv35_s2");
-    {
-        const npu_desc_t descs[] = {
-            {
-                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
-                .src0 = NK_C35,
-                .dst = NK_CAT3,
-                .scratch0 = 0u,
-                .words = (64u/16u)*(20u*20u)
-            },
-            {
-                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
-                .src0 = NK_FMID,
-                .dst = NK_CAT3 + (64u/16u)*(20u*20u)*16u,
-                .scratch0 = 0u,
-                .words = (128u/16u)*(20u*20u)
-            }
-        };
-        if (errors == 0u && !npu_desc_run_many(descs, 2u)) {
-            print_str("  neck cat3 desc fail\n"); errors++;
-        }
+    if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(NK_C35, NK_CAT3, 0u, (64u/16u)*(20u*20u))) {
+        print_str("  neck cat3a desc fail\n"); errors++;
     }
-    prof_mark("neck_cat3_DMA");
+    if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(NK_FMID,
+            NK_CAT3 + (64u/16u)*(20u*20u)*16u, 0u, (128u/16u)*(20u*20u))) {
+        print_str("  neck cat3b desc fail\n"); errors++;
+    }
+    prof_mark("neck_cat3_desc");
     NECK_C2F(YOLO_NK_C18, yolo_nk_c18, NK_CAT3, NK_PANP4, WGT_OF(40),WGT_OF(43),WGT_OF(44),WGT_OF(45));
     prof_mark("neck_c2f18");
 #ifdef YOLO_DEBUG_CK
@@ -749,34 +709,20 @@ void usercode7(void)
     // icg8 now resident (ICG_MAX/ICG_BUF=8): tiled conv instead of CPU ic_stream. (void)NK_PSUM.
     (void)NK_PSUM;
     yolo_set_pad_value(YOLO_NK_C46_PAD);
-    yolo_load_silu_lut(yolo_nk_c46_lut); yolo_set_silu_requant(0u, 0u, 0);
+    yolo_desc_load_silu_lut(yolo_nk_c46_lut); yolo_set_silu_requant(0u, 0u, 0);
     if (errors==0u && !yolo_run_conv2d_tiled_desc(NK_PANP4, WGT_OF(46), WGT_BASE, NK_C46, PAD_ROW,
                                20u,20u, 128u,128u, 3u,3u, 2u,1u,
                                yolo_nk_c46_bias, yolo_nk_c46_mul, yolo_nk_c46_shift,
                                NPU_CTRL_SILU_EXACT_EN, (128u/16u)*9u, 16u, YOLO_NK_C46_PAD, 0u, 0u, 0)) { print_str("  conv46 fail\n"); errors++; }
-    prof_mark("neck_conv46_s2_icstream");
-    {
-        const npu_desc_t descs[] = {
-            {
-                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
-                .src0 = NK_C46,
-                .dst = NK_CAT4,
-                .scratch0 = 0u,
-                .words = (128u/16u)*(10u*10u)
-            },
-            {
-                .op = NPU_DESC_OP_COPY_DDR_TO_DDR,
-                .src0 = C2F8_OUT,
-                .dst = NK_CAT4 + (128u/16u)*(10u*10u)*16u,
-                .scratch0 = 0u,
-                .words = (256u/16u)*(10u*10u)
-            }
-        };
-        if (errors == 0u && !npu_desc_run_many(descs, 2u)) {
-            print_str("  neck cat4 desc fail\n"); errors++;
-        }
+    prof_mark("neck_conv46_s2_desc");
+    if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(NK_C46, NK_CAT4, 0u, (128u/16u)*(10u*10u))) {
+        print_str("  neck cat4a desc fail\n"); errors++;
     }
-    prof_mark("neck_cat4_DMA");
+    if (errors == 0u && !yolo_desc_copy_ddr_to_ddr(C2F8_OUT,
+            NK_CAT4 + (128u/16u)*(10u*10u)*16u, 0u, (256u/16u)*(10u*10u))) {
+        print_str("  neck cat4b desc fail\n"); errors++;
+    }
+    prof_mark("neck_cat4_desc");
     NECK_C2F(YOLO_NK_C21, yolo_nk_c21, NK_CAT4, NK_PANP5, WGT_OF(51),WGT_OF(54),WGT_OF(55),WGT_OF(56));
     prof_mark("neck_c2f21");
 #ifdef YOLO_DEBUG_CK
@@ -815,6 +761,19 @@ void usercode7(void)
     HBR(NK_PANP5,10u,10u, P5, yolo_hd_p5, 57,59,61, 58,60,62, HD_BB_P5,HD_CL_P5);
     prof_mark("head_P5_6conv");
     print_str("  [head convs done]\n");
+    if (errors == 0u && !yolo_desc_graph_end_and_submit()) {
+        print_str("  graph submit fail\n");
+        errors++;
+    }
+    print_str("[GRAPH] submit_count=");
+    print_dec(yolo_desc_submit_count());
+    print_str("\n");
+    if (errors == 0u && yolo_desc_submit_count() != 1u) {
+        print_str("GRAPH SUBMIT COUNT FAIL count=");
+        print_dec(yolo_desc_submit_count());
+        print_str("\n");
+        errors++;
+    }
 
     // ---- decode: class0 gate on CPU, DFL expectation on the generic NPU DFL engine ----
     {

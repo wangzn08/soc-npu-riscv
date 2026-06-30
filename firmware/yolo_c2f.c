@@ -1,5 +1,5 @@
-// Generic C2f block runner. Convs on the shared NPU; residual add and concat
-// requant on the CPU (uniform, faithful to the C reference). See yolo_c2f.h.
+// Generic C2f block runner. Convs on the shared NPU; descriptor mode also records
+// residual/copy glue so a full graph can be submitted in one stream.
 
 #include "firmware.h"
 #include "yolo_ops.h"
@@ -55,7 +55,7 @@ static uint32_t silu_setup(const yolo_c2f_cfg_t *cfg, const uint8_t *lut,
          * zero-point is ALWAYS 0 (the output zp is baked into the LUT content). The
          * per-conv zp arg is then only the output zp used by the CPU add/concat. */
         (void)zp;
-        yolo_load_silu_lut(lut);
+        yolo_desc_load_silu_lut(lut);
         yolo_set_silu_requant(0u, 0u, 0);
         return NPU_CTRL_SILU_EXACT_EN;
     }
@@ -244,18 +244,26 @@ static int c2f_impl(const yolo_c2f_cfg_t *cfg, int use_desc)
             if (!ok)
                 return 0;
         } else {
-            for (g = 0u; g < half_groups; g++)
-                for (pos = 0u; pos < sp; pos++) {
-                    uint32_t widx = g * sp + pos;
-                    uint32_t cw[4]; rd_word(cfg->mcv2_ddr, widx, cw);
-                    wr_word(add_dst, widx, cw);
-                }
+            if (use_desc) {
+                if (!yolo_desc_copy_ddr_to_ddr(cfg->mcv2_ddr, add_dst,
+                                               C2F_ELTWISE_ACT, half_groups * sp))
+                    return 0;
+            } else {
+                for (g = 0u; g < half_groups; g++)
+                    for (pos = 0u; pos < sp; pos++) {
+                        uint32_t widx = g * sp + pos;
+                        uint32_t cw[4]; rd_word(cfg->mcv2_ddr, widx, cw);
+                        wr_word(add_dst, widx, cw);
+                    }
+            }
         }
     }
 
     // ---------- concat(s0, s1, add_0..add_{n-1}) requant to cv2 in-scale ----------
     // Folded: cv2 weights already absorb the per-source requant and the concat
     // buffer is filled in place, so this whole CPU loop is skipped.
+    if (use_desc && !fold)
+        return 0;
     if (!fold)
     for (pos = 0u; pos < sp; pos++) {
         uint32_t dstg = 0u;
@@ -294,7 +302,6 @@ static int c2f_impl(const yolo_c2f_cfg_t *cfg, int use_desc)
 int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg)
 { return c2f_impl(cfg, 0); }
 
-// Descriptor-queue path for the convs (cv1/mcv/cv2); residual/concat glue stays
-// on the CPU. Used by the full-net deploy (yolo_full_stem.c).
+// Descriptor-queue path for the convs and graph-safe residual/copy glue.
 int yolo_run_c2f_block_desc(const yolo_c2f_cfg_t *cfg)
 { return c2f_impl(cfg, 1); }

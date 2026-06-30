@@ -98,8 +98,8 @@ typedef struct {
 } yolo_c2f_cfg_t;
 
 int yolo_run_c2f_block(const yolo_c2f_cfg_t *cfg);
-// Same C2f block, but the convs (cv1/mcv/cv2) run on the hardware descriptor
-// queue (yolo_run_conv2d_tiled_desc); residual/concat glue stays on the CPU.
+// Same C2f block, but the convs (cv1/mcv/cv2) and folded residual/concat glue
+// run through the hardware descriptor queue for graph-submit builds.
 int yolo_run_c2f_block_desc(const yolo_c2f_cfg_t *cfg);
 
 #endif
