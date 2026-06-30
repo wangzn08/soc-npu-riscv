@@ -59,5 +59,9 @@ void yolo_desc_prof_print(void);
 
 // Reset the record/replay program cursor + bump allocators at net start.
 void yolo_desc_reset(void);
+void yolo_desc_graph_begin(void);
+int yolo_desc_graph_end_and_submit(void);
+int yolo_desc_graph_active(void);
+uint32_t yolo_desc_submit_count(void);
 
 #endif

@@ -25,6 +25,9 @@ static uint32_t g_desc_wgt   = 0u;   // preload weight DMA (real transfer)
 static uint32_t g_desc_recs  = 0u;   // total descriptor records summed over all submits
 static uint32_t g_desc_calls = 0u;   // number of layer submits (for resident region sizing)
 static uint32_t g_desc_maxrec = 0u;  // largest single program (records) -> peak region
+static uint32_t g_graph_active = 0u; // append records into one graph stream
+static uint32_t g_graph_di = 0u;     // descriptor count in the active graph
+static uint32_t g_submit_count = 0u; // hardware descriptor submits since reset
 static inline uint32_t d_cyc(void){ return *(volatile uint32_t *)NPU_PERF_CYC_TOTAL; }
 void yolo_desc_prof_print(void)
 {
@@ -52,7 +55,15 @@ static volatile desc_cat_t *const g_catalog =
     (volatile desc_cat_t *)DESC_CATALOG_BASE;
 
 void yolo_desc_reset(void)
-{ g_prog_idx = 0u; g_img_top = 0u; g_qp_top = 0u; g_prog_base = YOLO_DESC_DDR; }
+{
+    g_prog_idx = 0u;
+    g_img_top = 0u;
+    g_qp_top = 0u;
+    g_prog_base = YOLO_DESC_DDR;
+    g_graph_active = 0u;
+    g_graph_di = 0u;
+    g_submit_count = 0u;
+}
 
 // Point the record builders at this program's slot (record) or the throwaway
 // scratch (replay rebuilds nothing the engine uses).
@@ -67,6 +78,82 @@ static void desc_prog_begin(void)
 
 /* defined below; called by the record path, unused in replay builds */
 static int d_submit(uint32_t count) __attribute__((unused));
+static void d_stop(uint32_t *idx);
+
+void yolo_desc_graph_begin(void)
+{
+    g_graph_active = 1u;
+    g_graph_di = 0u;
+    desc_prog_begin();
+}
+
+int yolo_desc_graph_active(void)
+{
+    return g_graph_active != 0u;
+}
+
+uint32_t yolo_desc_submit_count(void)
+{
+    return g_submit_count;
+}
+
+int yolo_desc_graph_end_and_submit(void)
+{
+    uint32_t _tr;
+    int ok;
+    if (g_graph_active == 0u)
+        return 0;
+
+    d_stop(&g_graph_di);
+    g_desc_recs += g_graph_di;
+    g_desc_calls += 1u;
+    if (g_graph_di > g_desc_maxrec)
+        g_desc_maxrec = g_graph_di;
+
+#ifdef DESC_RECORD
+    g_catalog[g_prog_idx].off_words = (g_prog_base - DESC_IMAGE_BASE) / 4u;
+    g_catalog[g_prog_idx].count = g_graph_di;
+    g_prog_idx++;
+    g_img_top += g_graph_di * NPU_HW_DESC_WORDS;
+    _tr = d_cyc();
+    ok = d_submit(g_graph_di);
+    g_desc_run += d_cyc() - _tr;
+    g_prog_base += g_graph_di * NPU_HW_DESC_WORDS * 4u;
+#else
+    {
+        desc_cat_t c;
+        c.off_words = g_catalog[g_prog_idx].off_words;
+        c.count = g_catalog[g_prog_idx].count;
+        if (c.count != 0u) {
+            int t;
+            g_prog_idx++;
+            d_npu_wr(NPU_DESC_BASE_LO, DESC_IMAGE_BASE + c.off_words * 4u);
+            d_npu_wr(NPU_DESC_BASE_HI, 0u);
+            d_npu_wr(NPU_DESC_COUNT, c.count);
+            d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
+            d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_START);
+            _tr = d_cyc();
+            t = 8000000;
+            ok = 0;
+            while (t-- > 0) {
+                uint32_t st = d_npu_rd(NPU_DESC_STATUS);
+                if (st & NPU_DESC_STATUS_ERR) break;
+                if (st & NPU_DESC_STATUS_DONE) { ok = 1; break; }
+            }
+            g_desc_run += d_cyc() - _tr;
+            if (ok) g_submit_count++;
+            d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
+        } else {
+            _tr = d_cyc();
+            ok = d_submit(g_graph_di);
+            g_desc_run += d_cyc() - _tr;
+        }
+    }
+#endif
+
+    g_graph_active = 0u;
+    return ok;
+}
 
 // Record: append {slot offset, di} to the catalog, submit, bump. Replay: ignore
 // the just-built records, submit the pre-loaded program at catalog[g_prog_idx].
@@ -99,6 +186,7 @@ static int desc_submit_cataloged(uint32_t di)
         }
         if (t <= 0) return 0;
         d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
+        g_submit_count++;
         return 1;
     }
 #endif
@@ -259,6 +347,7 @@ static int d_submit(uint32_t count)
     }
     if (t <= 0) return 0;
     d_npu_wr(NPU_DESC_CTRL, NPU_DESC_CTRL_CLEAR_DONE);
+    g_submit_count++;
     return 1;
 }
 
@@ -366,6 +455,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
     for (oy0 = 0u; oy0 < out_h; oy0 += strip_out_rows) {
         uint32_t so = out_h - oy0;
         uint32_t di = 0u;
+        uint32_t *pdi = g_graph_active ? &g_graph_di : &di;
         if (so > strip_out_rows) so = strip_out_rows;
 #ifdef DESC_RECORD
         uint32_t strip_in_h, g, ri;
@@ -374,8 +464,9 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         strip_in_h = (so - 1u) * stride + kernel_h;  /* pad_h=0 */
         ir0 = (int32_t)(oy0 * stride) - (int32_t)pad;
 
-        desc_prog_begin();
-        d_act_cfg(&di, pad_value, act_flags, silu_requant_mul,
+        if (!g_graph_active)
+            desc_prog_begin();
+        d_act_cfg(pdi, pad_value, act_flags, silu_requant_mul,
                   silu_requant_shift, silu_requant_zp);
 
         for (g = 0u; g < icg; g++) {
@@ -385,7 +476,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                 uint32_t src = (r >= 0 && r < (int32_t)in_h)
                     ? in_ddr + (g * in_h + (uint32_t)r) * in_w * 16u
                     : pad_row_ddr;
-                d_dma_in(&di, src, dst, in_w);
+                d_dma_in(pdi, src, dst, in_w);
             }
         }
 
@@ -402,30 +493,32 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                     cwgt = wgt_base + done * wgt_words_per_oc;   // resident slice
                 } else {
                     // Reload this chunk's weights into Wgt SRAM base.
-                    d_dma_wgt(&di, wgt_all_ddr + done * wgt_words_per_oc * 16u,
+                    d_dma_wgt(pdi, wgt_all_ddr + done * wgt_words_per_oc * 16u,
                               wgt_base, chunk * wgt_words_per_oc);
                     cwgt = wgt_base;
                 }
                 // PADDED dims; pad_w horizontal HW pad, pad_h=0 (rows DMA'd).
-                d_conv(&di, 0u, cwgt,
+                d_conv(pdi, 0u, cwgt,
                        in_w + 2u * pad, strip_in_h, in_c, chunk,
                        kernel_h, kernel_w, stride, pad, 0u, conv_flags,
                        qbase_ddr + done * 16u, chunk);
                 for (sg = 0u; sg < cgroups; sg++) {
                     uint32_t oc_grp = done / 16u + sg;
-                    d_drain(&di, sg * so * out_w,
+                    d_drain(pdi, sg * so * out_w,
                             out_ddr + (oc_grp * out_h + oy0) * out_w * 16u, so * out_w);
                 }
                 done += chunk;
             }
         }
-        d_stop(&di);
+        if (!g_graph_active)
+            d_stop(pdi);
         g_desc_build += d_cyc() - _tb;
 #else
+        (void)pdi;
         (void)so;   /* replay: submit the pre-built program for this strip */
 #endif
 
-        {
+        if (!g_graph_active) {
             uint32_t _tr = d_cyc();
             int ok = desc_submit_cataloged(di);
             g_desc_run += d_cyc() - _tr;
@@ -446,15 +539,19 @@ int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
     uint32_t words = in_w * in_h * ic_groups;
     uint32_t dst_act = scratch_act_base + words;
     uint32_t di = 0u;
+    uint32_t *pdi = g_graph_active ? &g_graph_di : &di;
 
     if (in_w == 0u || in_h == 0u || ic_groups == 0u)
         return 1;
 
-    desc_prog_begin();
-    d_dma_in(&di, src_ddr, scratch_act_base, words);
-    d_maxpool(&di, scratch_act_base, dst_act, in_w, in_h, ic_groups * 16u);
-    d_dma_out_act(&di, dst_act, dst_ddr, words);
-    d_stop(&di);
+    if (!g_graph_active)
+        desc_prog_begin();
+    d_dma_in(pdi, src_ddr, scratch_act_base, words);
+    d_maxpool(pdi, scratch_act_base, dst_act, in_w, in_h, ic_groups * 16u);
+    d_dma_out_act(pdi, dst_act, dst_ddr, words);
+    if (g_graph_active)
+        return 1;
+    d_stop(pdi);
     return desc_submit_cataloged(di);
 }
 
@@ -467,25 +564,29 @@ int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
                               uint32_t ratio_mul, uint32_t ratio_shift)
 {
     uint32_t done = 0u, di = 0u;
+    uint32_t *pdi = g_graph_active ? &g_graph_di : &di;
     const uint32_t max_chunk = 4096u;
     uint32_t packed = NPU_ELT_PACK((uint32_t)zp, ratio_en, ratio_shift, ratio_mul);
 
     if (words == 0u)
         return 1;
 
-    desc_prog_begin();
+    if (!g_graph_active)
+        desc_prog_begin();
     while (done < words) {
         uint32_t chunk = words - done;
         uint32_t src1_act, dst_act;
         if (chunk > max_chunk) chunk = max_chunk;
         src1_act = scratch_act_base + chunk;
         dst_act  = src1_act + chunk;
-        d_dma_in(&di, src0_ddr + done * 16u, scratch_act_base, chunk);
-        d_dma_in(&di, src1_ddr + done * 16u, src1_act, chunk);
-        d_eltwise(&di, scratch_act_base, dst_act, src1_act, packed, chunk);
-        d_dma_out_act(&di, dst_act, dst_ddr + done * 16u, chunk);
+        d_dma_in(pdi, src0_ddr + done * 16u, scratch_act_base, chunk);
+        d_dma_in(pdi, src1_ddr + done * 16u, src1_act, chunk);
+        d_eltwise(pdi, scratch_act_base, dst_act, src1_act, packed, chunk);
+        d_dma_out_act(pdi, dst_act, dst_ddr + done * 16u, chunk);
         done += chunk;
     }
-    d_stop(&di);
+    if (g_graph_active)
+        return 1;
+    d_stop(pdi);
     return desc_submit_cataloged(di);
 }
