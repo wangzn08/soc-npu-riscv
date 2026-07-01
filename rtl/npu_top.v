@@ -5,9 +5,9 @@
 // Instantiates:
 //   param_regfile         — AXI-Lite config/status register file
 //   top_controller_fsm    — Main sequencer & address generators
-//   act_sram_wrapper      — Activation SRAM (256 KB Ping-Pong)
+//   act_sram_wrapper      — Activation SRAM (64K x 128b Ping-Pong)
 //   wgt_sram_wrapper      — Weight SRAM (256 KB Ping-Pong)
-//   out_sram_wrapper      — Output SRAM (128 KB Ping-Pong)
+//   out_sram_wrapper      — Output SRAM (16K x 128b Ping-Pong)
 //   im2col_line_buffer    — Sliding-window Im2Col converter
 //   wgt_reader            — Weight pre-fetch & assembly
 //   systolic_16x16        — 16×16 systolic array (4096 MACs/cycle)
@@ -29,8 +29,8 @@ module npu_top #(
     parameter AXI_LEN_W     = 8,
     parameter REG_ADDR_W    = 12,
     parameter REG_DATA_W    = 32,
-    parameter SRAM_ADDR_W   = 14,
-    parameter OUT_SRAM_ADDR_W = 13,
+    parameter SRAM_ADDR_W   = 16,
+    parameter OUT_SRAM_ADDR_W = 14,
     parameter ACT_DATA_W    = 128,
     parameter PSUM_WIDTH    = 32,
     parameter ACT_WIDTH     = 8,
@@ -412,6 +412,7 @@ module npu_top #(
 
     wire                            run_start         = desc_busy ? desc_npu_start      : cfg_start;
     wire                            run_ping_pong_sel = desc_busy ? desc_ctrl_flags[1]  : cfg_ping_pong_sel;
+    wire                            run_act_ping_sel  = desc_busy ? desc_ctrl_flags[24] : cfg_ping_pong_sel;
     wire                            run_pool_en       = desc_busy ? desc_ctrl_flags[2]  : cfg_pool_en;
     wire                            run_eltwise_en    = desc_busy ? desc_ctrl_flags[3]  : cfg_eltwise_en;
     wire                            run_relu_en       = desc_busy ? desc_ctrl_flags[5]  : cfg_relu_en;
@@ -783,7 +784,9 @@ module npu_top #(
 
     act_sram_wrapper #(
         .DATA_W (ACT_DATA_W),
-        .ADDR_W (SRAM_ADDR_W)
+        .ADDR_W (SRAM_ADDR_W),
+        .PONG_BASE (32768),
+        .DEPTH  (65536)
     ) u_act_sram (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -795,7 +798,7 @@ module npu_top #(
         .addrb         (act_sram_addrb),
         .dib           (act_sram_dib),
         .dob           (act_sram_dob),
-        .npu_ping_sel  (run_ping_pong_sel),
+        .npu_ping_sel  (run_act_ping_sel),
         .dma_ping_sel  (run_dma_act_ping_sel)
     );
 
@@ -812,7 +815,9 @@ module npu_top #(
 
     wgt_sram_wrapper #(
         .DATA_W (ACT_DATA_W),
-        .ADDR_W (SRAM_ADDR_W)
+        .ADDR_W (SRAM_ADDR_W),
+        .PONG_BASE (8192),
+        .DEPTH  (16384)
     ) u_wgt_sram (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -843,7 +848,9 @@ module npu_top #(
 
     out_sram_wrapper #(
         .DATA_W (ACT_DATA_W),
-        .ADDR_W (OUT_SRAM_ADDR_W)
+        .ADDR_W (OUT_SRAM_ADDR_W),
+        .PONG_BASE (8192),
+        .DEPTH  (16384)
     ) u_out_sram (
         .clk           (clk),
         .rst_n         (rst_n),

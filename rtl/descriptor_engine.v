@@ -127,6 +127,8 @@ module descriptor_engine #(
     localparam OP_GEMM                 = 8'h07;
     localparam OP_STOP_IRQ = 8'h08;
     localparam OP_DMA_DDR_TO_WGT       = 8'h09; // load conv weights DDR -> Wgt SRAM
+    localparam OP_CONV2D_ASYNC         = 8'h0A; // start CONV2D, then continue descriptor stream
+    localparam OP_WAIT_NPU             = 8'h0B; // wait for outstanding async CONV2D
     localparam OP_UPSAMPLE2X = 8'h20; // 2x nearest-neighbour upsample (Act SRAM)
     localparam OP_MAXPOOL5X5 = 8'h21; // 5x5 stride-1 signed maxpool (Act SRAM)
     localparam OP_ELTWISE_ADD = 8'h22; // signed eltwise add (C2f residual)
@@ -175,6 +177,7 @@ module descriptor_engine #(
     reg [1:0] beat_idx;
     reg [31:0] desc_w [0:15];
     reg [3:0] wait_kind;
+    reg       npu_pending;
     reg       wait_guard;   // skip the first S_WAIT_OP cycle: the trig pulse is
                             // still in flight, so the engine's level-type done
                             // (copy/expand/dma) has not yet cleared its STALE
@@ -215,6 +218,7 @@ module descriptor_engine #(
         m_axi_rready = 1'b0;
         beat_idx = 2'd0;
         wait_kind = WAIT_NONE;
+        npu_pending = 1'b0;
         wait_guard = 1'b0;
         o_dma_rd_req = 1'b0;
         o_dma_wr_req = 1'b0;
@@ -303,6 +307,7 @@ module descriptor_engine #(
             m_axi_rready <= 1'b0;
             beat_idx <= 2'd0;
             wait_kind <= WAIT_NONE;
+            npu_pending <= 1'b0;
             wait_guard <= 1'b0;
             o_dma_rd_req <= 1'b0;
             o_dma_wr_req <= 1'b0;
@@ -326,6 +331,9 @@ module descriptor_engine #(
             o_qparam_scale <= 32'd0;
             o_qparam_shift <= 6'd0;
             o_npu_start <= 1'b0;
+
+            if (i_npu_done)
+                npu_pending <= 1'b0;
             o_ctrl_flags <= 32'd0;
             o_in_w <= 16'd0;
             o_in_h <= 16'd0;
@@ -470,11 +478,13 @@ module descriptor_engine #(
                             set_error(ERR_BAD_SHAPE);
                         else
                             state <= S_START_OP;
-                    end else if (desc_op == OP_CONV2D || desc_op == OP_GEMM) begin
+                    end else if (desc_op == OP_CONV2D || desc_op == OP_CONV2D_ASYNC || desc_op == OP_GEMM) begin
                         if (desc_w[8] == 32'd0 || desc_w[9] == 32'd0)
                             set_error(ERR_BAD_SHAPE);
                         else
                             state <= S_START_OP;
+                    end else if (desc_op == OP_WAIT_NPU) begin
+                        state <= S_START_OP;
                     end else if (desc_op == OP_UPSAMPLE2X ||
                                  desc_op == OP_MAXPOOL5X5) begin
                         if (desc_w[8] == 32'd0 || desc_w[9] == 32'd0)
@@ -587,7 +597,7 @@ module descriptor_engine #(
                         wait_kind <= WAIT_COPY;
                         state <= S_WAIT_OP;
                     end
-                    OP_CONV2D, OP_GEMM: begin
+                    OP_CONV2D, OP_CONV2D_ASYNC, OP_GEMM: begin
                         o_ctrl_flags <= {desc_w[1][15:0], desc_w[0][31:16]} |
                                         (desc_op == OP_GEMM ? 32'h0000_0080 : 32'd0);
                         o_act_addr <= desc_w[2][SRAM_ADDR_W-1:0];
@@ -608,6 +618,16 @@ module descriptor_engine #(
                         o_pad_w <= {4'd0, desc_w[10][27:24]};
                         o_pad_h <= {4'd0, desc_w[10][31:28]};
                         state <= S_NPU_START;
+                    end
+                    OP_WAIT_NPU: begin
+                        if (!npu_pending || i_npu_done) begin
+                            wait_kind <= WAIT_NONE;
+                            state <= S_ADVANCE;
+                        end else begin
+                            wait_kind <= WAIT_NPU;
+                            wait_guard <= 1'b0;
+                            state <= S_WAIT_OP;
+                        end
                     end
                     OP_UPSAMPLE2X: begin
                         // src/dst reuse the DMA SRAM-base regs; dims reuse the
@@ -655,8 +675,14 @@ module descriptor_engine #(
 
                 S_NPU_START: begin
                     o_npu_start <= 1'b1;
-                    wait_kind <= WAIT_NPU;
-                    state <= S_WAIT_OP;
+                    if (desc_op == OP_CONV2D_ASYNC) begin
+                        npu_pending <= 1'b1;
+                        wait_kind <= WAIT_NONE;
+                        state <= S_ADVANCE;
+                    end else begin
+                        wait_kind <= WAIT_NPU;
+                        state <= S_WAIT_OP;
+                    end
                 end
 
                 S_QPARAM_AR: begin

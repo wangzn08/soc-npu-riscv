@@ -4,6 +4,10 @@
 // Synthesizable; infers block RAM on FPGA, SRAM macro on ASIC.
 //
 // Instances:
+// Current defaults:
+//   Act SRAM:  128b x 65536 (512 KB ping + 512 KB pong = 1 MB total)
+//   Wgt SRAM:  128b x 16384 (128 KB ping + 128 KB pong = 256 KB total)
+//   Out SRAM:  128b x 16384 (128 KB ping + 128 KB pong = 256 KB total)
 //   Act SRAM:  128b × 16384  (128 KB ping + 128 KB pong = 256 KB total)
 //   Wgt SRAM:  128b × 16384  (same as Act)
 //   Out SRAM:  128b ×  8192  ( 64 KB ping +  64 KB pong = 128 KB total)
@@ -86,15 +90,15 @@ endmodule
 
 // ===================================================================
 // Act SRAM wrapper: Ping-Pong double buffer
-//   Ping: address range [0      .. 8191]
-//   Pong: address range [8192   .. 16383]
+//   Ping: address range [0      .. 32767]
+//   Pong: address range [32768  .. 65535]
 // ===================================================================
 module act_sram_wrapper #(
     parameter DATA_W  = 128,
-    parameter ADDR_W  = 14,
+    parameter ADDR_W  = 16,
     parameter PING_BASE = 0,
-    parameter PONG_BASE = 8192,
-    parameter DEPTH   = 16384,
+    parameter PONG_BASE = 32768,
+    parameter DEPTH   = 65536,
     parameter COMB_B  = 1            // combinational read on Port B (DMA)
 ) (
     input  wire                     clk,
@@ -202,15 +206,15 @@ endmodule
 
 // ===================================================================
 // Out / Psum SRAM wrapper: Ping-Pong double buffer
-//   Each buffer: 64 KB = 65536 bytes → 128-bit width → 4096 deep
-//   Ping: [0..4095], Pong: [4096..8191]
+//   Default total: 16K 128-bit words
+//   Ping: [0..8191], Pong: [8192..16383]
 // ===================================================================
 module out_sram_wrapper #(
     parameter DATA_W  = 128,
-    parameter ADDR_W  = 13,
+    parameter ADDR_W  = 14,
     parameter PING_BASE = 0,
-    parameter PONG_BASE = 4096,
-    parameter DEPTH   = 8192,
+    parameter PONG_BASE = 8192,
+    parameter DEPTH   = 16384,
     parameter COMB_B  = 1
 ) (
     input  wire                     clk,
