@@ -166,6 +166,42 @@ static int c2f_impl(const yolo_c2f_cfg_t *cfg, int use_desc)
         else
             prev_ddr = add_slot(cfg, i-1u, full_groups, half_groups, sp);
 
+        uint32_t add_dst = add_slot(cfg, i, full_groups, half_groups, sp);
+        uint32_t local_pair = use_desc && cfg->silu_exact && cfg->cv2_folded &&
+                              (cfg->shortcut == 0u) && (cfg->n_bottleneck == 1u) &&
+                              (half_groups * sp <= 4096u);
+
+        if (local_pair) {
+            uint32_t half_c = cfg->full_c / 2u;
+            uint32_t wd;
+            uint32_t f;
+
+            yolo_set_pad_value(cfg->mcv1_pad_value[i]);
+            wd = wgt_src(cfg, cfg->mcv1_wgt_ddr[i], cfg->mcv1_wgt[i], cfg->mcv1_wgt_words);
+            f = silu_setup(cfg, cfg->mcv1_silu_lut[i], cfg->mcv1_rq_mul[i],
+                           cfg->mcv1_rq_shift[i], cfg->mcv1_rq_zp[i]);
+            if (!yolo_run_conv2d_resident_desc(prev_ddr, wd, WGT_BASE, 0u,
+                                   cfg->in_w, cfg->in_h, half_c, half_c,
+                                   3u, 3u, 1u, 1u,
+                                   cfg->mcv1_bias[i], cfg->mcv1_mul[i], cfg->mcv1_shift[i],
+                                   f, cfg->mcv1_wgt_words / half_c,
+                                   cfg->mcv1_pad_value[i], 0u, 0u))
+                return 0;
+
+            yolo_set_pad_value(cfg->mcv2_pad_value[i]);
+            wd = wgt_src(cfg, cfg->mcv2_wgt_ddr[i], cfg->mcv2_wgt[i], cfg->mcv2_wgt_words);
+            f = silu_setup(cfg, cfg->mcv2_silu_lut[i], cfg->glue_rq_mul[i],
+                           cfg->glue_rq_shift[i], cfg->glue_zp[i]);
+            if (!yolo_run_conv2d_resident_desc(0u, wd, WGT_BASE, add_dst,
+                                   cfg->in_w, cfg->in_h, half_c, half_c,
+                                   3u, 3u, 1u, 1u,
+                                   cfg->mcv2_bias[i], cfg->mcv2_mul[i], cfg->mcv2_shift[i],
+                                   f, cfg->mcv2_wgt_words / half_c,
+                                   cfg->mcv2_pad_value[i], 1u, 1u))
+                return 0;
+            continue;
+        }
+
         // Large-IC 3x3 (exact mode, half_c/16 > ICG_BUF) can't fit the im2col
         // window: stream IC via INT32 psum accumulate (CPU final SiLU). Otherwise
         // the resident tiled path.
@@ -230,7 +266,6 @@ static int c2f_impl(const yolo_c2f_cfg_t *cfg, int use_desc)
 
         // residual add -> add slot; shortcut uses the generic Act-SRAM eltwise
         // engine in chunks so large early C2f tensors do not require more SRAM.
-        uint32_t add_dst = add_slot(cfg, i, full_groups, half_groups, sp);
         if (cfg->shortcut) {
             int ok = use_desc
                 ? yolo_run_eltwise_add_desc(prev_ddr, cfg->mcv2_ddr, add_dst,

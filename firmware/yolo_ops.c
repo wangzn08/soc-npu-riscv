@@ -12,7 +12,7 @@
 #define YOLO_DMA_TIMEOUT 4000000u
 #define YOLO_NPU_TIMEOUT 60000000u   /* big 320 layers (ic128/oc256, no row_par) run many M cycles */
 #define YOLO_DMA_MAX_BEATS 256u
-#define YOLO_ACT_SRAM_WORDS 16384u
+#define YOLO_ACT_SRAM_WORDS 65536u
 
 static inline void npu_wr(uint32_t addr, uint32_t data)
 {
@@ -355,7 +355,7 @@ int yolo_run_eltwise_add_ddr(uint32_t src0_ddr,
                              uint32_t ratio_shift)
 {
     uint32_t done = 0u;
-    const uint32_t max_chunk = 4096u;
+    const uint32_t max_chunk = 8192u;
 
     if (words == 0u)
         return 1;

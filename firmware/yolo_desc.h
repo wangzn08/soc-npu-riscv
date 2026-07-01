@@ -34,11 +34,32 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                                uint32_t silu_requant_shift,
                                int32_t silu_requant_zp);
 
+// Full-feature resident conv for small tensors. The first layer can DMA input
+// from DDR into Act SRAM; later layers can copy previous Out SRAM into Act SRAM.
+// Set drain_output=0 to keep the output resident in Out SRAM for the next call.
+int yolo_run_conv2d_resident_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
+                                  uint32_t wgt_base, uint32_t out_ddr,
+                                  uint32_t in_w, uint32_t in_h,
+                                  uint32_t in_c, uint32_t out_c,
+                                  uint32_t kernel_h, uint32_t kernel_w,
+                                  uint32_t stride, uint32_t pad,
+                                  const int32_t *bias, const uint32_t *scale_mul,
+                                  const uint32_t *scale_shift, uint32_t ctrl_flags,
+                                  uint32_t wgt_words_per_oc, int32_t pad_value,
+                                  uint32_t input_from_out_sram,
+                                  uint32_t drain_output);
+
 // 5x5 stride-1 signed maxpool (DDR->DDR) via one descriptor program (DMA-in +
 // HW maxpool + DMA-out). Same args/result as yolo_run_maxpool5x5 (yolo_ops.c).
 int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
                              uint32_t scratch_act_base, uint32_t in_w,
                              uint32_t in_h, uint32_t ic_groups);
+
+// SPPF-local residency helper: DMA conv25 output once into Act SRAM, run the
+// three 5x5 pools on chip, then drain [x, pool1, pool2, pool3] as concat DDR.
+int yolo_run_sppf_pool_concat_desc(uint32_t src_ddr, uint32_t cat_ddr,
+                                   uint32_t scratch_act_base, uint32_t in_w,
+                                   uint32_t in_h, uint32_t ic_groups);
 
 // Signed eltwise residual add (DDR->DDR) via one descriptor program. Same args
 // and result as yolo_run_eltwise_add_ddr (yolo_ops.c).

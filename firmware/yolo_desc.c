@@ -7,6 +7,11 @@
 
 #define DMA_RD_MAX  256u   // DDR->Act beats/descriptor (axi_dma read len 8-bit)
 #define DMA_WR_MAX  64u    // Out->DDR beats/descriptor
+#define DESC_ACT_SRAM_WORDS 65536u
+#define DESC_ACT_BANK_WORDS 32768u
+#define DESC_OUT_SRAM_WORDS 16384u
+#define DESC_OUT_BANK_WORDS 8192u
+#define DESC_WGT_SRAM_WORDS 16384u
 
 static inline void d_npu_wr(uint32_t a, uint32_t d){ *(volatile uint32_t*)a = d; }
 static inline uint32_t d_npu_rd(uint32_t a){ return *(volatile uint32_t*)a; }
@@ -126,7 +131,8 @@ static void __attribute__((unused)) d_act_cfg(uint32_t *idx, int32_t pad_value, 
     d[5] = 0u;                          // clip_max -> default 127
 }
 
-static void d_dma_in(uint32_t *idx, uint32_t src_ddr, uint32_t act_base, uint32_t words)
+static void d_dma_in_bank(uint32_t *idx, uint32_t src_ddr, uint32_t act_base,
+                          uint32_t words, uint32_t act_bank)
 {
     uint32_t off = 0u;
     while (off < words) {
@@ -135,10 +141,40 @@ static void d_dma_in(uint32_t *idx, uint32_t src_ddr, uint32_t act_base, uint32_
         if (ch > DMA_RD_MAX) ch = DMA_RD_MAX;
         d = dword((*idx)++); dclr(d);
         dop(d, NPU_HW_DESC_OP_DMA_DDR_TO_ACT, 0u);
+        if (act_bank)
+            d[1] |= 1u;
         d[2] = src_ddr + off * 16u;
         d[4] = act_base + off;
         d[7] = ch;
         off += ch;
+    }
+}
+
+static void d_dma_in(uint32_t *idx, uint32_t src_ddr, uint32_t act_base, uint32_t words)
+{
+    d_dma_in_bank(idx, src_ddr, act_base, words, 0u);
+}
+
+static void __attribute__((unused)) d_dma_strip_in_bank(uint32_t *idx,
+                                                        uint32_t in_ddr,
+                                                        uint32_t pad_row_ddr,
+                                                        uint32_t in_w,
+                                                        uint32_t in_h,
+                                                        uint32_t icg,
+                                                        uint32_t strip_in_h,
+                                                        int32_t ir0,
+                                                        uint32_t act_bank)
+{
+    uint32_t g, ri;
+    for (g = 0u; g < icg; g++) {
+        for (ri = 0u; ri < strip_in_h; ri++) {
+            int32_t r = ir0 + (int32_t)ri;
+            uint32_t dst = (g * strip_in_h + ri) * in_w;
+            uint32_t src = (r >= 0 && r < (int32_t)in_h)
+                ? in_ddr + (g * in_h + (uint32_t)r) * in_w * 16u
+                : pad_row_ddr;
+            d_dma_in_bank(idx, src, dst, in_w, act_bank);
+        }
     }
 }
 
@@ -172,6 +208,37 @@ static void __attribute__((unused)) d_drain(uint32_t *idx, uint32_t out_base, ui
         d[7] = ch;
         off += ch;
     }
+}
+
+static void __attribute__((unused)) d_drain_bank(uint32_t *idx, uint32_t out_base,
+                                                 uint32_t dst_ddr, uint32_t words,
+                                                 uint32_t out_bank)
+{
+    uint32_t off = 0u;
+    while (off < words) {
+        uint32_t ch = words - off;
+        volatile uint32_t *d;
+        if (ch > DMA_WR_MAX) ch = DMA_WR_MAX;
+        d = dword((*idx)++); dclr(d);
+        dop(d, NPU_HW_DESC_OP_DMA_OUT_TO_DDR, 0u);
+        if (out_bank)
+            d[1] |= 4u;
+        d[2] = out_base + off;
+        d[4] = dst_ddr + off * 16u;
+        d[7] = ch;
+        off += ch;
+    }
+}
+
+static void __attribute__((unused)) d_sram_copy_out_to_act(uint32_t *idx, uint32_t out_base,
+                                                           uint32_t act_base, uint32_t words)
+{
+    volatile uint32_t *d = dword((*idx)++);
+    dclr(d);
+    dop(d, NPU_HW_DESC_OP_SRAM_COPY_OUT_TO_ACT, 0u);
+    d[2] = out_base;
+    d[4] = act_base;
+    d[7] = words;
 }
 
 // Act SRAM -> DDR drain (OP_DMA_ACT_TO_DDR), used by the maxpool/eltwise programs
@@ -220,18 +287,24 @@ static void d_eltwise(uint32_t *idx, uint32_t src0_act, uint32_t dst_act,
     d[7] = words;
 }
 
-static void __attribute__((unused)) d_conv(uint32_t *idx, uint32_t act, uint32_t wgt_base,
+static void __attribute__((unused)) d_conv_at_op(uint32_t *idx, uint32_t op,
+                   uint32_t act, uint32_t wgt_base, uint32_t out_base,
                    uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
                    uint32_t kh, uint32_t kw, uint32_t stride,
                    uint32_t pad_w, uint32_t pad_h, uint32_t ctrl_flags,
-                   uint32_t qbase, uint32_t qcnt)
+                   uint32_t qbase, uint32_t qcnt, uint32_t act_bank,
+                   uint32_t out_bank)
 {
     volatile uint32_t *d = dword((*idx)++);
     dclr(d);
-    dop(d, NPU_HW_DESC_OP_CONV2D, ctrl_flags);
+    if (act_bank)
+        ctrl_flags |= NPU_CTRL_ACT_PING;
+    if (out_bank)
+        ctrl_flags |= NPU_CTRL_OUT_PING;
+    dop(d, op, ctrl_flags);
     d[2] = act;
     d[3] = wgt_base;
-    d[4] = 0u;                          // Out SRAM base 0
+    d[4] = out_base;
     d[8] = (cfg_h << 16) | cfg_w;       // PADDED dims (HW pad reads unpadded tile)
     d[9] = (out_c << 16) | in_c;
     d[10] = (((pad_h & 0xFu) << 28) | ((pad_w & 0xFu) << 24)) |
@@ -240,8 +313,70 @@ static void __attribute__((unused)) d_conv(uint32_t *idx, uint32_t act, uint32_t
     d[12] = qcnt;
 }
 
+static void __attribute__((unused)) d_conv_at(uint32_t *idx, uint32_t act, uint32_t wgt_base,
+                   uint32_t out_base,
+                   uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
+                   uint32_t kh, uint32_t kw, uint32_t stride,
+                   uint32_t pad_w, uint32_t pad_h, uint32_t ctrl_flags,
+                   uint32_t qbase, uint32_t qcnt)
+{
+    d_conv_at_op(idx, NPU_HW_DESC_OP_CONV2D, act, wgt_base, out_base,
+                 cfg_w, cfg_h, in_c, out_c, kh, kw, stride, pad_w, pad_h,
+                 ctrl_flags, qbase, qcnt, 0u, 0u);
+}
+
+static void __attribute__((unused)) d_conv_async_bank(uint32_t *idx, uint32_t act,
+                   uint32_t wgt_base, uint32_t out_base,
+                   uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
+                   uint32_t kh, uint32_t kw, uint32_t stride,
+                   uint32_t pad_w, uint32_t pad_h, uint32_t ctrl_flags,
+                   uint32_t qbase, uint32_t qcnt, uint32_t out_bank)
+{
+    d_conv_at_op(idx, NPU_HW_DESC_OP_CONV2D_ASYNC, act, wgt_base, out_base,
+                 cfg_w, cfg_h, in_c, out_c, kh, kw, stride, pad_w, pad_h,
+                 ctrl_flags, qbase, qcnt, 0u, out_bank);
+}
+
+static void __attribute__((unused)) d_conv_async_act_out_bank(uint32_t *idx,
+                   uint32_t act, uint32_t wgt_base, uint32_t out_base,
+                   uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
+                   uint32_t kh, uint32_t kw, uint32_t stride,
+                   uint32_t pad_w, uint32_t pad_h, uint32_t ctrl_flags,
+                   uint32_t qbase, uint32_t qcnt, uint32_t act_bank,
+                   uint32_t out_bank)
+{
+    d_conv_at_op(idx, NPU_HW_DESC_OP_CONV2D_ASYNC, act, wgt_base, out_base,
+                 cfg_w, cfg_h, in_c, out_c, kh, kw, stride, pad_w, pad_h,
+                 ctrl_flags, qbase, qcnt, act_bank, out_bank);
+}
+
+static void __attribute__((unused)) d_conv_act_bank(uint32_t *idx, uint32_t act,
+                   uint32_t wgt_base, uint32_t out_base,
+                   uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
+                   uint32_t kh, uint32_t kw, uint32_t stride,
+                   uint32_t pad_w, uint32_t pad_h, uint32_t ctrl_flags,
+                   uint32_t qbase, uint32_t qcnt, uint32_t act_bank)
+{
+    d_conv_at_op(idx, NPU_HW_DESC_OP_CONV2D, act, wgt_base, out_base,
+                 cfg_w, cfg_h, in_c, out_c, kh, kw, stride, pad_w, pad_h,
+                 ctrl_flags, qbase, qcnt, act_bank, 0u);
+}
+
+static void __attribute__((unused)) d_conv(uint32_t *idx, uint32_t act, uint32_t wgt_base,
+                   uint32_t cfg_w, uint32_t cfg_h, uint32_t in_c, uint32_t out_c,
+                   uint32_t kh, uint32_t kw, uint32_t stride,
+                   uint32_t pad_w, uint32_t pad_h, uint32_t ctrl_flags,
+                   uint32_t qbase, uint32_t qcnt)
+{
+    d_conv_at(idx, act, wgt_base, 0u, cfg_w, cfg_h, in_c, out_c,
+              kh, kw, stride, pad_w, pad_h, ctrl_flags, qbase, qcnt);
+}
+
 static void d_stop(uint32_t *idx)
 { volatile uint32_t *d = dword((*idx)++); dclr(d); dop(d, NPU_HW_DESC_OP_STOP_IRQ, 0u); }
+
+static void __attribute__((unused)) d_wait_npu(uint32_t *idx)
+{ volatile uint32_t *d = dword((*idx)++); dclr(d); dop(d, NPU_HW_DESC_OP_WAIT_NPU, 0u); }
 
 static int d_submit(uint32_t count)
 {
@@ -278,7 +413,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
                                int32_t silu_requant_zp)
 {
     uint32_t icg = in_c / 16u;
-    uint32_t out_w, out_h, oy0;
+    uint32_t out_w, out_h;
     // Activation flags forwarded to ACTIVATION_CFG (silu_exact / silu_en+requant).
     uint32_t act_flags = ((ctrl_flags & NPU_CTRL_SILU_EXACT_EN) ? 0x1u : 0u) |
                          ((ctrl_flags & NPU_CTRL_SILU_EN) ? 0x2u : 0u) |
@@ -300,7 +435,7 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
     // Weights fit Wgt SRAM (16384 words)? If so preload all OCs once (resident,
     // conv reads chunk c at base done*wgt_words_per_oc). Otherwise reload each
     // <=64-OC chunk into Wgt SRAM via descriptor right before its conv.
-    uint32_t preload_all = (out_c * wgt_words_per_oc <= 16384u);
+    uint32_t preload_all = (out_c * wgt_words_per_oc <= DESC_WGT_SRAM_WORDS);
 
     if (icg == 0u || in_w == 0u || in_h == 0u || out_c == 0u ||
         kernel_h == 0u || kernel_w == 0u || stride == 0u || strip_out_rows == 0u)
@@ -360,69 +495,157 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
        by the record build path below. */
     (void)in_ddr; (void)in_c; (void)ctrl_flags; (void)out_ddr; (void)conv_flags;
     (void)act_flags; (void)qbase_ddr; (void)chunk_cap; (void)out_w;
+    (void)out_h;
     (void)silu_requant_mul; (void)silu_requant_shift; (void)silu_requant_zp;
 #endif
 
-    for (oy0 = 0u; oy0 < out_h; oy0 += strip_out_rows) {
-        uint32_t so = out_h - oy0;
+    {
         uint32_t di = 0u;
-        if (so > strip_out_rows) so = strip_out_rows;
 #ifdef DESC_RECORD
-        uint32_t strip_in_h, g, ri;
-        int32_t ir0;
         uint32_t _tb = d_cyc();
-        strip_in_h = (so - 1u) * stride + kernel_h;  /* pad_h=0 */
-        ir0 = (int32_t)(oy0 * stride) - (int32_t)pad;
+        uint32_t strip_idx = 0u;
+        uint32_t oy0;
 
         desc_prog_begin();
         d_act_cfg(&di, pad_value, act_flags, silu_requant_mul,
                   silu_requant_shift, silu_requant_zp);
 
-        for (g = 0u; g < icg; g++) {
-            for (ri = 0u; ri < strip_in_h; ri++) {
-                int32_t r = ir0 + (int32_t)ri;
-                uint32_t dst = (g * strip_in_h + ri) * in_w;
-                uint32_t src = (r >= 0 && r < (int32_t)in_h)
-                    ? in_ddr + (g * in_h + (uint32_t)r) * in_w * 16u
-                    : pad_row_ddr;
-                d_dma_in(&di, src, dst, in_w);
-            }
+        if (out_h != 0u) {
+            uint32_t so0 = out_h;
+            uint32_t strip_in_h0;
+            int32_t ir00;
+            if (so0 > strip_out_rows) so0 = strip_out_rows;
+            strip_in_h0 = (so0 - 1u) * stride + kernel_h;
+            ir00 = -(int32_t)pad;
+            if (icg * strip_in_h0 * in_w > DESC_ACT_BANK_WORDS)
+                return 0;
+            d_dma_strip_in_bank(&di, in_ddr, pad_row_ddr, in_w, in_h, icg,
+                                strip_in_h0, ir00, 0u);
         }
 
-        // OC chunks: one CONV2D start computes up to 64 OCs (4 groups), then the
-        // chunk's OC groups are drained before the next chunk overwrites Out SRAM.
-        {
+        for (oy0 = 0u; oy0 < out_h; oy0 += strip_out_rows, strip_idx++) {
+            uint32_t so = out_h - oy0;
+            uint32_t strip_in_h, act_bank;
+            uint32_t next_oy0 = oy0 + strip_out_rows;
+            uint32_t has_next = (next_oy0 < out_h);
+            uint32_t next_so = 0u;
+            uint32_t next_strip_in_h = 0u;
+            uint32_t next_act_bank = (strip_idx + 1u) & 1u;
+            int32_t next_ir0 = 0;
+            uint32_t prefetched_next = 0u;
             uint32_t done = 0u;
+            uint32_t chunk_idx = 0u;
+            uint32_t have_prev = 0u;
+            uint32_t prev_done = 0u;
+            uint32_t prev_cgroups = 0u;
+            uint32_t prev_bank = 0u;
+            uint32_t words_per_group;
+            uint32_t max_cgroups = (chunk_cap + 15u) / 16u;
+            uint32_t overlap_out;
+            uint32_t sg;
+
+            if (so > strip_out_rows) so = strip_out_rows;
+            words_per_group = so * out_w;
+            overlap_out = (out_c > chunk_cap) &&
+                          (max_cgroups * words_per_group <= DESC_OUT_BANK_WORDS);
+            strip_in_h = (so - 1u) * stride + kernel_h;  /* pad_h=0 */
+            act_bank = strip_idx & 1u;
+            if (icg * strip_in_h * in_w > DESC_ACT_BANK_WORDS)
+                return 0;
+
+            if (has_next) {
+                next_so = out_h - next_oy0;
+                if (next_so > strip_out_rows) next_so = strip_out_rows;
+                next_strip_in_h = (next_so - 1u) * stride + kernel_h;
+                next_ir0 = (int32_t)(next_oy0 * stride) - (int32_t)pad;
+                if (icg * next_strip_in_h * in_w > DESC_ACT_BANK_WORDS)
+                    return 0;
+            }
+
             while (done < out_c) {
                 uint32_t chunk = out_c - done;
-                uint32_t sg, cgroups, cwgt;
+                uint32_t cgroups, cwgt;
                 if (chunk > chunk_cap) chunk = chunk_cap;
                 cgroups = (chunk + 15u) / 16u;
-                if (preload_all) {
-                    cwgt = wgt_base + done * wgt_words_per_oc;   // resident slice
+
+                if (overlap_out) {
+                    uint32_t bank = chunk_idx & 1u;
+                    if (have_prev)
+                        d_wait_npu(&di);
+
+                    if (preload_all) {
+                        cwgt = wgt_base + done * wgt_words_per_oc;
+                    } else {
+                        d_dma_wgt(&di, wgt_all_ddr + done * wgt_words_per_oc * 16u,
+                                  wgt_base, chunk * wgt_words_per_oc);
+                        cwgt = wgt_base;
+                    }
+
+                    d_conv_async_act_out_bank(&di, 0u, cwgt, 0u,
+                                              in_w + 2u * pad, strip_in_h, in_c, chunk,
+                                              kernel_h, kernel_w, stride, pad, 0u, conv_flags,
+                                              qbase_ddr + done * 16u, chunk, act_bank, bank);
+
+                    if (has_next && !prefetched_next) {
+                        d_dma_strip_in_bank(&di, in_ddr, pad_row_ddr, in_w, in_h, icg,
+                                            next_strip_in_h, next_ir0, next_act_bank);
+                        prefetched_next = 1u;
+                    }
+
+                    if (have_prev) {
+                        for (sg = 0u; sg < prev_cgroups; sg++) {
+                            uint32_t oc_grp = prev_done / 16u + sg;
+                            d_drain_bank(&di, sg * words_per_group,
+                                         out_ddr + (oc_grp * out_h + oy0) * out_w * 16u,
+                                         words_per_group, prev_bank);
+                        }
+                    }
+
+                    have_prev = 1u;
+                    prev_done = done;
+                    prev_cgroups = cgroups;
+                    prev_bank = bank;
                 } else {
-                    // Reload this chunk's weights into Wgt SRAM base.
-                    d_dma_wgt(&di, wgt_all_ddr + done * wgt_words_per_oc * 16u,
-                              wgt_base, chunk * wgt_words_per_oc);
-                    cwgt = wgt_base;
-                }
-                // PADDED dims; pad_w horizontal HW pad, pad_h=0 (rows DMA'd).
-                d_conv(&di, 0u, cwgt,
-                       in_w + 2u * pad, strip_in_h, in_c, chunk,
-                       kernel_h, kernel_w, stride, pad, 0u, conv_flags,
-                       qbase_ddr + done * 16u, chunk);
-                for (sg = 0u; sg < cgroups; sg++) {
-                    uint32_t oc_grp = done / 16u + sg;
-                    d_drain(&di, sg * so * out_w,
-                            out_ddr + (oc_grp * out_h + oy0) * out_w * 16u, so * out_w);
+                    if (preload_all) {
+                        cwgt = wgt_base + done * wgt_words_per_oc;   // resident slice
+                    } else {
+                        // Reload this chunk's weights into Wgt SRAM base.
+                        d_dma_wgt(&di, wgt_all_ddr + done * wgt_words_per_oc * 16u,
+                                  wgt_base, chunk * wgt_words_per_oc);
+                        cwgt = wgt_base;
+                    }
+                    d_conv_async_act_out_bank(&di, 0u, cwgt, 0u,
+                                              in_w + 2u * pad, strip_in_h, in_c, chunk,
+                                              kernel_h, kernel_w, stride, pad, 0u, conv_flags,
+                                              qbase_ddr + done * 16u, chunk, act_bank, 0u);
+                    if (has_next && !prefetched_next) {
+                        d_dma_strip_in_bank(&di, in_ddr, pad_row_ddr, in_w, in_h, icg,
+                                            next_strip_in_h, next_ir0, next_act_bank);
+                        prefetched_next = 1u;
+                    }
+                    d_wait_npu(&di);
+                    for (sg = 0u; sg < cgroups; sg++) {
+                        uint32_t oc_grp = done / 16u + sg;
+                        d_drain(&di, sg * words_per_group,
+                                out_ddr + (oc_grp * out_h + oy0) * out_w * 16u, words_per_group);
+                    }
                 }
                 done += chunk;
+                chunk_idx++;
+            }
+
+            if (overlap_out && have_prev) {
+                d_wait_npu(&di);
+                for (sg = 0u; sg < prev_cgroups; sg++) {
+                    uint32_t oc_grp = prev_done / 16u + sg;
+                    d_drain_bank(&di, sg * words_per_group,
+                                 out_ddr + (oc_grp * out_h + oy0) * out_w * 16u,
+                                 words_per_group, prev_bank);
+                }
             }
         }
         d_stop(&di);
         g_desc_build += d_cyc() - _tb;
-#else
-        (void)so;   /* replay: submit the pre-built program for this strip */
 #endif
 
         {
@@ -434,6 +657,136 @@ int yolo_run_conv2d_tiled_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
         }
     }
     return 1;
+}
+
+int yolo_run_conv2d_resident_desc(uint32_t in_ddr, uint32_t wgt_all_ddr,
+                                  uint32_t wgt_base, uint32_t out_ddr,
+                                  uint32_t in_w, uint32_t in_h,
+                                  uint32_t in_c, uint32_t out_c,
+                                  uint32_t kernel_h, uint32_t kernel_w,
+                                  uint32_t stride, uint32_t pad,
+                                  const int32_t *bias, const uint32_t *scale_mul,
+                                  const uint32_t *scale_shift, uint32_t ctrl_flags,
+                                  uint32_t wgt_words_per_oc, int32_t pad_value,
+                                  uint32_t input_from_out_sram,
+                                  uint32_t drain_output)
+{
+    uint32_t icg = in_c / 16u;
+    uint32_t out_w, out_h, spatial, in_words, out_words;
+    uint32_t di = 0u;
+    uint32_t act_flags = ((ctrl_flags & NPU_CTRL_SILU_EXACT_EN) ? 0x1u : 0u) |
+                         ((ctrl_flags & NPU_CTRL_SILU_EN) ? 0x2u : 0u) |
+                         ((ctrl_flags & NPU_CTRL_SILU_REQUANT_EN) ? 0x4u : 0u);
+    uint32_t is_pw = (kernel_h == 1u && kernel_w == 1u);
+    uint32_t pw_stream = is_pw && (icg > YOLO_ICG_BUF);
+    uint32_t chunk_cap = pw_stream ? 16u : 64u;
+    uint32_t conv_flags = (is_pw ? NPU_CTRL_PW_EN : NPU_CTRL_HW_PAD);
+    uint32_t preload_all = (out_c * wgt_words_per_oc <= DESC_WGT_SRAM_WORDS);
+    uint32_t qbase_ddr = YOLO_QPARAM_DDR;
+    uint32_t done;
+
+    if (!pw_stream)
+        conv_flags |= NPU_CTRL_OC_SINGLE;
+
+    if (icg == 0u || in_w == 0u || in_h == 0u || out_c == 0u ||
+        kernel_h == 0u || kernel_w == 0u || stride == 0u)
+        return 0;
+
+    if (stride == 1u && kernel_h > 1u)
+        conv_flags |= NPU_CTRL_ROW_PAR;
+
+    out_w = (in_w + 2u * pad - kernel_w) / stride + 1u;
+    out_h = (in_h + 2u * pad - kernel_h) / stride + 1u;
+    spatial = out_w * out_h;
+    in_words = in_w * in_h * icg;
+    out_words = spatial * ((out_c + 15u) / 16u);
+
+    if (input_from_out_sram && in_words > DESC_OUT_SRAM_WORDS)
+        return 0;
+    if (in_words > DESC_ACT_SRAM_WORDS || out_words > DESC_OUT_SRAM_WORDS)
+        return 0;
+
+#ifdef DESC_RECORD
+    qbase_ddr = DESC_QPARAM_BASE + g_qp_top * 4u;
+    g_qp_top += out_c * 4u;
+    {
+        uint32_t _t = d_cyc();
+        volatile uint32_t *q = (volatile uint32_t *)qbase_ddr;
+        uint32_t oc;
+        for (oc = 0u; oc < out_c; oc++) {
+            q[oc*4+0] = (uint32_t)(bias ? bias[oc] : 0);
+            q[oc*4+1] = scale_mul[oc];
+            q[oc*4+2] = 0u;
+            q[oc*4+3] = scale_shift[oc];
+        }
+        g_desc_build += d_cyc() - _t;
+    }
+#else
+    (void)bias; (void)scale_mul; (void)scale_shift;
+#endif
+
+#ifdef DESC_RECORD
+    {
+        uint32_t _tb = d_cyc();
+        desc_prog_begin();
+        d_act_cfg(&di, pad_value, act_flags, 0u, 0u, 0);
+
+        if (input_from_out_sram)
+            d_sram_copy_out_to_act(&di, 0u, 0u, in_words);
+        else
+            d_dma_in(&di, in_ddr, 0u, in_words);
+
+        if (preload_all)
+            d_dma_wgt(&di, wgt_all_ddr, wgt_base, out_c * wgt_words_per_oc);
+
+        done = 0u;
+        while (done < out_c) {
+            uint32_t chunk = out_c - done;
+            uint32_t cgroups, sg, cwgt, out_base;
+            if (chunk > chunk_cap)
+                chunk = chunk_cap;
+            cgroups = (chunk + 15u) / 16u;
+            out_base = (done / 16u) * spatial;
+
+            if (preload_all) {
+                cwgt = wgt_base + done * wgt_words_per_oc;
+            } else {
+                d_dma_wgt(&di, wgt_all_ddr + done * wgt_words_per_oc * 16u,
+                          wgt_base, chunk * wgt_words_per_oc);
+                cwgt = wgt_base;
+            }
+
+            d_conv_at(&di, 0u, cwgt, out_base,
+                      in_w + 2u * pad, in_h + 2u * pad, in_c, chunk,
+                      kernel_h, kernel_w, stride, pad, pad, conv_flags,
+                      qbase_ddr + done * 16u, chunk);
+
+            if (drain_output) {
+                for (sg = 0u; sg < cgroups; sg++) {
+                    uint32_t oc_grp = done / 16u + sg;
+                    d_drain(&di, out_base + sg * spatial,
+                            out_ddr + oc_grp * spatial * 16u, spatial);
+                }
+            }
+            done += chunk;
+        }
+
+        d_stop(&di);
+        g_desc_build += d_cyc() - _tb;
+    }
+#else
+    (void)in_ddr; (void)wgt_all_ddr; (void)wgt_base; (void)out_ddr;
+    (void)wgt_words_per_oc; (void)pad_value; (void)drain_output;
+    (void)act_flags; (void)chunk_cap; (void)conv_flags;
+    (void)preload_all; (void)qbase_ddr; (void)done;
+#endif
+
+    {
+        uint32_t _tr = d_cyc();
+        int ok = desc_submit_cataloged(di);
+        g_desc_run += d_cyc() - _tr;
+        return ok;
+    }
 }
 
 // 5x5 maxpool (DDR->DDR) as a single descriptor program: DMA src into Act SRAM,
@@ -458,6 +811,33 @@ int yolo_run_maxpool5x5_desc(uint32_t src_ddr, uint32_t dst_ddr,
     return desc_submit_cataloged(di);
 }
 
+int yolo_run_sppf_pool_concat_desc(uint32_t src_ddr, uint32_t cat_ddr,
+                                   uint32_t scratch_act_base, uint32_t in_w,
+                                   uint32_t in_h, uint32_t ic_groups)
+{
+    uint32_t words = in_w * in_h * ic_groups;
+    uint32_t act_x = scratch_act_base;
+    uint32_t act_m0 = act_x + words;
+    uint32_t act_m1 = act_m0 + words;
+    uint32_t act_m2 = act_m1 + words;
+    uint32_t di = 0u;
+
+    if (in_w == 0u || in_h == 0u || ic_groups == 0u)
+        return 1;
+
+    desc_prog_begin();
+    d_dma_in(&di, src_ddr, act_x, words);
+    d_maxpool(&di, act_x, act_m0, in_w, in_h, ic_groups * 16u);
+    d_maxpool(&di, act_m0, act_m1, in_w, in_h, ic_groups * 16u);
+    d_maxpool(&di, act_m1, act_m2, in_w, in_h, ic_groups * 16u);
+    d_dma_out_act(&di, act_x,  cat_ddr, words);
+    d_dma_out_act(&di, act_m0, cat_ddr + words * 16u, words);
+    d_dma_out_act(&di, act_m1, cat_ddr + words * 32u, words);
+    d_dma_out_act(&di, act_m2, cat_ddr + words * 48u, words);
+    d_stop(&di);
+    return desc_submit_cataloged(di);
+}
+
 // Signed eltwise residual add (DDR->DDR) as one descriptor program. Mirrors
 // yolo_run_eltwise_add_ddr (yolo_ops.c): chunk so src0/src1/dst all fit Act SRAM,
 // and for each chunk chain DMA-in(src0) + DMA-in(src1) + ELTWISE + DMA-out.
@@ -467,7 +847,7 @@ int yolo_run_eltwise_add_desc(uint32_t src0_ddr, uint32_t src1_ddr,
                               uint32_t ratio_mul, uint32_t ratio_shift)
 {
     uint32_t done = 0u, di = 0u;
-    const uint32_t max_chunk = 4096u;
+    const uint32_t max_chunk = 8192u;
     uint32_t packed = NPU_ELT_PACK((uint32_t)zp, ratio_en, ratio_shift, ratio_mul);
 
     if (words == 0u)

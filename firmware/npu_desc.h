@@ -58,6 +58,10 @@ int npu_desc_run_many(const npu_desc_t *list, uint32_t count);
 /* OP_DMA_DDR_TO_WGT: like DMA_DDR_TO_ACT but the SRAM write target is Wgt SRAM
  * (per-chunk conv weight load). w[2]=DDR src, w[4]=Wgt SRAM word base, w[7]=words. */
 #define NPU_HW_DESC_OP_DMA_DDR_TO_WGT       0x09u
+/* OP_CONV2D_ASYNC starts the NPU and lets descriptor execution continue.
+ * Pair it with OP_WAIT_NPU before reusing NPU/Out-bank resources. */
+#define NPU_HW_DESC_OP_CONV2D_ASYNC         0x0Au
+#define NPU_HW_DESC_OP_WAIT_NPU             0x0Bu
 
 /* Act-SRAM spatial movement ops (implemented in descriptor_engine.v):
  * OP_UPSAMPLE2X / OP_MAXPOOL5X5 share w[2]=src base, w[4]=dst base,

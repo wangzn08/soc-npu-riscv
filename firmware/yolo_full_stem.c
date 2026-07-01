@@ -203,18 +203,6 @@ static void maxpool5(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, ui
             }
     }
 }
-// concat 4 same-scale tile-major parts -> [4*groups] tensor.
-static void concat4(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t dst,
-                    uint32_t groups, uint32_t SP)
-{
-    uint32_t srcs[4]; uint32_t i, n; srcs[0]=a;srcs[1]=b;srcs[2]=c;srcs[3]=d;
-    for (i = 0u; i < 4u; i++)
-        for (n = 0u; n < groups*SP; n++) {
-            volatile uint32_t *s=(volatile uint32_t*)(srcs[i]+n*16u);
-            volatile uint32_t *t=(volatile uint32_t*)(dst+(i*groups*SP+n)*16u);
-            t[0]=s[0];t[1]=s[1];t[2]=s[2];t[3]=s[3];
-        }
-}
 // nearest-neighbor 2x upsample (tile-major DDR, scale/zp unchanged): HxW -> 2Hx2W.
 static void upsample2(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, uint32_t W) __attribute__((unused));
 static void upsample2(uint32_t src, uint32_t dst, uint32_t groups, uint32_t H, uint32_t W)
@@ -296,7 +284,7 @@ static void ck_stage(const char *nm, uint32_t base, uint32_t SP, uint32_t OC,
     cfg.in_ddr=(INDDR); cfg.cv1_ic=P##_CV1_IC; cfg.cv1_out_ddr=NK_SCR_CV1; \
     cfg.bn_out_ddr=NK_SCR_BN; cfg.mcv2_ddr=NK_SCR_MCV2; cfg.add_ddr[0]=NK_SCR_ADD; \
     cfg.concat_ddr=NK_SCR_CAT; cfg.out_ddr=(OUTDDR); cfg.wgt_ddr=C2F_WGT; \
-    cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=1u; cfg.wgt_in_blob=1u; cfg.psum_ddr=NK_PSUM; \
+    cfg.pad_row_ddr=PAD_ROW; cfg.strip=32u; cfg.silu_exact=1u; cfg.wgt_in_blob=1u; cfg.psum_ddr=NK_PSUM; \
     cfg.cv1_wgt_ddr=(Wc1); cfg.mcv1_wgt_ddr[0]=(Wm1); cfg.mcv2_wgt_ddr[0]=(Wm2); cfg.cv2_wgt_ddr=(Wc2); \
     cfg.cv1_wgt_words=P##_FULL_C*(P##_CV1_IC/16u); \
     cfg.cv1_bias=p##_cv1_bias; cfg.cv1_mul=p##_cv1_mul; cfg.cv1_shift=p##_cv1_shift; \
@@ -322,6 +310,10 @@ static void ck_stage(const char *nm, uint32_t base, uint32_t SP, uint32_t OC,
 static int run_head_conv(uint32_t in, uint32_t wgt, uint32_t out, uint32_t inw, uint32_t inh,
                          uint32_t ic, uint32_t oc, uint32_t kh, uint32_t stride, uint32_t pad,
                          const int32_t *bias, const uint32_t *mul, const uint32_t *shift,
+                         const uint8_t *lut, int32_t inzp) __attribute__((unused));
+static int run_head_conv(uint32_t in, uint32_t wgt, uint32_t out, uint32_t inw, uint32_t inh,
+                         uint32_t ic, uint32_t oc, uint32_t kh, uint32_t stride, uint32_t pad,
+                         const int32_t *bias, const uint32_t *mul, const uint32_t *shift,
                          const uint8_t *lut, int32_t inzp)
 {
     /* All head ICs are <=256 (icg16), within im2col ICG_MAX=16, so the desc-tiled
@@ -331,6 +323,21 @@ static int run_head_conv(uint32_t in, uint32_t wgt, uint32_t out, uint32_t inw, 
     return yolo_run_conv2d_tiled_desc(in, wgt, WGT_BASE, out, PAD_ROW, inw, inh, ic, oc,
                kh, kh, stride, pad, bias, mul, shift, NPU_CTRL_SILU_EXACT_EN,
                (ic/16u)*kh*kh, 16u, inzp, 0u, 0u, 0);
+}
+
+static int run_head_conv_resident(uint32_t in, uint32_t wgt, uint32_t out,
+                                  uint32_t inw, uint32_t inh, uint32_t ic, uint32_t oc,
+                                  uint32_t kh, uint32_t stride, uint32_t pad,
+                                  const int32_t *bias, const uint32_t *mul,
+                                  const uint32_t *shift, const uint8_t *lut,
+                                  int32_t inzp, uint32_t input_from_out_sram,
+                                  uint32_t drain_output)
+{
+    yolo_set_pad_value(inzp); yolo_load_silu_lut(lut); yolo_set_silu_requant(0u,0u,0);
+    return yolo_run_conv2d_resident_desc(input_from_out_sram ? 0u : in, wgt, WGT_BASE, out,
+               inw, inh, ic, oc, kh, kh, stride, pad, bias, mul, shift,
+               NPU_CTRL_SILU_EXACT_EN, (ic/16u)*kh*kh, inzp,
+               input_from_out_sram, drain_output);
 }
 /* expf approx (bare-metal, no libm): exp(x)=2^(x*log2e), poly for frac + float exp. */
 static float my_exp(float x)
@@ -358,12 +365,26 @@ static void dfl_prepare_tables(float scale, int16_t wk[16], uint16_t elut[256])
         e *= step;
     }
 }
-static float q8_8_to_float(uint16_t q)
+static int32_t ceil_f32_to_i32(float x)
 {
-    return ((float)((int16_t)q)) * (1.0f / 256.0f);
+    int32_t i = (int32_t)x;
+    return ((float)i < x) ? i + 1 : i;
 }
-static float dq(uint32_t base, uint32_t sp, uint32_t ch, uint32_t pos, int32_t zp, float sc)
-{ return (float)(rs8(base, (ch>>4)*sp + pos, ch&15u) - zp) * sc; }
+static int32_t class_gate_q(int32_t zp, float scale)
+{
+    int32_t q = ceil_f32_to_i32((-1.09861229f / scale) + (float)zp);
+    if (q < -128) return -128;
+    if (q > 127) return 128;
+    return q;
+}
+static int32_t q8_8_s16(uint32_t q)
+{
+    return (int32_t)(int16_t)(q & 0xFFFFu);
+}
+static int32_t abs_i32(int32_t x)
+{
+    return x < 0 ? -x : x;
+}
 
 void usercode7(void)
 {
@@ -390,7 +411,7 @@ void usercode7(void)
                                3u, 3u, 2u, 1u,
                                yolo_conv0_320e_bias_q, yolo_conv0_320e_scale_mul,
                                yolo_conv0_320e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C0E_WGT_PER_OC, 16u, C0E_PAD_VALUE, 0u, 0u, 0)) {
+                               NPU_CTRL_SILU_EXACT_EN, C0E_WGT_PER_OC, 32u, C0E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv0 fail\n"); errors++;
     }
     prof_mark("s0_conv0");
@@ -404,7 +425,7 @@ void usercode7(void)
                                3u, 3u, 2u, 1u,
                                yolo_conv1_320e_bias_q, yolo_conv1_320e_scale_mul,
                                yolo_conv1_320e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C1E_WGT_PER_OC, 16u, C1E_PAD_VALUE, 0u, 0u, 0)) {
+                               NPU_CTRL_SILU_EXACT_EN, C1E_WGT_PER_OC, 32u, C1E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv1 fail\n"); errors++;
     }
     prof_mark("s1_conv1");
@@ -415,7 +436,7 @@ void usercode7(void)
     cfg.in_ddr=C1_OUT; cfg.cv1_ic=YOLO_C2F2_CV1_IC; cfg.cv1_out_ddr=CV1_OUT;
     cfg.bn_out_ddr=BN_OUT; cfg.mcv2_ddr=MCV2_DDR; cfg.add_ddr[0]=ADD0_DDR;
     cfg.concat_ddr=CONCAT; cfg.out_ddr=C2F_OUT; cfg.wgt_ddr=C2F_WGT;
-    cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=1u;
+    cfg.pad_row_ddr=PAD_ROW; cfg.strip=32u; cfg.silu_exact=1u;
     cfg.wgt_in_blob=1u;   // c2f_2 weights (conv2/3/4/5) from the DDR blob too
     cfg.cv1_wgt_ddr=WGT_OF(2); cfg.mcv1_wgt_ddr[0]=WGT_OF(3);
     cfg.mcv2_wgt_ddr[0]=WGT_OF(4); cfg.cv2_wgt_ddr=WGT_OF(5);
@@ -457,7 +478,7 @@ void usercode7(void)
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F_OUT, WGT_OF(6), WGT_BASE, C6_OUT, PAD_ROW,
                                C6E_IN_W, C6E_IN_H, C6E_IC, C6E_OC, 3u, 3u, C6E_STRIDE, 1u,
                                yolo_conv6e_bias_q, yolo_conv6e_scale_mul, yolo_conv6e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C6E_WGT_PER_OC, 16u, C6E_PAD_VALUE, 0u, 0u, 0)) {
+                               NPU_CTRL_SILU_EXACT_EN, C6E_WGT_PER_OC, 32u, C6E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv6 fail\n"); errors++;
     }
     print_str("  [stage3 conv6 done]\n");
@@ -469,7 +490,7 @@ void usercode7(void)
     cfg.in_ddr=C6_OUT; cfg.cv1_ic=YOLO_C2F4_CV1_IC; cfg.cv1_out_ddr=B_CV1;
     cfg.bn_out_ddr=B_BN; cfg.mcv2_ddr=B_MCV2; cfg.add_ddr[0]=B_ADD0; cfg.add_ddr[1]=B_ADD1;
     cfg.concat_ddr=B_CONCAT; cfg.out_ddr=C2F4_OUT; cfg.wgt_ddr=C2F_WGT;
-    cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=1u; cfg.wgt_in_blob=1u;
+    cfg.pad_row_ddr=PAD_ROW; cfg.strip=32u; cfg.silu_exact=1u; cfg.wgt_in_blob=1u;
     cfg.cv1_wgt_ddr=WGT_OF(7); cfg.cv2_wgt_ddr=WGT_OF(12);
     cfg.mcv1_wgt_ddr[0]=WGT_OF(8);  cfg.mcv2_wgt_ddr[0]=WGT_OF(9);
     cfg.mcv1_wgt_ddr[1]=WGT_OF(10); cfg.mcv2_wgt_ddr[1]=WGT_OF(11);
@@ -511,7 +532,7 @@ void usercode7(void)
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F4_OUT, WGT_OF(13), WGT_BASE, C13_OUT, PAD_ROW,
                                C13E_IN_W, C13E_IN_H, C13E_IC, C13E_OC, 3u, 3u, C13E_STRIDE, 1u,
                                yolo_conv13e_bias_q, yolo_conv13e_scale_mul, yolo_conv13e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, C13E_WGT_PER_OC, 16u, C13E_PAD_VALUE, 0u, 0u, 0)) {
+                               NPU_CTRL_SILU_EXACT_EN, C13E_WGT_PER_OC, 32u, C13E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv13 fail\n"); errors++;
     }
     print_str("  [stage5 conv13 done]\n");
@@ -523,7 +544,7 @@ void usercode7(void)
     cfg.in_ddr=C13_OUT; cfg.cv1_ic=YOLO_C2F6_CV1_IC; cfg.cv1_out_ddr=D_CV1;
     cfg.bn_out_ddr=D_BN; cfg.mcv2_ddr=D_MCV2; cfg.add_ddr[0]=D_ADD0; cfg.add_ddr[1]=D_ADD1;
     cfg.concat_ddr=D_CONCAT; cfg.out_ddr=C2F6_OUT; cfg.wgt_ddr=C2F_WGT;
-    cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=1u; cfg.wgt_in_blob=1u;
+    cfg.pad_row_ddr=PAD_ROW; cfg.strip=32u; cfg.silu_exact=1u; cfg.wgt_in_blob=1u;
     cfg.psum_ddr=D_PSUM;
     cfg.cv1_wgt_ddr=WGT_OF(14); cfg.cv2_wgt_ddr=WGT_OF(19);
     cfg.mcv1_wgt_ddr[0]=WGT_OF(15); cfg.mcv2_wgt_ddr[0]=WGT_OF(16);
@@ -568,7 +589,7 @@ void usercode7(void)
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F6_OUT, WGT_OF(20), WGT_BASE, C20_OUT, PAD_ROW,
                                C20E_IN_W, C20E_IN_H, C20E_IC, C20E_OC, 3u, 3u, C20E_STRIDE, 1u,
                                yolo_conv20e_bias_q, yolo_conv20e_scale_mul, yolo_conv20e_scale_shift,
-                               NPU_CTRL_SILU_EXACT_EN, (C20E_IC/16u)*9u, 16u, C20E_PAD_VALUE, 0u, 0u, 0)) {
+                               NPU_CTRL_SILU_EXACT_EN, (C20E_IC/16u)*9u, 32u, C20E_PAD_VALUE, 0u, 0u, 0)) {
         print_str("  conv20 fail\n"); errors++;
     }
     print_str("  [stage7 conv20 done]\n");
@@ -580,7 +601,7 @@ void usercode7(void)
     cfg.in_ddr=C20_OUT; cfg.cv1_ic=YOLO_C2F8_CV1_IC; cfg.cv1_out_ddr=E_CV1;
     cfg.bn_out_ddr=E_BN; cfg.mcv2_ddr=E_MCV2; cfg.add_ddr[0]=E_ADD0;
     cfg.concat_ddr=E_CONCAT; cfg.out_ddr=C2F8_OUT; cfg.wgt_ddr=C2F_WGT;
-    cfg.pad_row_ddr=PAD_ROW; cfg.strip=16u; cfg.silu_exact=1u; cfg.wgt_in_blob=1u;
+    cfg.pad_row_ddr=PAD_ROW; cfg.strip=32u; cfg.silu_exact=1u; cfg.wgt_in_blob=1u;
     cfg.psum_ddr=E_PSUM;
     cfg.cv1_wgt_ddr=WGT_OF(21); cfg.cv2_wgt_ddr=WGT_OF(24);
     cfg.mcv1_wgt_ddr[0]=WGT_OF(22); cfg.mcv2_wgt_ddr[0]=WGT_OF(23);
@@ -609,8 +630,8 @@ void usercode7(void)
     prof_mark("s8_c2f8");
 
     // ---------- Stage 9: SPPF (model.9) conv25 -> 3x maxpool5 -> concat -> conv26 ----------
-    // conv25 (1x1 256->128, icg16 PW stream, exact); maxpool/concat on CPU (scale-
-    // preserving); conv26 (1x1 512->256, icg32 PW stream, exact). Reads C2F8_OUT.
+    // conv25 (1x1 256->128, icg16 PW stream, exact); maxpool/concat stay local
+    // in Act SRAM, then drain one S_CAT tensor for conv26.
     yolo_load_silu_lut(yolo_sppf_e_c25_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(C2F8_OUT, WGT_OF(25), WGT_BASE, S_CV1, PAD_ROW,
@@ -623,12 +644,12 @@ void usercode7(void)
     prof_mark("s9_sppf_conv25");
     if (errors == 0u) {
         uint32_t g25 = SPPFE_C25_OC / 16u;
-        if (!yolo_run_maxpool5x5_desc(S_CV1, S_M0, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool0 fail\n"); errors++; }
-        if (errors == 0u && !yolo_run_maxpool5x5_desc(S_M0, S_M1, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool1 fail\n"); errors++; }
-        if (errors == 0u && !yolo_run_maxpool5x5_desc(S_M1, S_M2, S_POOL_ACT, SPPFE_IN_W, SPPFE_IN_H, g25)) { print_str("  sppf pool2 fail\n"); errors++; }
-        concat4(S_CV1, S_M0, S_M1, S_M2, S_CAT, g25, SPPFE_SPATIAL);
+        if (!yolo_run_sppf_pool_concat_desc(S_CV1, S_CAT, S_POOL_ACT,
+                                            SPPFE_IN_W, SPPFE_IN_H, g25)) {
+            print_str("  sppf pool/concat desc fail\n"); errors++;
+        }
     }
-    prof_mark("s9_sppf_maxpool_concat_CPU");
+    prof_mark("s9_sppf_pool_concat_resident");
     yolo_load_silu_lut(yolo_sppf_e_c26_lut);
     yolo_set_silu_requant(0u, 0u, 0);
     if (errors == 0u && !yolo_run_conv2d_tiled_desc(S_CAT, WGT_OF(26), WGT_BASE, SPPF_OUT, PAD_ROW,
@@ -714,7 +735,7 @@ void usercode7(void)
     if (errors==0u && !yolo_run_conv2d_tiled_desc(NK_PANP3, WGT_OF(35), WGT_BASE, NK_C35, PAD_ROW,
                                40u,40u, 64u,64u, 3u,3u, 2u,1u,
                                yolo_nk_c35_bias, yolo_nk_c35_mul, yolo_nk_c35_shift,
-                               NPU_CTRL_SILU_EXACT_EN, 4u*9u, 16u, YOLO_NK_C35_PAD, 0u, 0u, 0)) { print_str("  conv35 fail\n"); errors++; }
+                               NPU_CTRL_SILU_EXACT_EN, 4u*9u, 32u, YOLO_NK_C35_PAD, 0u, 0u, 0)) { print_str("  conv35 fail\n"); errors++; }
     prof_mark("neck_conv35_s2");
     {
         const npu_desc_t descs[] = {
@@ -753,7 +774,7 @@ void usercode7(void)
     if (errors==0u && !yolo_run_conv2d_tiled_desc(NK_PANP4, WGT_OF(46), WGT_BASE, NK_C46, PAD_ROW,
                                20u,20u, 128u,128u, 3u,3u, 2u,1u,
                                yolo_nk_c46_bias, yolo_nk_c46_mul, yolo_nk_c46_shift,
-                               NPU_CTRL_SILU_EXACT_EN, (128u/16u)*9u, 16u, YOLO_NK_C46_PAD, 0u, 0u, 0)) { print_str("  conv46 fail\n"); errors++; }
+                               NPU_CTRL_SILU_EXACT_EN, (128u/16u)*9u, 32u, YOLO_NK_C46_PAD, 0u, 0u, 0)) { print_str("  conv46 fail\n"); errors++; }
     prof_mark("neck_conv46_s2_icstream");
     {
         const npu_desc_t descs[] = {
@@ -808,17 +829,37 @@ void usercode7(void)
             p##_cl_out_bias,p##_cl_out_mul,p##_cl_out_shift,p##_cl_out_lut,YOLO_HD_##P##_CL_OUT_PAD)) {print_str(" hclout fail\n");errors++;} \
       prof_mark("h_clout1x1"); \
     } while(0)
-    HBR(NK_PANP3,40u,40u, P3, yolo_hd_p3, 36,38,41, 37,39,42, HD_BB_P3,HD_CL_P3);
+    #define HBR_RES(IN,INW,INH, P, p, BB_CI,BBM_CI,BBO_CI, CL_CI,CLM_CI,CLO_CI, BBDST,CLDST) do { \
+      if(errors==0u && !run_head_conv_resident(IN,WGT_OF(BB_CI),0u,INW,INH,YOLO_HD_##P##_STEM_IC,YOLO_HD_##P##_BB_STEM_OC,3u,1u,1u, \
+            p##_bb_stem_bias,p##_bb_stem_mul,p##_bb_stem_shift,p##_bb_stem_lut,YOLO_HD_##P##_BB_STEM_PAD,0u,0u)) {print_str(" hbbstem resident fail\n");errors++;} \
+      prof_mark("h_bbstem3x3"); \
+      if(errors==0u && !run_head_conv_resident(0u,WGT_OF(BBM_CI),0u,INW,INH,YOLO_HD_##P##_BB_STEM_OC,YOLO_HD_##P##_BB_STEM_OC,3u,1u,1u, \
+            p##_bb_mid_bias,p##_bb_mid_mul,p##_bb_mid_shift,p##_bb_mid_lut,YOLO_HD_##P##_BB_MID_PAD,1u,0u)) {print_str(" hbbmid resident fail\n");errors++;} \
+      prof_mark("h_bbmid3x3"); \
+      if(errors==0u && !run_head_conv_resident(0u,WGT_OF(BBO_CI),BBDST,INW,INH,YOLO_HD_##P##_BB_STEM_OC,64u,1u,1u,0u, \
+            p##_bb_out_bias,p##_bb_out_mul,p##_bb_out_shift,p##_bb_out_lut,YOLO_HD_##P##_BB_OUT_PAD,1u,1u)) {print_str(" hbbout resident fail\n");errors++;} \
+      prof_mark("h_bbout1x1"); \
+      if(errors==0u && !run_head_conv_resident(IN,WGT_OF(CL_CI),0u,INW,INH,YOLO_HD_##P##_STEM_IC,YOLO_HD_##P##_CL_STEM_OC,3u,1u,1u, \
+            p##_cl_stem_bias,p##_cl_stem_mul,p##_cl_stem_shift,p##_cl_stem_lut,YOLO_HD_##P##_CL_STEM_PAD,0u,0u)) {print_str(" hclstem resident fail\n");errors++;} \
+      prof_mark("h_clstem3x3"); \
+      if(errors==0u && !run_head_conv_resident(0u,WGT_OF(CLM_CI),0u,INW,INH,YOLO_HD_##P##_CL_STEM_OC,YOLO_HD_##P##_CL_STEM_OC,3u,1u,1u, \
+            p##_cl_mid_bias,p##_cl_mid_mul,p##_cl_mid_shift,p##_cl_mid_lut,YOLO_HD_##P##_CL_MID_PAD,1u,0u)) {print_str(" hclmid resident fail\n");errors++;} \
+      prof_mark("h_clmid3x3"); \
+      if(errors==0u && !run_head_conv_resident(0u,WGT_OF(CLO_CI),CLDST,INW,INH,YOLO_HD_##P##_CL_STEM_OC,80u,1u,1u,0u, \
+            p##_cl_out_bias,p##_cl_out_mul,p##_cl_out_shift,p##_cl_out_lut,YOLO_HD_##P##_CL_OUT_PAD,1u,1u)) {print_str(" hclout resident fail\n");errors++;} \
+      prof_mark("h_clout1x1"); \
+    } while(0)
+    HBR_RES(NK_PANP3,40u,40u, P3, yolo_hd_p3, 36,38,41, 37,39,42, HD_BB_P3,HD_CL_P3);
     prof_mark("head_P3_6conv");
-    HBR(NK_PANP4,20u,20u, P4, yolo_hd_p4, 47,49,52, 48,50,53, HD_BB_P4,HD_CL_P4);
+    HBR_RES(NK_PANP4,20u,20u, P4, yolo_hd_p4, 47,49,52, 48,50,53, HD_BB_P4,HD_CL_P4);
     prof_mark("head_P4_6conv");
-    HBR(NK_PANP5,10u,10u, P5, yolo_hd_p5, 57,59,61, 58,60,62, HD_BB_P5,HD_CL_P5);
+    HBR_RES(NK_PANP5,10u,10u, P5, yolo_hd_p5, 57,59,61, 58,60,62, HD_BB_P5,HD_CL_P5);
     prof_mark("head_P5_6conv");
     print_str("  [head convs done]\n");
 
     // ---- decode: class0 gate on CPU, DFL expectation on the generic NPU DFL engine ----
     {
-        static float dx1[128],dy1[128],dx2[128],dy2[128]; uint32_t nd=0u;
+        static int32_t dx1_q8[128],dy1_q8[128],dx2_q8[128],dy2_q8[128]; uint32_t nd=0u;
         static uint16_t dfl_elut[256];
         static int16_t dfl_wk[16];
         static uint16_t cand_ax[128], cand_ay[128];
@@ -827,7 +868,10 @@ void usercode7(void)
         float bbs[3]={YOLO_HD_P3_BB_OUTS,YOLO_HD_P4_BB_OUTS,YOLO_HD_P5_BB_OUTS};
         float cls[3]={YOLO_HD_P3_CL_OUTS,YOLO_HD_P4_CL_OUTS,YOLO_HD_P5_CL_OUTS};
         int32_t clz[3]={YOLO_HD_P3_CL_OUTZP,YOLO_HD_P4_CL_OUTZP,YOLO_HD_P5_CL_OUTZP};
+        int32_t cls_gate[3];
         uint32_t s2;
+        for (s2=0u; s2<3u; s2++)
+            cls_gate[s2] = class_gate_q(clz[s2], cls[s2]);
         for (s2=0u; s2<3u; s2++) {
             uint32_t H=hw[s2], Wd=H, SP=H*Wd, pos, local_n=0u;
             dfl_prepare_tables(bbs[s2], dfl_wk, dfl_elut);
@@ -838,8 +882,7 @@ void usercode7(void)
                 /* cheapest first: class-0 (person) gate. sigmoid is monotonic, so
                  * sigmoid(lg0)<0.25 <=> lg0 < ln(1/3); compare the raw logit and skip
                  * non-candidate anchors entirely. */
-                float lg0=dq(clB[s2],SP,0u,pos,clz[s2],cls[s2]);
-                if(lg0 < -1.09861229f) continue;   /* sigmoid(lg0) < 0.25 */
+                if(rs8(clB[s2], pos, 0u) < cls_gate[s2]) continue;   /* sigmoid(lg0) < 0.25 */
                 cand_ax[local_n] = (uint16_t)ax;
                 cand_ay[local_n] = (uint16_t)ay;
                 for (c=0u; c<4u; c++) {
@@ -858,15 +901,16 @@ void usercode7(void)
                 for (q=0u; q<local_n; q++) {
                     volatile uint32_t *op = (volatile uint32_t *)(HD_DFL_OUT + q*16u);
                     uint32_t lo=op[0], hi=op[1];
-                    float coord0=q8_8_to_float((uint16_t)(lo & 0xFFFFu));
-                    float coord1=q8_8_to_float((uint16_t)(lo >> 16));
-                    float coord2=q8_8_to_float((uint16_t)(hi & 0xFFFFu));
-                    float coord3=q8_8_to_float((uint16_t)(hi >> 16));
-                    float axf=(float)cand_ax[q], ayf=(float)cand_ay[q];
-                    dx1[nd]=(axf+0.5f-coord0)*(float)st[s2];
-                    dy1[nd]=(ayf+0.5f-coord1)*(float)st[s2];
-                    dx2[nd]=(axf+0.5f+coord2)*(float)st[s2];
-                    dy2[nd]=(ayf+0.5f+coord3)*(float)st[s2];
+                    int32_t coord0=q8_8_s16(lo);
+                    int32_t coord1=q8_8_s16(lo >> 16);
+                    int32_t coord2=q8_8_s16(hi);
+                    int32_t coord3=q8_8_s16(hi >> 16);
+                    int32_t axq=((int32_t)cand_ax[q] << 8) + 128;
+                    int32_t ayq=((int32_t)cand_ay[q] << 8) + 128;
+                    dx1_q8[nd]=(axq - coord0) * (int32_t)st[s2];
+                    dy1_q8[nd]=(ayq - coord1) * (int32_t)st[s2];
+                    dx2_q8[nd]=(axq + coord2) * (int32_t)st[s2];
+                    dy2_q8[nd]=(ayq + coord3) * (int32_t)st[s2];
                     nd++;
                 }
             }
@@ -878,22 +922,24 @@ void usercode7(void)
         print_str("  boxes(cx,cy):");
         for(i=0u;i<nd;i++){
             if(sup[i])continue;
-            float fcx=(dx1[i]+dx2[i])*0.5f, fcy=(dy1[i]+dy2[i])*0.5f;
-            int32_t cx=(int32_t)fcx, cy=(int32_t)fcy; if(cx<0)cx=0; if(cy<0)cy=0;
+            int32_t cxq=(dx1_q8[i]+dx2_q8[i])/2, cyq=(dy1_q8[i]+dy2_q8[i])/2;
+            int32_t cx=cxq >> 8, cy=cyq >> 8; if(cx<0)cx=0; if(cy<0)cy=0;
             print_str(" ("); print_dec((uint32_t)cx); print_str(","); print_dec((uint32_t)cy); print_str(")");
-            for(j=i+1u;j<nd;j++){ float ex=(dx1[j]+dx2[j])*0.5f-fcx, ey=(dy1[j]+dy2[j])*0.5f-fcy;
-                if(ex<0)ex=-ex;
-                if(ey<0)ey=-ey;
-                if(ex<14.0f&&ey<14.0f) sup[j]=1u; }
+            for(j=i+1u;j<nd;j++){
+                int32_t jcxq=(dx1_q8[j]+dx2_q8[j])/2;
+                int32_t jcyq=(dy1_q8[j]+dy2_q8[j])/2;
+                if(abs_i32(jcxq-cxq)<(14*256)&&abs_i32(jcyq-cyq)<(14*256)) sup[j]=1u; }
         }
         print_str("\n");
         for(i=0u;i<nd;i++) sup[i]=0u;
         uint32_t matched=0u;
         // for each golden box, see if a surviving det matches center within 14px
         for(j=0u;j<4u;j++){
-            float gcx=yolo_hd_golden[j][0], gcy=yolo_hd_golden[j][1]; uint32_t hit=0u;
-            for(i=0u;i<nd;i++){ if(sup[i])continue; float cx=(dx1[i]+dx2[i])*0.5f, cy=(dy1[i]+dy2[i])*0.5f;
-                float ex=cx-gcx, ey=cy-gcy; if(ex<0)ex=-ex; if(ey<0)ey=-ey; if(ex<14.0f&&ey<14.0f){hit=1u;break;} }
+            int32_t gcxq=(int32_t)(yolo_hd_golden[j][0]*256.0f+0.5f);
+            int32_t gcyq=(int32_t)(yolo_hd_golden[j][1]*256.0f+0.5f); uint32_t hit=0u;
+            for(i=0u;i<nd;i++){ if(sup[i])continue;
+                int32_t cxq=(dx1_q8[i]+dx2_q8[i])/2, cyq=(dy1_q8[i]+dy2_q8[i])/2;
+                if(abs_i32(cxq-gcxq)<(14*256)&&abs_i32(cyq-gcyq)<(14*256)){hit=1u;break;} }
             if(hit) matched++;
         }
         print_str("  head dets="); print_dec(nd); print_str(" golden-matched="); print_dec(matched); print_str("/4\n");

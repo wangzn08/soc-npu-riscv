@@ -149,6 +149,7 @@ void usercode7(void);
 #define NPU_CTRL_SIGMOID_EN  (1 << 21) // post-process sigmoid LUT (vs SiLU); detect-head cls
 #define NPU_CTRL_SILU_EXACT_EN (1 << 22) // per-layer exact SiLU LUT (out-grid indexed; no +-8 clamp)
 #define NPU_CTRL_IC_STREAM   (1 << 23) // large-IC conv streaming (IC-chunk loop + INT32 psum accumulate)
+#define NPU_CTRL_ACT_PING    (1u << 24) // descriptor-only: NPU reads Act SRAM pong without switching Wgt bank
 
 /* INT32 psum accumulate (large-IC conv streaming): partial passes write/accumulate
  * INT32 psum to an Out-SRAM region; the final pass requant+SiLU reads it back. */
